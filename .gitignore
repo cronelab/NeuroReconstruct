@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# PyInstaller
+backend/build/
+backend/dist/
+*.spec.bak
+
+# Database
+backend/brain_viewer.db
+
+# Reconstruction data (large NIfTI files, patient data)
+backend/data/
+
+# Node / React
+frontend/node_modules/
+frontend/build/
+
+# Demo distribution (built artifact)
+dist_demo/
+
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Misc
+_upload/
+*.log
