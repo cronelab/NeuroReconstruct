@@ -29,6 +29,7 @@ frontend/build/
 
 # Demo distribution (built artifact)
 dist_demo/
+demo/
 
 # Environment / secrets
 .env
