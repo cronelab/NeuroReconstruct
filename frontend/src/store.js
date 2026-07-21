@@ -50,4 +50,6 @@ export const useAppStore = create((set, get) => ({
   setStructuresData: (data) => set({ structuresData: data }),
   structureVisible: {},          // { key: bool }
   setStructureVisible: (key, v) => set(s => ({ structureVisible: { ...s.structureVisible, [key]: v } })),
+  setStructureVisibleMany: (keys, v) =>
+    set(s => ({ structureVisible: { ...s.structureVisible, ...Object.fromEntries(keys.map(k => [k, v])) } })),
 }));
