@@ -169,9 +169,8 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
                   <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, padding: 32, background: '#111418', border: '1px solid #1e2530', borderRadius: 8, maxWidth: 360 }}>
                     <span style={{ fontSize: 13, color: '#7a8a99', fontFamily: 'IBM Plex Sans, sans-serif' }}>Upload MRI to enable slice viewing</span>
                     <label style={{ width: '100%' }}>
-                      <span style={{ fontSize: 11, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>MRI (.nii.gz) *</span>
-                      <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
-                        <input ref={mriRef} type="file" accept=".nii.gz,.nii" style={{ flex: 1, minWidth: 0, fontSize: 11, color: '#e8edf2', fontFamily: 'IBM Plex Mono, monospace' }} />
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <span style={{ fontSize: 11, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>MRI (.nii.gz) *</span>
                         <select
                           value={mriModality}
                           onChange={e => setMriModality(e.target.value)}
@@ -182,6 +181,7 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
                           <option value="t2">T2</option>
                         </select>
                       </div>
+                      <input ref={mriRef} type="file" accept=".nii.gz,.nii" style={{ display: 'block', marginTop: 4, width: '100%', boxSizing: 'border-box', fontSize: 11, color: '#e8edf2', fontFamily: 'IBM Plex Mono, monospace' }} />
                     </label>
                     <label style={{ width: '100%' }}>
                       <span style={{ fontSize: 11, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>CT (.nii.gz) — optional, triggers coregistration</span>

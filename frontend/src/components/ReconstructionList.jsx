@@ -238,19 +238,19 @@ export default function ReconstructionList({ onSelect, onTrash }) {
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 18 }}>
               <div>
-                <label style={{ display: 'block', fontSize: 13, color: '#c8d0da', marginBottom: 6, fontWeight: 600 }}>MRI NIfTI (.nii / .nii.gz) *</label>
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                  <input type="file" accept=".nii,.nii.gz" onChange={e => setForm(p => ({ ...p, mri_file: e.target.files[0] }))} required style={{ padding: '4px 8px', fontSize: 12, flex: 1, minWidth: 0 }} />
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <label style={{ fontSize: 13, color: '#c8d0da', fontWeight: 600 }}>MRI NIfTI (.nii / .nii.gz) *</label>
                   <select
                     value={form.mri_modality}
                     onChange={e => setForm(p => ({ ...p, mri_modality: e.target.value }))}
                     title="MRI contrast — used to select the correct skull-stripping model"
-                    style={{ padding: '4px 8px', fontSize: 12, background: '#0a0c10', color: '#c8d0da', border: '1px solid #2a3340', borderRadius: 4, flexShrink: 0 }}
+                    style={{ padding: '2px 6px', fontSize: 11, background: '#0a0c10', color: '#c8d0da', border: '1px solid #2a3340', borderRadius: 4 }}
                   >
                     <option value="t1">T1</option>
                     <option value="t2">T2</option>
                   </select>
                 </div>
+                <input type="file" accept=".nii,.nii.gz" onChange={e => setForm(p => ({ ...p, mri_file: e.target.files[0] }))} required style={{ padding: '4px 8px', fontSize: 12, width: '100%', boxSizing: 'border-box' }} />
               </div>
               <div>
                 <label style={{ display: 'block', fontSize: 13, color: '#c8d0da', marginBottom: 6, fontWeight: 600 }}>CT NIfTI (.nii / .nii.gz) <span style={{ color: '#4a5568', fontWeight: 400 }}>— optional</span></label>
