@@ -1,24 +1,47 @@
 import React, { useState, useCallback, useRef } from 'react';
 import SliceViewer from './SliceViewer';
+import FusionSliceViewer from './FusionSliceViewer';
 import { useAppStore } from '../store';
-import { uploadReconstructionFiles } from '../api';
+import { uploadReconstructionFiles, confirmRegistration } from '../api';
 
-const VIEWS = [
+const BASE_VIEWS = [
   { id: '3d',       label: '3D',       icon: '⬡' },
   { id: 'sagittal', label: 'Sagittal', icon: '◧' },
   { id: 'axial',    label: 'Axial',    icon: '⬒' },
   { id: 'coronal',  label: 'Coronal',  icon: '◨' },
 ];
 
+const FUSION_VIEW = { id: 'fusion', label: 'Fusion', icon: '⧉' };
+
 const AXIS_COLORS = {
   sagittal: '#ff6b6b',
   axial:    '#81c784',
   coronal:  '#4fc3f7',
+  fusion:   '#ffab40',
 };
 
 export default function MultiViewLayout({ reconId, viewer3D }) {
   const [activeView, setActiveView] = useState('3d');
   const { reconstruction, setReconstruction } = useAppStore();
+  const [confirmBusy, setConfirmBusy] = useState(false);
+
+  // Fusion view is only meaningful when a CT is registered to the MRI.
+  const hasFusion = !!reconstruction?.has_ct && !!reconstruction?.has_registration;
+  const VIEWS = hasFusion ? [...BASE_VIEWS, FUSION_VIEW] : BASE_VIEWS;
+  const regConfirmed = !!reconstruction?.registration_confirmed;
+
+  const handleConfirmRegistration = useCallback(async (value) => {
+    if (!reconstruction || confirmBusy) return;
+    setConfirmBusy(true);
+    try {
+      await confirmRegistration(reconstruction.id, value);
+      setReconstruction({ ...reconstruction, registration_confirmed: value });
+    } catch (e) {
+      // no-op; button stays in prior state
+    } finally {
+      setConfirmBusy(false);
+    }
+  }, [reconstruction, confirmBusy, setReconstruction]);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const mriRef = useRef(null);
@@ -130,12 +153,15 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
               onMouseLeave={e => { if (!isActive) e.currentTarget.style.borderColor = '#1e2530'; }}
             >
               <div style={{ height: 70, background: '#000', overflow: 'hidden', position: 'relative' }}>
-                {view.id === '3d' ? (
-                  <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#2a3340', fontSize: 28 }}>
+                {(view.id === '3d' || view.id === 'fusion') ? (
+                  <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: view.id === 'fusion' ? (isActive ? accentColor : '#5a4420') : '#2a3340', fontSize: 28 }}>
                     {view.icon}
                   </div>
                 ) : (
                   <SliceViewer reconId={reconId} axis={view.id} isThumbnail />
+                )}
+                {view.id === 'fusion' && !regConfirmed && (
+                  <div style={{ position: 'absolute', top: 3, right: 3, width: 8, height: 8, borderRadius: '50%', background: '#ffab40', boxShadow: '0 0 4px #ffab40' }} title="Registration not yet reviewed" />
                 )}
               </div>
               <div style={{
@@ -160,6 +186,40 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
         <div style={{ position: 'absolute', inset: 0, display: activeView === '3d' ? 'block' : 'none' }}>
           {viewer3D}
         </div>
+
+        {hasFusion && (
+          <div style={{ position: 'absolute', inset: 0, display: activeView === 'fusion' ? 'flex' : 'none', flexDirection: 'column' }}>
+            {/* Registration review / confirm bar */}
+            <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12, padding: '8px 14px', background: regConfirmed ? '#0d2a1a' : '#1a1000', borderBottom: `1px solid ${regConfirmed ? '#00e67633' : '#ffab4033'}` }}>
+              <span style={{ fontSize: 12, fontFamily: 'IBM Plex Sans, sans-serif', color: regConfirmed ? '#00e676' : '#ffab40', fontWeight: 600 }}>
+                {regConfirmed ? '✓ Registration reviewed & confirmed' : '⚠ Registration not yet reviewed'}
+              </span>
+              <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Sans, sans-serif', flex: 1 }}>
+                Sweep the MRI↔CT blend and check that skull, ventricle, and midline edges stay aligned.
+              </span>
+              {regConfirmed ? (
+                <button
+                  onClick={() => handleConfirmRegistration(false)}
+                  disabled={confirmBusy}
+                  style={{ fontSize: 11, padding: '5px 12px', borderRadius: 4, cursor: 'pointer', background: 'transparent', color: '#7a8a99', border: '1px solid #2a3340', fontFamily: 'IBM Plex Sans, sans-serif' }}
+                >
+                  Un-confirm
+                </button>
+              ) : (
+                <button
+                  onClick={() => handleConfirmRegistration(true)}
+                  disabled={confirmBusy}
+                  style={{ fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 4, cursor: 'pointer', background: '#0d2a1a', color: '#00e676', border: '1px solid #00e67655', fontFamily: 'IBM Plex Sans, sans-serif', opacity: confirmBusy ? 0.6 : 1 }}
+                >
+                  ✓ Looks correct — Confirm
+                </button>
+              )}
+            </div>
+            <div style={{ flex: 1, minHeight: 0 }}>
+              {activeView === 'fusion' && <FusionSliceViewer reconId={reconId} />}
+            </div>
+          </div>
+        )}
 
         {['sagittal', 'axial', 'coronal'].map(ax => (
           <div key={ax} style={{ position: 'absolute', inset: 0, display: activeView === ax ? 'block' : 'none' }}>
