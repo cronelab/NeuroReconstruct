@@ -58,7 +58,10 @@ def _get_mri_volume(mri_path: str):
     return _mri_volume_cache[mri_path]
 
 def _render_slice(mri_path: str, axis: str, slice_idx: int):
-    """Return (png_bytes, shape, world_coord, voxel_size_mm, count, actual_idx), cached."""
+    """Return (png_bytes, shape, world_coord, voxel_size_mm, count, actual_idx,
+    inv_affine, vol_shape, px_w_mm, px_h_mm), cached. px_w_mm/px_h_mm are the
+    physical mm-per-pixel along the displayed width/height, for aspect-correct
+    rendering of anisotropic voxels."""
     vol = _get_mri_volume(mri_path)
     data = vol["data"]
     affine = vol["affine"]
@@ -89,9 +92,17 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
     world_coord = float(affine[ax, 3] + affine[ax, ax] * slice_idx)
     voxel_size_mm = float(voxel_sizes[ax])
 
+    # Physical mm-per-pixel of the *displayed* image. After the np.fliplr(np.rot90)
+    # above, displayed WIDTH maps to the slice's "row" data-axis and displayed
+    # HEIGHT to its "col" data-axis:
+    #   sagittal(ax0): rows=y(1) cols=z(2) | coronal(ax1): rows=x(0) cols=z(2) | axial(ax2): rows=x(0) cols=y(1)
+    row_ax, col_ax = {0: (1, 2), 1: (0, 2), 2: (0, 1)}[ax]
+    px_w_mm = float(voxel_sizes[row_ax])
+    px_h_mm = float(voxel_sizes[col_ax])
+
     inv_affine = np.linalg.inv(affine)
     result = (png_bytes, sl_uint8.shape, world_coord, voxel_size_mm, n, slice_idx,
-              inv_affine.flatten().tolist(), list(data.shape))
+              inv_affine.flatten().tolist(), list(data.shape), px_w_mm, px_h_mm)
     vol["png_cache"][key] = result  # cache the full tuple
     return result
 
@@ -919,7 +930,7 @@ async def get_mri_slice(
     result_data = await loop.run_in_executor(
         None, _render_slice, mri_abs, axis, slice_idx
     )
-    png_bytes, shape, world_coord, voxel_size_mm, count, actual_idx, inv_affine, vol_shape = result_data
+    png_bytes, shape, world_coord, voxel_size_mm, count, actual_idx, inv_affine, vol_shape, px_w_mm, px_h_mm = result_data
 
     return FastAPIResponse(
         content=png_bytes,
@@ -931,6 +942,8 @@ async def get_mri_slice(
             "X-Slice-Height": str(shape[0]),
             "X-Slice-World-Coord": str(world_coord),
             "X-Voxel-Size-Mm": str(voxel_size_mm),
+            "X-Display-Px-Width-Mm": str(px_w_mm),
+            "X-Display-Px-Height-Mm": str(px_h_mm),
             "X-Volume-Inv-Affine": json.dumps(inv_affine),
             "X-Volume-Shape": json.dumps(vol_shape),
         }

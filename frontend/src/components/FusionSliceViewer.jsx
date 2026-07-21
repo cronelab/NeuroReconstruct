@@ -27,6 +27,8 @@ function FusionCanvas({ reconId, axis }) {
   const ctTintedRef = useRef(new Map());   // idx -> tinted ImageBitmap
   const sliceIdxRef = useRef(0);
   const sliceCountRef = useRef(1);
+  const pxWmmRef = useRef(1);   // physical mm-per-pixel (display width) — for anisotropic voxels
+  const pxHmmRef = useRef(1);   // physical mm-per-pixel (display height)
 
   const [blend, setBlend] = useState(0.5);   // 0 = MRI only, 1 = CT only
   const [sliceLabel, setSliceLabel] = useState({ idx: 0, count: 1 });
@@ -76,8 +78,11 @@ function FusionCanvas({ reconId, axis }) {
     const ctTint = ctTintedRef.current.get(idx);
     if (!mri) return;
 
-    const scale = Math.min(W / mri.width, H / mri.height);
-    const dw = mri.width * scale, dh = mri.height * scale;
+    // Aspect-correct for anisotropic voxels: scale by physical mm extent, not pixel count
+    const physW = mri.width * pxWmmRef.current;
+    const physH = mri.height * pxHmmRef.current;
+    const scale = Math.min(W / physW, H / physH);
+    const dw = physW * scale, dh = physH * scale;
     const dx = (W - dw) / 2, dy = (H - dh) / 2;
 
     const b = blendRef.current;
@@ -129,6 +134,8 @@ function FusionCanvas({ reconId, axis }) {
       }
       const count = parseInt(mriRes.headers.get('X-Slice-Count') || '1');
       const actual = parseInt(mriRes.headers.get('X-Slice-Index') || '0');
+      pxWmmRef.current = parseFloat(mriRes.headers.get('X-Display-Px-Width-Mm') || '1');
+      pxHmmRef.current = parseFloat(mriRes.headers.get('X-Display-Px-Height-Mm') || '1');
       sliceCountRef.current = count;
       sliceIdxRef.current = actual;
       const mriBitmap = await createImageBitmap(await mriRes.blob());
@@ -178,6 +185,8 @@ function FusionCanvas({ reconId, axis }) {
         if (!mriRes.ok) { setErrorMsg(`MRI ${mriRes.status}`); setStatus('error'); return; }
         const count = parseInt(mriRes.headers.get('X-Slice-Count') || '1');
         const actual = parseInt(mriRes.headers.get('X-Slice-Index') || '0');
+        pxWmmRef.current = parseFloat(mriRes.headers.get('X-Display-Px-Width-Mm') || '1');
+        pxHmmRef.current = parseFloat(mriRes.headers.get('X-Display-Px-Height-Mm') || '1');
         sliceCountRef.current = count;
         sliceIdxRef.current = actual;
         const mriBitmap = await createImageBitmap(await mriRes.blob());

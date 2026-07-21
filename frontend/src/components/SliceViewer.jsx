@@ -17,6 +17,8 @@ const CONTACT_THICKNESS_MM = 4.0; // show contacts within ±this many mm of slic
 function LocatorOverlay({ reconId, refAxis, lineType, fraction }) {
   const canvasRef = React.useRef(null);
   const bitmapRef = React.useRef(null);
+  const pxWmmRef = React.useRef(1);   // physical mm-per-pixel (display width) — anisotropic voxels
+  const pxHmmRef = React.useRef(1);   // physical mm-per-pixel (display height)
   const AXIS_COLORS = { sagittal: '#ff6b6b', coronal: '#4fc3f7', axial: '#81c784' };
   const color = AXIS_COLORS[refAxis] || '#fff';
 
@@ -27,6 +29,8 @@ function LocatorOverlay({ reconId, refAxis, lineType, fraction }) {
       { headers: token ? { Authorization: `Bearer ${token}` } : {} }
     ).then(async res => {
       if (!res.ok) return;
+      pxWmmRef.current = parseFloat(res.headers.get('X-Display-Px-Width-Mm') || '1');
+      pxHmmRef.current = parseFloat(res.headers.get('X-Display-Px-Height-Mm') || '1');
       const blob = await res.blob();
       bitmapRef.current = await createImageBitmap(blob);
       drawLocator();
@@ -41,10 +45,13 @@ function LocatorOverlay({ reconId, refAxis, lineType, fraction }) {
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, W, H);
 
-    // Draw reference slice letterboxed (preserve aspect ratio)
-    const scale = Math.min(W / bm.width, H / bm.height);
-    const dw = bm.width * scale;
-    const dh = bm.height * scale;
+    // Draw reference slice letterboxed, aspect-corrected for anisotropic voxels
+    // (scale by physical mm extent, not pixel count)
+    const physW = bm.width * pxWmmRef.current;
+    const physH = bm.height * pxHmmRef.current;
+    const scale = Math.min(W / physW, H / physH);
+    const dw = physW * scale;
+    const dh = physH * scale;
     const dx = (W - dw) / 2;
     const dy = (H - dh) / 2;
     ctx.globalAlpha = 0.7;
@@ -168,9 +175,14 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
     if (!entry?.bitmap) return;
 
     const { bitmap, worldCoord } = entry;
-    const scale = Math.min(W / bitmap.width, H / bitmap.height);
-    const dw = bitmap.width * scale;
-    const dh = bitmap.height * scale;
+    // Aspect-correct for anisotropic voxels: scale by physical mm extent, not pixel count
+    const pxW = entry.pxWidthMm || 1;
+    const pxH = entry.pxHeightMm || 1;
+    const physW = bitmap.width * pxW;
+    const physH = bitmap.height * pxH;
+    const scale = Math.min(W / physW, H / physH);
+    const dw = physW * scale;
+    const dh = physH * scale;
     const dx = (W - dw) / 2;
     const dy = (H - dh) / 2;
     ctx.drawImage(bitmap, dx, dy, dw, dh);
@@ -320,6 +332,8 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
       const actual = parseInt(res.headers.get('X-Slice-Index') || '0');
       const worldCoord = parseFloat(res.headers.get('X-Slice-World-Coord') || 'NaN');
       const voxelSize = parseFloat(res.headers.get('X-Voxel-Size-Mm') || '1');
+      const pxWidthMm = parseFloat(res.headers.get('X-Display-Px-Width-Mm') || '1');
+      const pxHeightMm = parseFloat(res.headers.get('X-Display-Px-Height-Mm') || '1');
       sliceCountRef.current = count;
       // Parse affine + shape once (they don't change per slice)
       if (!invAffineRef.current) {
@@ -331,7 +345,7 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
 
       const blob = await res.blob();
       const bitmap = await createImageBitmap(blob);
-      const entry = { bitmap, worldCoord, voxelSize };
+      const entry = { bitmap, worldCoord, voxelSize, pxWidthMm, pxHeightMm };
       if (actual >= 0) cacheRef.current.set(actual, entry);
       onDone?.(entry, actual);
     } catch (e) {
