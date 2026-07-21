@@ -21,7 +21,7 @@ import os
 
 # ── Skull stripping ────────────────────────────────────────────────────────────
 
-def _skull_strip_antspynet(data: np.ndarray, affine: np.ndarray) -> np.ndarray:
+def _skull_strip_antspynet(data: np.ndarray, affine: np.ndarray, modality: str = "t1") -> np.ndarray:
     """
     Use antspynet brain_extraction() to produce a binary brain mask.
     Returns None if antspynet/antspy is not installed.
@@ -33,7 +33,7 @@ def _skull_strip_antspynet(data: np.ndarray, affine: np.ndarray) -> np.ndarray:
         print(f"[MESH] antspynet import failed: {e}")
         return None
 
-    print("[MESH] Using antspynet brain extraction...")
+    print(f"[MESH] Using antspynet brain extraction (modality={modality})...")
 
     # Build ANTs image from numpy array + affine
     spacing = tuple(float(np.sqrt((affine[:3, i] ** 2).sum())) for i in range(3))
@@ -48,7 +48,7 @@ def _skull_strip_antspynet(data: np.ndarray, affine: np.ndarray) -> np.ndarray:
     )
 
     try:
-        prob = antspynet.brain_extraction(ants_img, modality="t1", verbose=False)
+        prob = antspynet.brain_extraction(ants_img, modality=modality, verbose=False)
         mask = ants.threshold_image(prob, 0.5, 1.0, 1, 0)
         brain_mask = mask.numpy().astype(bool)
         n_voxels = brain_mask.sum()
@@ -102,9 +102,12 @@ def _skull_strip_morphological(data: np.ndarray, affine: np.ndarray,
 # ── Main extraction ────────────────────────────────────────────────────────────
 
 def extract_brain_mesh(nifti_path: str, output_path: str,
-                       threshold: float = None) -> dict:
+                       threshold: float = None, modality: str = "t1") -> dict:
     """
     Load a NIfTI MRI, skull-strip, run marching cubes, save mesh as JSON.
+
+    modality: MRI contrast of the input volume ("t1" or "t2"). Passed through
+    to antspynet's brain_extraction() so the correct pretrained network is used.
     """
     img = nib.load(nifti_path)
     img = nib.as_closest_canonical(img)
@@ -124,7 +127,7 @@ def extract_brain_mesh(nifti_path: str, output_path: str,
     print(f"[MESH] Using threshold: {threshold:.2f}")
 
     # ── Skull stripping ────────────────────────────────────────────────────────
-    brain_mask = _skull_strip_antspynet(data, affine)
+    brain_mask = _skull_strip_antspynet(data, affine, modality)
     used_morphological = brain_mask is None
     if used_morphological:
         brain_mask = _skull_strip_morphological(data, affine, threshold)

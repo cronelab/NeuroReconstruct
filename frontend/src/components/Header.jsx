@@ -136,6 +136,14 @@ export default function Header({ onBack, onNavigate }) {
           <div style={{ ...s.statusBadge, background: statusStyle.bg, color: statusStyle.color, border: `1px solid ${statusStyle.border}` }}>
             {status === 'processing' && '⟳ '}{status}
           </div>
+          {reconstruction.has_ct && reconstruction.has_registration && !reconstruction.registration_confirmed && (
+            <div
+              style={{ ...s.statusBadge, background: '#1a1000', color: '#ffab40', border: '1px solid #ffab4044' }}
+              title="Open the Fusion view to review CT-MRI registration"
+            >
+              ⚠ Reg. unreviewed
+            </div>
+          )}
         </>
       ) : (
         <span style={{ color: '#7a8a99', fontSize: 12 }}>No reconstruction loaded</span>

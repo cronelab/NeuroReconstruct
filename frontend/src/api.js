@@ -77,6 +77,9 @@ export const snapToBlob = (reconId, worldPos, threshold) =>
 export const getStructures = (id, token) =>
   api.get(`/reconstructions/${id}/structures${token ? `?token=${token}` : ""}`);
 
+export const confirmRegistration = (id, confirmed) =>
+  api.patch(`/reconstructions/${id}/registration-confirm`, { confirmed });
+
 export const uploadReconstructionFiles = (reconId, formData) =>
   api.post(`/reconstructions/${reconId}/files`, formData, {
     headers: { 'Content-Type': 'multipart/form-data' },

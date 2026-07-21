@@ -97,7 +97,95 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
 
 
 from services.electrode_service import autofill_contacts
-from services.ct_electrode_extractor import build_threshold_mesh, snap_to_blob_centroid
+from services.ct_electrode_extractor import build_threshold_mesh, snap_to_blob_centroid, _resolve_ct_path
+
+# ── Fusion (CT-in-MRI-space) slice cache ──────────────────────────────────────
+# Fixed bone/metal window for the registration-QA fusion view — this is for
+# visually checking alignment (skull outline, ventricles), not diagnostic
+# reading, so a fixed window is simpler and more consistent across patients
+# than a per-volume percentile (which metal artifacts would skew).
+_CT_FUSION_WINDOW_MIN = -100.0
+_CT_FUSION_WINDOW_MAX = 1900.0
+
+_ct_volume_cache: dict = {}  # ct_path -> {"data", "affine", "fusion_png_cache": {(axis,idx): bytes}}
+
+def _get_ct_volume(ct_path: str):
+    """Load and canonicalize the (masked, if available) CT NIfTI once; cache the float array."""
+    if ct_path not in _ct_volume_cache:
+        import nibabel as nib
+        resolved = _resolve_ct_path(ct_path)
+        img = nib.load(resolved)
+        img_ras = nib.as_closest_canonical(img)
+        _ct_volume_cache[ct_path] = {
+            "data": img_ras.get_fdata(),
+            "affine": img_ras.affine,
+            "fusion_png_cache": {},  # (mri_path, axis, slice_idx) -> (png_bytes, actual_idx, count)
+        }
+    return _ct_volume_cache[ct_path]
+
+def _render_fusion_slice(mri_path: str, ct_path: str, transform: np.ndarray, axis: str, slice_idx: int):
+    """
+    Resample the CT onto the exact MRI slice plane at (axis, slice_idx) and render
+    as a grayscale PNG that is pixel-for-pixel aligned with /mri-slice's output.
+
+    Unlike the structure overlay (which picks the nearest same-axis slice — a valid
+    shortcut only because DKT labels share the MRI's own axes), the CT is related to
+    the MRI by an arbitrary rigid rotation, so an MRI slice plane generally maps to
+    an OBLIQUE plane through the CT volume. This does true 3D trilinear resampling
+    of that oblique plane via scipy.ndimage.map_coordinates, using the full
+    MRI-voxel -> CT-voxel affine (CT affine, registration transform, and MRI affine
+    composed together), rather than picking a single CT slice index.
+
+    Cached per (ct_path, mri_path, axis, slice_idx) since it's moderately expensive.
+    """
+    from scipy.ndimage import map_coordinates
+
+    ct_vol = _get_ct_volume(ct_path)
+    ct_data, ct_affine = ct_vol["data"], ct_vol["affine"]
+    mri_vol = _get_mri_volume(mri_path)
+    mri_data, mri_affine = mri_vol["data"], mri_vol["affine"]
+
+    ax = {"sagittal": 0, "coronal": 1, "axial": 2}[axis]
+    n = mri_data.shape[ax]
+    if slice_idx < 0 or slice_idx >= n:
+        slice_idx = n // 2
+
+    cache_key = (mri_path, axis, slice_idx)
+    if cache_key in ct_vol["fusion_png_cache"]:
+        return ct_vol["fusion_png_cache"][cache_key]
+
+    nx, ny, nz = mri_data.shape
+    if ax == 0:
+        vy, vz = np.meshgrid(np.arange(ny), np.arange(nz), indexing="ij")
+        vx = np.full_like(vy, slice_idx)
+    elif ax == 1:
+        vx, vz = np.meshgrid(np.arange(nx), np.arange(nz), indexing="ij")
+        vy = np.full_like(vx, slice_idx)
+    else:
+        vx, vy = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+        vz = np.full_like(vx, slice_idx)
+
+    ones = np.ones_like(vx, dtype=np.float64)
+    mri_vox_hom = np.stack([vx, vy, vz, ones]).astype(np.float64).reshape(4, -1)
+
+    # MRI voxel -> MRI world -> CT world (inverse of the saved CT->MRI transform) -> CT voxel
+    M = np.linalg.inv(ct_affine) @ np.linalg.inv(transform) @ mri_affine
+    ct_vox_hom = M @ mri_vox_hom
+    coords = ct_vox_hom[:3].reshape(3, *vx.shape)
+
+    ct_slice_raw = map_coordinates(ct_data, coords, order=1, cval=-1000.0, mode="constant")
+
+    # Same orientation flip as MRI slices, so the two PNGs composite pixel-for-pixel
+    sl = np.fliplr(np.rot90(ct_slice_raw, k=1))
+    sl_norm = np.clip((sl - _CT_FUSION_WINDOW_MIN) / (_CT_FUSION_WINDOW_MAX - _CT_FUSION_WINDOW_MIN), 0, 1)
+    sl_uint8 = (sl_norm * 255).astype(np.uint8)
+
+    buf = io.BytesIO()
+    Image.fromarray(sl_uint8, mode="L").save(buf, format="PNG", optimize=False, compress_level=1)
+    result = (buf.getvalue(), slice_idx, n)
+    ct_vol["fusion_png_cache"][cache_key] = result
+    return result
+
 
 # ── Structure overlay slice cache ─────────────────────────────────────────────
 _struct_overlay_cache: dict = {}  # label_path -> {"data", "affine", "png_cache": {(axis,idx): bytes}}
@@ -302,6 +390,7 @@ class ReconstructionResponse(BaseModel):
     updated_at: datetime
     is_complete: bool = False
     is_locked: bool = False
+    registration_confirmed: bool = False
 
     class Config:
         from_attributes = True
@@ -446,6 +535,7 @@ async def list_reconstructions(
                 os.path.exists(os.path.join(os.path.dirname(_abs(recon.ct_path)), "ct_to_mri.npy"))
                 if recon.ct_path else False
             ),
+            "registration_confirmed": getattr(recon, "registration_confirmed", False) or False,
             "electrode_shafts": shafts_data,
         })
     return out
@@ -456,6 +546,7 @@ async def create_reconstruction(
     patient_id: str = Form(...),
     label: str = Form(...),
     mri_file: UploadFile = File(...),
+    mri_modality: str = Form("t1"),
     ct_file: Optional[UploadFile] = File(None),
     ct_preregistered: bool = Form(False),
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -463,6 +554,9 @@ async def create_reconstruction(
     db: AsyncSession = Depends(get_db),
 ):
     """Upload NIfTI files and kick off mesh extraction in background."""
+    mri_modality = mri_modality.lower()
+    if mri_modality not in ("t1", "t2"):
+        raise HTTPException(status_code=400, detail="mri_modality must be 't1' or 't2'")
     recon_dir = os.path.join(DATA_DIR, f"recon_{uuid.uuid4().hex[:8]}")
     os.makedirs(recon_dir, exist_ok=True)
 
@@ -491,7 +585,7 @@ async def create_reconstruction(
     await db.refresh(recon)
 
     # Run mesh extraction in background
-    background_tasks.add_task(_extract_mesh_background, recon.id, mri_path, recon_dir, ct_path, ct_preregistered)
+    background_tasks.add_task(_extract_mesh_background, recon.id, mri_path, recon_dir, ct_path, ct_preregistered, mri_modality)
 
     return recon
 
@@ -500,6 +594,7 @@ async def create_reconstruction(
 async def upload_reconstruction_files(
     recon_id: int,
     mri_file: Optional[UploadFile] = File(None),
+    mri_modality: str = Form("t1"),
     ct_file: Optional[UploadFile] = File(None),
     ct_preregistered: bool = Form(False),
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -507,6 +602,9 @@ async def upload_reconstruction_files(
     db: AsyncSession = Depends(get_db),
 ):
     """Upload or replace MRI/CT files for an existing reconstruction and re-run processing."""
+    mri_modality = mri_modality.lower()
+    if mri_modality not in ("t1", "t2"):
+        raise HTTPException(status_code=400, detail="mri_modality must be 't1' or 't2'")
     result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
     recon = result.scalar_one_or_none()
     if not recon:
@@ -548,12 +646,12 @@ async def upload_reconstruction_files(
     await db.commit()
 
     if mri_path:
-        background_tasks.add_task(_extract_mesh_background, recon_id, mri_path, recon_dir, ct_path, ct_preregistered)
+        background_tasks.add_task(_extract_mesh_background, recon_id, mri_path, recon_dir, ct_path, ct_preregistered, mri_modality)
 
     return {"status": "processing"}
 
 
-async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str, ct_path: str = None, ct_preregistered: bool = False):
+async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str, ct_path: str = None, ct_preregistered: bool = False, mri_modality: str = "t1"):
     """Background task: extract brain mesh from MRI NIfTI, then register CT if available."""
     from database import AsyncSessionLocal
     import hashlib
@@ -582,9 +680,9 @@ async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str,
                 _shutil.copy2(existing_mesh, mesh_path)
                 print(f"[MESH] Reused existing mesh from {os.path.dirname(existing_mesh)}")
             else:
-                await loop.run_in_executor(None, extract_brain_mesh, mri_path, mesh_path, None)
+                await loop.run_in_executor(None, extract_brain_mesh, mri_path, mesh_path, None, mri_modality)
         else:
-            await loop.run_in_executor(None, extract_brain_mesh, mri_path, mesh_path, None)
+            await loop.run_in_executor(None, extract_brain_mesh, mri_path, mesh_path, None, mri_modality)
         status = "ready"
     except Exception as e:
         import traceback
@@ -607,11 +705,14 @@ async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str,
             result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
             recon = result.scalar_one_or_none()
             if recon and recon.ct_path and os.path.exists(_abs(recon.ct_path)):
-                # Mark as registering so the UI shows spinner and blocks access
+                # Mark as registering so the UI shows spinner and blocks access.
+                # Also reset registration_confirmed — a fresh registration run is
+                # about to replace ct_to_mri.npy, so any prior manual confirmation
+                # no longer applies to the transform that will exist afterward.
                 await db.execute(
                     update(Reconstruction)
                     .where(Reconstruction.id == recon_id)
-                    .values(status="registering", updated_at=datetime.utcnow())
+                    .values(status="registering", registration_confirmed=False, updated_at=datetime.utcnow())
                 )
                 await db.commit()
                 try:
@@ -748,6 +849,7 @@ async def get_reconstruction(
             os.path.exists(os.path.join(os.path.dirname(_abs(recon.ct_path)), "ct_to_mri.npy"))
             if recon.ct_path else False
         ),
+        "registration_confirmed": getattr(recon, "registration_confirmed", False) or False,
         "electrode_shafts": shafts_data,
     }
 
@@ -773,6 +875,23 @@ async def update_reconstruction_status(
         recon.is_locked = is_locked
     await db.commit()
     return {"is_complete": recon.is_complete, "is_locked": recon.is_locked}
+
+
+@app.patch("/api/reconstructions/{recon_id}/registration-confirm")
+async def confirm_registration(
+    recon_id: int,
+    confirmed: bool = Body(..., embed=True),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Manually mark (or un-mark) a reconstruction's CT-MRI registration as visually reviewed and correct."""
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Reconstruction not found")
+    recon.registration_confirmed = confirmed
+    await db.commit()
+    return {"registration_confirmed": recon.registration_confirmed}
 
 
 @app.get("/api/reconstructions/{recon_id}/mri-slice")
@@ -850,6 +969,58 @@ async def get_structure_slice(
         raise HTTPException(status_code=404, detail="Structure labels not available for this reconstruction")
 
     return FastAPIResponse(content=png_bytes, media_type="image/png")
+
+
+@app.get("/api/reconstructions/{recon_id}/fusion-slice")
+async def get_fusion_slice(
+    recon_id: int,
+    axis: str = "axial",
+    slice_idx: int = -1,
+    token: Optional[str] = None,
+    current_user: Optional[User] = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return a grayscale PNG of the CT resampled into the MRI slice plane, for
+    visual registration QA. Pixel-aligned with /mri-slice at the same axis/slice_idx —
+    the frontend composites the two directly on top of each other.
+    """
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not current_user and recon.share_token != token:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not recon.ct_path or not recon.mri_path:
+        raise HTTPException(status_code=404, detail="MRI or CT not available")
+
+    mri_abs = _abs(recon.mri_path)
+    ct_abs = _abs(recon.ct_path)
+    if not mri_abs or not os.path.exists(mri_abs) or not ct_abs or not os.path.exists(ct_abs):
+        raise HTTPException(status_code=404, detail="MRI or CT file missing on disk")
+
+    from services.registration import load_transform, get_transform_path
+    transform_path = get_transform_path(ct_abs)
+    if not os.path.exists(transform_path):
+        raise HTTPException(status_code=404, detail="No registration transform available yet")
+    transform = load_transform(transform_path)
+
+    loop = asyncio.get_event_loop()
+    try:
+        png_bytes, actual_idx, count = await loop.run_in_executor(
+            None, _render_fusion_slice, mri_abs, ct_abs, transform, axis, slice_idx
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fusion render failed: {e}")
+
+    return FastAPIResponse(
+        content=png_bytes,
+        media_type="image/png",
+        headers={
+            "X-Slice-Index": str(actual_idx),
+            "X-Slice-Count": str(count),
+        }
+    )
 
 
 @app.post("/api/reconstructions/{recon_id}/prerender-slices")

@@ -134,6 +134,23 @@ const COLOR_PALETTE = [
   { name: 'Bronze',       hex: '#cd7f32' },
 ];
 
+// Checkbox that can render a dash (indeterminate) when only some descendants are checked
+function TriStateCheckbox({ checked, indeterminate, onChange, style }) {
+  const ref = React.useRef(null);
+  useEffect(() => {
+    if (ref.current) ref.current.indeterminate = !!indeterminate && !checked;
+  }, [indeterminate, checked]);
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      checked={checked}
+      onChange={onChange}
+      style={{ width: 15, height: 15, flexShrink: 0, cursor: 'pointer', ...style }}
+    />
+  );
+}
+
 // Swatched color picker component
 function ColorPicker({ value, onChange }) {
   const [open, setOpen] = React.useState(false);
@@ -348,8 +365,9 @@ export default function ElectrodeEditor({
   currentThreshold,
   showStructures, setShowStructures, onLoadStructures,
 }) {
-  const { reconstruction, selectedShaftId, setSelectedShaftId, structuresData, structureVisible, setStructureVisible } = useAppStore();
+  const { reconstruction, selectedShaftId, setSelectedShaftId, structuresData, structureVisible, setStructureVisible, setStructureVisibleMany } = useAppStore();
   const [localStructuresLoading, setLocalStructuresLoading] = useState(false);
+  const [collapsedGroups, setCollapsedGroups] = useState({});
 
   const [huThreshold, setHuThreshold] = useState(0);
   const debouncedThreshold = useDebounce(huThreshold, 400);
@@ -579,53 +597,89 @@ export default function ElectrodeEditor({
                 const leftEntries  = entries.filter(([k]) => k.endsWith('_l'));
                 const rightEntries = entries.filter(([k]) => k.endsWith('_r'));
                 const midline      = entries.filter(([k]) => !k.endsWith('_l') && !k.endsWith('_r'));
-                const selectAll   = () => entries.forEach(([k]) => setStructureVisible(k, true));
-                const deselectAll = () => entries.forEach(([k]) => setStructureVisible(k, false));
-                const btnBase = { fontSize: 11, background: 'none', border: '1px solid #2a3440', borderRadius: 3, padding: '2px 9px', cursor: 'pointer', fontFamily: 'IBM Plex Mono, monospace' };
+
+                const keysOf = (list) => list.map(([k]) => k);
+                const stateOf = (list) => {
+                  const vis = list.map(([k]) => structureVisible?.[k] !== false);
+                  const allOn  = vis.every(v => v);
+                  const allOff = vis.every(v => !v);
+                  return { checked: allOn, indeterminate: !allOn && !allOff };
+                };
+                const toggleKeys = (keys, v) => setStructureVisibleMany(keys, v);
+
+                const groupState = stateOf(entries);
+                const isCollapsed = collapsedGroups[group] !== false; // default: collapsed
+
                 return (
-                  <div key={group} style={{ marginBottom: 14 }}>
-                    {/* Group header */}
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                      <div style={{ fontSize: 11, fontWeight: 600, color: '#7a8a99', textTransform: 'uppercase', letterSpacing: '0.06em', fontFamily: 'IBM Plex Mono, monospace' }}>{group}</div>
-                      <div style={{ display: 'flex', gap: 5 }}>
-                        <button onClick={selectAll}   style={{ ...btnBase, color: '#74C0FC' }}>All</button>
-                        <button onClick={deselectAll} style={{ ...btnBase, color: '#7a8a99' }}>None</button>
-                      </div>
+                  <div key={group} style={{ marginBottom: 6, borderBottom: '1px solid #1a1e24' }}>
+                    {/* Level 1 — Group */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 0', cursor: 'pointer' }}
+                      onClick={() => setCollapsedGroups(prev => ({ ...prev, [group]: !isCollapsed }))}>
+                      <span style={{ fontSize: 10, color: '#7a8a99', width: 10, textAlign: 'center', flexShrink: 0 }}>{isCollapsed ? '▸' : '▾'}</span>
+                      <TriStateCheckbox
+                        checked={groupState.checked}
+                        indeterminate={groupState.indeterminate}
+                        onChange={e => { e.stopPropagation(); toggleKeys(keysOf(entries), e.target.checked); }}
+                        style={{ accentColor: '#74C0FC' }}
+                      />
+                      <span style={{ fontSize: 11, fontWeight: 600, color: '#c8d4e0', textTransform: 'uppercase', letterSpacing: '0.06em', fontFamily: 'IBM Plex Mono, monospace', flex: 1 }}>
+                        {group}
+                      </span>
+                      <span style={{ fontSize: 10, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>{entries.length}</span>
                     </div>
-                    {/* Midline structures — full width */}
-                    {midline.map(([key, s]) => {
-                      const checked = structureVisible?.[key] !== false;
-                      return (
-                        <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}>
-                          <input type="checkbox" checked={checked}
-                            onChange={e => setStructureVisible(key, e.target.checked)}
-                            style={{ accentColor: s.color, width: 15, height: 15, flexShrink: 0, cursor: 'pointer' }} />
-                          <div style={{ width: 11, height: 11, borderRadius: 2, background: s.color, flexShrink: 0 }} />
-                          <span style={{ fontSize: 13, color: '#c8d4e0', fontFamily: 'IBM Plex Sans, sans-serif' }}>{s.label}</span>
-                        </div>
-                      );
-                    })}
-                    {/* Bilateral structures in two columns */}
-                    {(leftEntries.length > 0 || rightEntries.length > 0) && (
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 10 }}>
-                        {[['Left', leftEntries], ['Right', rightEntries]].map(([side, sideEntries]) => (
-                          <div key={side}>
-                            <div style={{ fontSize: 10, color: '#7a8a99', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 5, fontFamily: 'IBM Plex Mono, monospace' }}>{side}</div>
-                            {sideEntries.map(([key, s]) => {
-                              const checked = structureVisible?.[key] !== false;
-                              const label = s.label.replace(/^(Left|Right)\s+/i, '');
+
+                    {!isCollapsed && (
+                      <div style={{ paddingLeft: 20, paddingBottom: 8 }}>
+                        {/* Midline structures — full width */}
+                        {midline.map(([key, s]) => {
+                          const checked = structureVisible?.[key] !== false;
+                          return (
+                            <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}>
+                              <TriStateCheckbox checked={checked}
+                                onChange={e => setStructureVisible(key, e.target.checked)}
+                                style={{ accentColor: s.color }} />
+                              <div style={{ width: 11, height: 11, borderRadius: 2, background: s.color, flexShrink: 0 }} />
+                              <span style={{ fontSize: 13, color: '#c8d4e0', fontFamily: 'IBM Plex Sans, sans-serif' }}>{s.label}</span>
+                            </div>
+                          );
+                        })}
+                        {/* Level 2 — Side (Left/Right), Level 3 — individual structures */}
+                        {(leftEntries.length > 0 || rightEntries.length > 0) && (
+                          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 10 }}>
+                            {[['Left', leftEntries], ['Right', rightEntries]].map(([side, sideEntries]) => {
+                              if (!sideEntries.length) return <div key={side} />;
+                              const sideState = stateOf(sideEntries);
                               return (
-                                <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}>
-                                  <input type="checkbox" checked={checked}
-                                    onChange={e => setStructureVisible(key, e.target.checked)}
-                                    style={{ accentColor: s.color, width: 15, height: 15, flexShrink: 0, cursor: 'pointer' }} />
-                                  <div style={{ width: 11, height: 11, borderRadius: 2, background: s.color, flexShrink: 0 }} />
-                                  <span style={{ fontSize: 13, color: '#c8d4e0', fontFamily: 'IBM Plex Sans, sans-serif', lineHeight: 1.2 }}>{label}</span>
+                                <div key={side}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5, cursor: 'pointer' }}
+                                    onClick={() => toggleKeys(keysOf(sideEntries), !sideState.checked)}>
+                                    <TriStateCheckbox
+                                      checked={sideState.checked}
+                                      indeterminate={sideState.indeterminate}
+                                      onChange={e => { e.stopPropagation(); toggleKeys(keysOf(sideEntries), e.target.checked); }}
+                                      style={{ width: 13, height: 13 }} />
+                                    <span style={{ fontSize: 10, color: '#7a8a99', textTransform: 'uppercase', letterSpacing: '0.05em', fontFamily: 'IBM Plex Mono, monospace' }}>{side}</span>
+                                  </div>
+                                  <div style={{ paddingLeft: 19 }}>
+                                    {sideEntries.map(([key, s]) => {
+                                      const checked = structureVisible?.[key] !== false;
+                                      const label = s.label.replace(/^(Left|Right)\s+/i, '');
+                                      return (
+                                        <div key={key} style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}>
+                                          <TriStateCheckbox checked={checked}
+                                            onChange={e => setStructureVisible(key, e.target.checked)}
+                                            style={{ accentColor: s.color }} />
+                                          <div style={{ width: 11, height: 11, borderRadius: 2, background: s.color, flexShrink: 0 }} />
+                                          <span style={{ fontSize: 13, color: '#c8d4e0', fontFamily: 'IBM Plex Sans, sans-serif', lineHeight: 1.2 }}>{label}</span>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
                                 </div>
                               );
                             })}
                           </div>
-                        ))}
+                        )}
                       </div>
                     )}
                   </div>
