@@ -6,7 +6,7 @@
 
 ## Project Goal
 
-A clinical web application for Johns Hopkins neurosurgeons to create, visualize, and review **sEEG electrode reconstructions** overlaid on 3D brain models. Surgeons upload a patient's T1 MRI (and optionally a post-implant CT), place electrode contacts on the CT mesh, and review the result for surgical planning.
+A clinical web application for Johns Hopkins neurosurgeons to create, visualize, and review **sEEG electrode reconstructions** overlaid on 3D brain models. Surgeons upload a patient's T1 (or T2) MRI and optionally a post-implant CT, place electrode contacts on the CT mesh, and review the result for surgical planning.
 
 **Core principle: accuracy over features.** Anything that could mislead (e.g. template-space anatomy displayed in patient space) should be hidden rather than shown with imperfect data.
 
@@ -34,8 +34,10 @@ Database: `backend/brain_viewer.db` (SQLite, created automatically)
 |---|---|
 | Frontend | React, Three.js r128, Zustand, axios |
 | Backend | Python 3.11, FastAPI, SQLite (SQLAlchemy async) |
-| Neuroimaging | nibabel, scikit-image (marching cubes), trimesh, PIL |
-| Auth | JWT tokens, axios interceptors |
+| Neuroimaging | nibabel, scikit-image (marching cubes), trimesh, **open3d** (mesh decimation), scipy, PIL |
+| CT↔MRI registration | **SimpleITK** (Mattes mutual information, rigid) |
+| Segmentation / skull-strip | **antspyx + antspynet** (deep_atropos, DKT parcellation, brain_extraction) |
+| Auth | JWT tokens, bcrypt (passlib), axios interceptors |
 | Dev env | Windows, conda env `neuro-recon` |
 
 ### Critical: numpy must stay < 2.0
@@ -43,6 +45,11 @@ Database: `backend/brain_viewer.db` (SQLite, created automatically)
 nibabel, scikit-learn, pandas, and scipy all break with numpy 2.x in this conda environment.  
 After any `pip install`, verify with: `python -c "import nibabel, sklearn"`  
 If broken: `pip install "numpy<2.0"`
+
+### Critical: pinned deps that break silently if bumped
+
+- `bcrypt==4.0.1` — passlib 1.7.4 calls `bcrypt.__about__` (removed in bcrypt 4.1+); a newer bcrypt makes **every** `hash_password()` crash, taking down app startup (default admin creation). Keep pinned.
+- `open3d` — required by `trimesh.simplify_quadric_decimation()`. Without it, mesh extraction crashes at the decimation step (`ModuleNotFoundError: open3d`) for any MRI large enough to exceed the 120k-face decimation threshold — i.e. essentially all real data.
 
 ---
 
@@ -55,30 +62,31 @@ If broken: `pip install "numpy<2.0"`
 | `main.py` | All FastAPI endpoints. Auth, reconstruction CRUD, mesh serving, MRI slice rendering (with in-memory cache), electrode management, CT mesh generation, snap-to-blob. |
 | `database.py` | SQLAlchemy models: `User`, `Reconstruction`, `ElectrodeShaft`, `ElectrodeContact`. |
 | `auth.py` | JWT creation/verification, password hashing, `get_current_user` dependency. |
-| `services/mesh_extractor.py` | Extracts brain surface mesh from T1 MRI NIfTI via marching cubes. Returns vertices/faces in world RAS coords, centered at origin. Runs in background on upload. |
-| `services/ct_electrode_extractor.py` | CT mesh generation (HU threshold + marching cubes) and `snap_to_blob_centroid()` — snaps a clicked world position to nearest bright CT blob centroid within 8mm. |
+| `services/mesh_extractor.py` | Brain surface mesh from MRI NIfTI. antspynet `brain_extraction` skull-strip (modality param — **t1 or t2**, chosen at upload) with a morphological fallback, then marching cubes + open3d decimation. Returns vertices/faces in world RAS, centered at origin. Runs in background on upload. |
+| `services/registration.py` | CT→MRI rigid registration via SimpleITK (Mattes MI, deterministic single-thread). Saves 4×4 affine as `ct_to_mri.npy`. Also `preprocess_ct()` (table/air strip → `ct_masked.nii.gz`). Falls back to identity if images already aligned (metric near 0). |
+| `services/ct_electrode_extractor.py` | CT mesh generation (HU threshold + marching cubes) and `snap_to_blob_centroid()` — snaps a clicked world position to nearest bright CT blob centroid within 8mm. Applies the registration transform so CT aligns with the brain mesh. |
 | `services/electrode_service.py` | Autofill: cubic spline fit parameterized by contact number (not arc length). Interpolates between placed contacts, linear extrapolation beyond the manual range. Blob-snap applied to interpolated contacts only. |
-| `services/structure_extractor.py` | **PARKED. Do not wire to UI.** Harvard-Oxford atlas mesh extraction via nilearn. Produces MNI152-space structures — not patient-specific, misleading for surgical use without registration. |
-| `migrate_shaft_fields.py` | One-time migration: adds shaft metadata columns to existing DB. |
-| `migrate_lock_fields.py` | One-time migration: adds `is_complete` and `is_locked` columns. |
+| `services/structure_extractor.py` | **ACTIVE — patient-specific, wired to UI.** antspynet `deep_atropos` (subcortical) + `desikan_killiany_tourville_labeling` (cortical DKT) run on the patient's own T1 — native space, no MNI atlas. Extracts ~84 structures across 6 groups as meshes aligned to the brain mesh. Cached as per-structure JSON + `structures_cortical.nii.gz`. (Superseded the old parked nilearn/Harvard-Oxford MNI152 approach.) |
+| `migrate_shaft_fields.py` / `migrate_lock_fields.py` / `migrate_deleted_at.py` / `migrate_registration_confirmed.py` | One-time, idempotent column-add migrations for existing DBs (shaft metadata, `is_complete`/`is_locked`, `deleted_at`, `registration_confirmed`). |
 
 ### Frontend (`frontend/src/`)
 
 | File | Purpose |
 |---|---|
 | `App.jsx` | Root. Manages page state (list/viewer/login), session restore, URL routing for share links. |
-| `store.js` | Zustand global state: user, token, reconstruction, meshData, isEditorMode, shaftVisibility, selectedShaftId, activeContactNumber, brainOpacity. Also holds `structuresData`/`structureVisible` (unused, parked). |
-| `api.js` | All axios API calls. Auth token injected via interceptor. |
+| `store.js` | Zustand global state: user, token, reconstruction, meshData, isEditorMode, shaftVisibility, selectedShaftId, activeContactNumber, brainOpacity, `structuresData`, `structureVisible` (**both active**), `setStructureVisibleMany` (bulk toggle for the structure tree). |
+| `api.js` | All axios API calls. Auth token injected via interceptor. Includes `confirmRegistration`. |
 | `index.css` | Global dark theme styles. Defines `@keyframes spin`, `pulse`, `fadeIn`. |
 | `components/LoginPage.jsx` | Login form. |
-| `components/ReconstructionList.jsx` | Home page. Two-column layout: In Progress (left 320px) and Completed (right flex). Shows shaft/contact counts. Upload form. Polls every 10s. |
-| `components/Header.jsx` | Top bar. Clickable logo → home. Mark Complete toggle. Edit button (disabled when locked). |
+| `components/ReconstructionList.jsx` | Home page. Two-column layout: In Progress (left 320px) and Completed (right flex). Shows shaft/contact counts. Upload form with **MRI modality (T1/T2) selector**. Polls every 10s. |
+| `components/Header.jsx` | Top bar. Clickable logo → home. Mark Complete toggle. Edit button (disabled when locked). "⚠ Reg. unreviewed" badge when a CT is registered but not yet confirmed. |
 | `components/ReconstructionViewer.jsx` | Main viewer shell. Owns: CT mesh loading, MRI visibility, threshold debounce (400ms), undo stack, lock/complete state. Wraps content in MultiViewLayout. Draggable right-panel resizer. Auto-enters edit mode for in-progress reconstructions. |
-| `components/MultiViewLayout.jsx` | Four-panel layout: left column of view selector buttons (3D + sagittal/axial/coronal), main view area. Manages shared slicePositions for cross-view locators. |
-| `components/Viewer3D.jsx` | Three.js canvas. Renders brain mesh, CT artifact mesh, electrode shafts/contacts/lines. OrbitControls. StructureMesh component exists but is never called (parked). |
+| `components/MultiViewLayout.jsx` | Left column of view selector buttons (3D + sagittal/axial/coronal, **plus Fusion when a CT is registered**) and main view area. Manages shared slicePositions for cross-view locators. Hosts the registration review/confirm bar in the Fusion view. |
+| `components/Viewer3D.jsx` | Three.js canvas. Renders brain mesh, CT artifact mesh, electrode shafts/contacts/lines, **and structure meshes (StructureMesh — now active)**. OrbitControls. |
 | `components/CTArtifactMesh.jsx` | Renders CT threshold mesh as white semi-transparent surface. Handles click-to-place contacts (only when activeContactNumber != null). |
-| `components/SliceViewer.jsx` | MRI slice viewer. Client-side cache + prefetch (10 ahead, 4 behind, 6 concurrent requests). Scroll wheel + vertical scrollbar. Depth-filtered electrode dot projection (±4mm). LocatorOverlay corner thumbnail. |
-| `components/ElectrodeEditor.jsx` | Right panel in edit mode. CT threshold slider, MRI toggle/opacity, shaft list (draggable divider), contact selector grid, autofill bar. Contains ColorPicker (50 named colors) and ContactSelector sub-components. |
+| `components/SliceViewer.jsx` | MRI slice viewer. Client-side cache + prefetch (10 ahead, 4 behind, 6 concurrent requests). Scroll wheel + vertical scrollbar. Depth-filtered electrode dot projection (±4mm). Structure-label overlay. LocatorOverlay corner thumbnail. |
+| `components/FusionSliceViewer.jsx` | Registration-QA fusion view. MRI grayscale base + **red-tinted** CT (resampled into the MRI plane by `/fusion-slice`) with an MRI↔CT blend slider, per-axis switch, scroll nav. |
+| `components/ElectrodeEditor.jsx` | Right panel in edit mode. CT threshold slider, MRI toggle/opacity, **hierarchical brain-structure tree (Group → Side → Structure, tri-state checkboxes)**, shaft list (draggable divider), contact selector grid, autofill bar. Contains ColorPicker (50 named colors), ContactSelector, TriStateCheckbox sub-components. |
 | `components/LayerPanel.jsx` | **Dead code.** Safe to delete. |
 | `components/CTSlicePlanes.jsx` | **Dead code.** Safe to delete. |
 
@@ -91,7 +99,8 @@ users:              id, username, hashed_password, role (viewer/editor/admin), c
 
 reconstructions:    id, patient_id, label, share_token, created_by,
                     created_at, updated_at, mesh_path, mri_path, ct_path,
-                    status, is_complete, is_locked
+                    status, is_complete, is_locked,
+                    registration_confirmed, deleted_at
 
 electrode_shafts:   id, reconstruction_id, name, label,
                     electrode_type (depth/strip/grid), color, visible,
@@ -132,8 +141,11 @@ electrode_contacts: id, shaft_id, contact_number, x, y, z,
 - `POST /api/reconstructions/{id}/prerender-slices` warms PNG cache in background on viewer open
 - Frontend: client-side Map cache, prefetch 10 ahead / 4 behind, max 6 concurrent requests
 
-### Brain Structures — Deliberately Parked
-The Harvard-Oxford atlas produces MNI152-space meshes. Displaying these in patient space without registration is dangerous for surgical planning. The backend code (`structure_extractor.py`) and frontend dead code (`structuresData` in store, `StructureMesh` in Viewer3D) are left in place but not wired to any UI. Revisit only when ANTsPy or SynthSeg registration pipeline is implemented.
+### Brain Structures — Now Patient-Specific (was parked)
+The old concern (Harvard-Oxford MNI152 atlas meshes shown in patient space without registration) was resolved by switching to **antspynet `deep_atropos` + DKT parcellation run directly on the patient's own T1** — native space, patient-specific, no atlas registration. This is now fully wired: `/structures` endpoint, "⊕ Load" button, hierarchical Group→Side→Structure tree in `ElectrodeEditor`, and `StructureMesh` rendering in `Viewer3D` + label overlays in `SliceViewer`. ~84 structures; a handful of the smallest DKT regions (accumbens, frontal/temporal poles) may report "no voxels" — minor completeness gap, not a correctness issue.
+
+### Registration QA — Fusion Viewer + Manual Confirmation
+CT→MRI registration accuracy previously had no check beyond "does `ct_to_mri.npy` exist". Added a Fusion view (`/fusion-slice` resamples the CT onto the MRI plane via true oblique 3D trilinear resampling; frontend overlays it red over the MRI with a blend slider) and a `registration_confirmed` flag an editor sets via "Looks correct" — auto-resets whenever registration re-runs. Not a hard gate; surfaces an "unreviewed" banner/badge. **Status: on branch `registration-qa` (PR #2), not yet merged to main.** Follow-ups not built: persisted MI metric, square spyglass lens, at-a-glance ReconCard badge.
 
 ---
 
@@ -150,8 +162,11 @@ PATCH  /api/reconstructions/{id}/status             set is_complete, is_locked
 GET    /api/reconstructions/{id}/mesh               brain surface mesh JSON
 GET    /api/reconstructions/{id}/ct-mesh            CT threshold mesh JSON
 GET    /api/reconstructions/{id}/mri-slice          ?axis=axial&slice_idx=90
+GET    /api/reconstructions/{id}/structure-slice    label overlay PNG for a slice
+GET    /api/reconstructions/{id}/fusion-slice       CT resampled into MRI plane (registration QA)
 POST   /api/reconstructions/{id}/prerender-slices   warm slice cache
-GET    /api/reconstructions/{id}/structures         PARKED - MNI atlas meshes
+GET    /api/reconstructions/{id}/structures         ACTIVE - patient-specific antspynet meshes
+PATCH  /api/reconstructions/{id}/registration-confirm  set/clear registration_confirmed
 
 POST   /api/shafts                                  create shaft
 PATCH  /api/shafts/{id}                             update shaft fields
@@ -169,37 +184,44 @@ POST   /api/reconstructions/{id}/snap-to-blob       snap world pos to CT blob
 
 *(Update this section each session)*
 
-**Last worked on:** Attempted to add brain substructures visualization using nilearn Harvard-Oxford atlas. Abandoned because atlas is in MNI152 space and not patient-specific — would be misleading for surgical planning. Removed the UI, left backend code parked.
+**Last worked on (2026-07-21):** Got the app running end-to-end and shipped several fixes/features across two PR branches off `main`:
+- `fix-bcrypt-and-mri-modality` (**PR #1**): bcrypt startup-crash fix, MRI T1/T2 modality selector, file-input layout fix, open3d dependency (fixes mesh-decimation crash on real data), hierarchical brain-structure checkbox tree.
+- `registration-qa` (**PR #2**, stacked on PR #1): fusion slice viewer + manual registration confirmation. See design section above.
 
-**Compile issue:** `ElectrodeEditor.jsx` had a JSX syntax error introduced during structures removal (regex ate a closing `}` from a comment). Multiple repair attempts were made. If the file still fails to compile on your machine, the error is around the `{/* ── SHAFT HEADER ── */}` comment — verify it has the closing `}`.
+Neither PR is merged to `main` yet. Verified end-to-end against real patient data (`PY26N009_dev1`): mesh extraction, CT registration (valid rigid transform, MI −0.58), ~84 patient-specific structures, and the fusion overlay (CT skull concentric around MRI brain).
 
-**Everything else working:**
-- 3D brain + CT + electrode visualization
-- MRI slice viewer (sagittal/axial/coronal) with smooth scrolling, electrode projection, cross-view locators
+**Working:**
+- 3D brain + CT + electrode + **patient-specific structure** visualization
+- MRI slice viewer (sagittal/axial/coronal) with smooth scrolling, electrode + structure-label projection, cross-view locators
 - Electrode placement workflow (click CT → snap to blob → place contact)
 - Autofill (spline fit)
-- Lock/complete workflow
-- Role-based auth
+- Lock/complete workflow, role-based auth
+- CT→MRI registration + fusion-view QA (on branch)
+
+**Note:** the JSX compile issue previously flagged in `ElectrodeEditor.jsx` (`{/* ── SHAFT HEADER ── */}`) is resolved — the comment has its closing brace and the file compiles.
 
 ---
 
 ## Next Steps
 
-1. **Confirm ElectrodeEditor.jsx compiles** — check browser console after npm start
-2. **CSV/Excel export of electrode coordinates** — shaft name, contact number, x/y/z mm. High clinical value for sharing with analysis tools (MNI coords would require registration first).
-3. **Test with real multi-patient data** — multiple shafts, verify autofill and slice projections
-4. **Share link review mode** — read-only viewer for completed reconstructions without login (token generated, endpoint exists, UI not fully wired)
-5. **ANTsPy/SynthSeg registration** — prerequisite for brain substructures and contact-to-atlas labeling
-6. **FreeSurfer surface import** — upload lh.pial/rh.pial as brain surface instead of marching cubes
-7. **AWS deployment** — behind JHU VPN IP allowlist, HTTPS, proper secret management
+1. **Merge PR #1 then PR #2** (retarget PR #2 to `main` after PR #1 merges)
+2. **Registration-QA follow-ups** — persist the SimpleITK MI metric (currently logged then discarded), square spyglass lens in the fusion view, at-a-glance registration badge on ReconCard
+3. **CSV/Excel export of electrode coordinates** — shaft name, contact number, x/y/z mm. High clinical value for sharing with analysis tools
+4. **Contact-to-structure labeling** — now feasible since structures are patient-specific; report which DKT/subcortical region each contact falls in
+5. **Fill the 6 missing DKT structures** — accumbens, frontal pole, temporal pole (bilateral) report "no voxels"; verify label indices vs. the antspynet DKT scheme
+6. **Test with more multi-patient data** — multiple shafts, verify autofill and slice projections across cases
+7. **Share link review mode** — read-only viewer for completed reconstructions without login (token generated, endpoint exists, UI not fully wired)
+8. **FreeSurfer surface import** — upload lh.pial/rh.pial as brain surface instead of marching cubes
+9. **AWS deployment** — behind JHU VPN IP allowlist, HTTPS, proper secret management; migrate SQLite → Postgres for multi-user
 
 ---
 
 ## Known Gotchas
 
-- `numpy < 2.0` required — see Critical note above
+- `numpy < 2.0`, `bcrypt==4.0.1`, and `open3d` are load-bearing pins — see Critical notes above
 - `LayerPanel.jsx` and `CTSlicePlanes.jsx` are dead code
-- `structure_extractor.py` is parked dead code — do not wire to UI
 - Always filter `c.x_mm != null` before using contact coordinates (placeholders have null coords)
-- MRI slice cache is in-memory, resets on backend restart (first scroll after restart is slower — normal)
-- The `structures` endpoint at `/api/reconstructions/{id}/structures` exists in `main.py` but should not be called until patient-specific segmentation is available
+- MRI + CT slice caches are in-memory, reset on backend restart (first scroll after restart is slower — normal)
+- **The uvicorn `--reload` watcher is unreliable on this Windows setup** — it can silently stop picking up changes. If backend edits don't take effect, kill the uvicorn process and restart it manually.
+- Structures/fusion antspynet passes are CPU-only on native Windows (no GPU under TensorFlow ≥2.11) — first structure computation for a case takes minutes; results are cached to disk afterward.
+- Upload only **T1 or T2** MRI (modality is selected at upload and drives skull-strip); other contrasts are out-of-distribution for the antspynet model.
