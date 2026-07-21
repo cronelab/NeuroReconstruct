@@ -456,6 +456,7 @@ async def create_reconstruction(
     patient_id: str = Form(...),
     label: str = Form(...),
     mri_file: UploadFile = File(...),
+    mri_modality: str = Form("t1"),
     ct_file: Optional[UploadFile] = File(None),
     ct_preregistered: bool = Form(False),
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -463,6 +464,9 @@ async def create_reconstruction(
     db: AsyncSession = Depends(get_db),
 ):
     """Upload NIfTI files and kick off mesh extraction in background."""
+    mri_modality = mri_modality.lower()
+    if mri_modality not in ("t1", "t2"):
+        raise HTTPException(status_code=400, detail="mri_modality must be 't1' or 't2'")
     recon_dir = os.path.join(DATA_DIR, f"recon_{uuid.uuid4().hex[:8]}")
     os.makedirs(recon_dir, exist_ok=True)
 
@@ -491,7 +495,7 @@ async def create_reconstruction(
     await db.refresh(recon)
 
     # Run mesh extraction in background
-    background_tasks.add_task(_extract_mesh_background, recon.id, mri_path, recon_dir, ct_path, ct_preregistered)
+    background_tasks.add_task(_extract_mesh_background, recon.id, mri_path, recon_dir, ct_path, ct_preregistered, mri_modality)
 
     return recon
 
@@ -500,6 +504,7 @@ async def create_reconstruction(
 async def upload_reconstruction_files(
     recon_id: int,
     mri_file: Optional[UploadFile] = File(None),
+    mri_modality: str = Form("t1"),
     ct_file: Optional[UploadFile] = File(None),
     ct_preregistered: bool = Form(False),
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -507,6 +512,9 @@ async def upload_reconstruction_files(
     db: AsyncSession = Depends(get_db),
 ):
     """Upload or replace MRI/CT files for an existing reconstruction and re-run processing."""
+    mri_modality = mri_modality.lower()
+    if mri_modality not in ("t1", "t2"):
+        raise HTTPException(status_code=400, detail="mri_modality must be 't1' or 't2'")
     result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
     recon = result.scalar_one_or_none()
     if not recon:
@@ -548,12 +556,12 @@ async def upload_reconstruction_files(
     await db.commit()
 
     if mri_path:
-        background_tasks.add_task(_extract_mesh_background, recon_id, mri_path, recon_dir, ct_path, ct_preregistered)
+        background_tasks.add_task(_extract_mesh_background, recon_id, mri_path, recon_dir, ct_path, ct_preregistered, mri_modality)
 
     return {"status": "processing"}
 
 
-async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str, ct_path: str = None, ct_preregistered: bool = False):
+async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str, ct_path: str = None, ct_preregistered: bool = False, mri_modality: str = "t1"):
     """Background task: extract brain mesh from MRI NIfTI, then register CT if available."""
     from database import AsyncSessionLocal
     import hashlib
@@ -582,9 +590,9 @@ async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str,
                 _shutil.copy2(existing_mesh, mesh_path)
                 print(f"[MESH] Reused existing mesh from {os.path.dirname(existing_mesh)}")
             else:
-                await loop.run_in_executor(None, extract_brain_mesh, mri_path, mesh_path, None)
+                await loop.run_in_executor(None, extract_brain_mesh, mri_path, mesh_path, None, mri_modality)
         else:
-            await loop.run_in_executor(None, extract_brain_mesh, mri_path, mesh_path, None)
+            await loop.run_in_executor(None, extract_brain_mesh, mri_path, mesh_path, None, mri_modality)
         status = "ready"
     except Exception as e:
         import traceback

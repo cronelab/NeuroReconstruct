@@ -23,6 +23,7 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
   const [uploadError, setUploadError] = useState('');
   const mriRef = useRef(null);
   const ctRef  = useRef(null);
+  const [mriModality, setMriModality] = useState('t1');
 
   const handleUploadFiles = useCallback(async () => {
     const mriFile = mriRef.current?.files?.[0];
@@ -33,6 +34,7 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
     try {
       const fd = new FormData();
       fd.append('mri_file', mriFile);
+      fd.append('mri_modality', mriModality);
       if (ctFile) fd.append('ct_file', ctFile);
       await uploadReconstructionFiles(reconId, fd);
       setReconstruction({ ...reconstruction, has_mri: true, status: 'processing' });
@@ -41,7 +43,7 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
     } finally {
       setUploading(false);
     }
-  }, [reconId, reconstruction, setReconstruction]);
+  }, [reconId, reconstruction, setReconstruction, mriModality]);
 
   // Shared slice positions: { axis -> { idx, count } }
   const [slicePositions, setSlicePositions] = useState({
@@ -168,7 +170,18 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
                     <span style={{ fontSize: 13, color: '#7a8a99', fontFamily: 'IBM Plex Sans, sans-serif' }}>Upload MRI to enable slice viewing</span>
                     <label style={{ width: '100%' }}>
                       <span style={{ fontSize: 11, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>MRI (.nii.gz) *</span>
-                      <input ref={mriRef} type="file" accept=".nii.gz,.nii" style={{ display: 'block', marginTop: 4, width: '100%', fontSize: 11, color: '#e8edf2', fontFamily: 'IBM Plex Mono, monospace' }} />
+                      <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                        <input ref={mriRef} type="file" accept=".nii.gz,.nii" style={{ flex: 1, minWidth: 0, fontSize: 11, color: '#e8edf2', fontFamily: 'IBM Plex Mono, monospace' }} />
+                        <select
+                          value={mriModality}
+                          onChange={e => setMriModality(e.target.value)}
+                          title="MRI contrast — used to select the correct skull-stripping model"
+                          style={{ fontSize: 11, background: '#0a0c10', color: '#e8edf2', border: '1px solid #2a3340', borderRadius: 3, fontFamily: 'IBM Plex Mono, monospace' }}
+                        >
+                          <option value="t1">T1</option>
+                          <option value="t2">T2</option>
+                        </select>
+                      </div>
                     </label>
                     <label style={{ width: '100%' }}>
                       <span style={{ fontSize: 11, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>CT (.nii.gz) — optional, triggers coregistration</span>

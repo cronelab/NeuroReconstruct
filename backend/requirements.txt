@@ -10,5 +10,6 @@ sqlalchemy==2.0.30
 aiosqlite==0.20.0
 pydantic==2.7.1
 python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
+passlib==1.7.4
+bcrypt==4.0.1
 Pillow==10.3.0
