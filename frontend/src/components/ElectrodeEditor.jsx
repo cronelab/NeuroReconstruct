@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { useAppStore } from '../store';
 import { createShaft, autofillShaft, deleteContact, updateShaft, initContacts } from '../api';
 import api from '../api';
+import CtHistogramSlider from './CtHistogramSlider';
 
 const ELECTRODE_TYPES = [
   { value: 'depth', label: 'Depth (sEEG)' },
@@ -358,7 +359,7 @@ function ContactSelector({ shaft, activeContactNumber, setActiveContactNumber, o
 }
 
 export default function ElectrodeEditor({
-  reconId,
+  reconId, shareToken,
   isLocked = false, onShaftsUpdated, onThresholdChange, hasCtFile,
   showMri, setShowMri, mriOpacity, setMriOpacity, hasMesh,
   onUndo, undoAvailable,
@@ -369,8 +370,13 @@ export default function ElectrodeEditor({
   const { reconstruction, selectedShaftId, setSelectedShaftId, structuresData, structureVisible, setStructureVisible, setStructureVisibleMany } = useAppStore();
   const [localStructuresLoading, setLocalStructuresLoading] = useState(false);
 
-  const [huThreshold, setHuThreshold] = useState(1500);
-  const debouncedThreshold = useDebounce(huThreshold, 400);
+  // CT HU window: floor (lower bound) + ceiling (upper bound). Ceiling defaults
+  // to the top of the range = open top (includes all bright metal), matching
+  // the previous floor-only behavior.
+  const [huFloor, setHuFloor] = useState(1500);
+  const [huCeiling, setHuCeiling] = useState(3100);
+  const debFloor = useDebounce(huFloor, 400);
+  const debCeiling = useDebounce(huCeiling, 400);
 
   const [showNewShaft, setShowNewShaft] = useState(false);
   const [newShaft, setNewShaft] = useState({
@@ -414,8 +420,8 @@ export default function ElectrodeEditor({
   const manualContacts = selectedShaft?.contacts?.filter(c => c.is_manual && c.x_mm != null) || [];
   const canAutofill = manualContacts.length >= 2;
 
-  useEffect(() => { onThresholdChange?.(huThreshold); }, []);
-  useEffect(() => { onThresholdChange?.(debouncedThreshold); }, [debouncedThreshold]);
+  useEffect(() => { onThresholdChange?.(huFloor, huCeiling); }, []);
+  useEffect(() => { onThresholdChange?.(debFloor, debCeiling); }, [debFloor, debCeiling]);
 
   // Keyboard undo
   useEffect(() => {
@@ -539,16 +545,18 @@ export default function ElectrodeEditor({
       {/* ── TOP BAR: CT + MRI compact controls ── */}
       <div style={{ flexShrink: 0, borderBottom: '1px solid #1e2530', background: '#0d1015' }}>
         {hasCtFile && (
-          <div style={{ padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 8, borderBottom: hasMesh ? '1px solid #1a2030' : 'none' }}>
-            <span style={{ fontSize: 13, color: '#e8edf2', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', flexShrink: 0 }}>CT</span>
-            <input type="range" min={-1000} max={3000} step={50} value={huThreshold}
-              onChange={e => setHuThreshold(Number(e.target.value))}
-              style={{ flex: 1, accentColor: '#ffdd00' }} />
-            <input type="number" min={-1000} max={3000} step={50} value={huThreshold}
-              onChange={e => { const v = Math.max(-1000, Math.min(3000, Number(e.target.value))); if (!isNaN(v)) setHuThreshold(v); }}
-              style={{ width: 68, textAlign: 'right', fontFamily: 'IBM Plex Mono, monospace', fontSize: 13, color: '#ffdd00',
-                background: '#111418', border: '1px solid #2a3340', borderRadius: 4, padding: '3px 6px' }} />
-            <span style={{ fontSize: 13, color: '#b0bec5', fontFamily: 'IBM Plex Mono, monospace', flexShrink: 0 }}>HU</span>
+          <div style={{ padding: '8px 14px', borderBottom: hasMesh ? '1px solid #1a2030' : 'none' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+              <span style={{ fontSize: 13, color: '#e8edf2', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', flexShrink: 0 }}>CT</span>
+              <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace' }}>HU window</span>
+            </div>
+            <CtHistogramSlider
+              reconId={reconId}
+              shareToken={shareToken}
+              floor={huFloor}
+              ceiling={huCeiling}
+              onChange={(f, c) => { setHuFloor(f); setHuCeiling(c); }}
+            />
           </div>
         )}
         {hasMesh && (

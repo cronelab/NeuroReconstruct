@@ -5,6 +5,7 @@ import { useAppStore } from '../store';
 import Viewer3D from './Viewer3D';
 import LayerPanel from './LayerPanel';
 import ElectrodeEditor from './ElectrodeEditor';
+import CtHistogramSlider from './CtHistogramSlider';
 import api, { snapToBlob } from '../api';
 
 function StructureRow({ structKey, s, structureVisible, setStructureVisible, stripHemisphere }) {
@@ -64,7 +65,8 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
   // CT threshold mesh state
   const [ctMeshData, setCtMeshData] = useState(null);
   const [ctMeshLoading, setCtMeshLoading] = useState(false);
-  const [currentThreshold, setCurrentThreshold] = useState(1500);
+  const [currentThreshold, setCurrentThreshold] = useState(1500);  // HU floor
+  const [currentCeiling, setCurrentCeiling] = useState(null);       // HU ceiling (null = open top; set from data_max)
   const [undoStack, setUndoStack] = useState([]); // [{shaftId, contactNumber}]
   const [showMri, setShowMri] = useState(false);
   const [showStructures, setShowStructures] = useState(false);
@@ -170,16 +172,19 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
   const thresholdDebounceRef = useRef(null);
   const autoLoadedRef = useRef(false);
 
-  const loadCtMesh = useCallback(async (threshold) => {
+  // The ceiling comes from the slider (bounded by the CT's real data_max).
+  // A null ceiling means "open top" (floor-only) and omits the param.
+  const loadCtMesh = useCallback(async (threshold, ceiling = null) => {
     const myId = ++requestIdRef.current;
     setCtMeshLoading(true);
     try {
       const params = new URLSearchParams({ threshold });
+      if (ceiling != null) params.set('ceiling', ceiling);
       if (shareToken) params.set('token', shareToken);
       const res = await api.get(`/reconstructions/${reconId}/ct-threshold-mesh?${params}`);
       if (myId !== requestIdRef.current) return;
       const d = res.data;
-      console.log('[CT Mesh]', { empty: d.empty, vertices: d.vertices?.length, faces: d.faces?.length, threshold });
+      console.log('[CT Mesh]', { empty: d.empty, vertices: d.vertices?.length, faces: d.faces?.length, threshold, ceiling });
       setCtMeshData(d.empty ? null : d);
     } catch (e) {
       console.warn('CT mesh failed', e);
@@ -215,12 +220,13 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
     finally { setStructuresLoading(false); }
   }, [reconId, shareToken, structuresData, structuresLoading]);
 
-  const handleThresholdChange = useCallback((threshold) => {
+  const handleThresholdChange = useCallback((threshold, ceiling = null) => {
     setCurrentThreshold(threshold);
+    setCurrentCeiling(ceiling);
     // Debounce CT mesh reload — avoids flooding backend while sliding
     if (thresholdDebounceRef.current) clearTimeout(thresholdDebounceRef.current);
     thresholdDebounceRef.current = setTimeout(() => {
-      loadCtMesh(threshold);
+      loadCtMesh(threshold, ceiling);
     }, 400);
   }, [loadCtMesh]);
 
@@ -358,6 +364,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
         }}>
           <ElectrodeEditor
             reconId={reconId}
+            shareToken={shareToken}
             onShaftsUpdated={loadReconstruction}
             onThresholdChange={handleThresholdChange}
             hasCtFile={reconstruction?.has_ct || false}
@@ -406,12 +413,13 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
                 </div>
                 {showCt && (
                   <div style={{ paddingLeft: 21 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                      <input type="range" min={-1000} max={3000} step={50} value={currentThreshold}
-                        onChange={e => { const v = parseInt(e.target.value); handleThresholdChange(v); }}
-                        style={{ flex: 1, accentColor: '#ffab40' }} />
-                      <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace', width: 46, textAlign: 'right' }}>{currentThreshold} HU</span>
-                    </div>
+                    <CtHistogramSlider
+                      reconId={reconId}
+                      shareToken={shareToken}
+                      floor={currentThreshold}
+                      ceiling={currentCeiling}
+                      onChange={(f, c) => handleThresholdChange(f, c)}
+                    />
                   </div>
                 )}
               </div>

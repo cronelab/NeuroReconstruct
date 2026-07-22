@@ -74,6 +74,9 @@ export const initContacts = (shaftId) =>
 export const snapToBlob = (reconId, worldPos, threshold) =>
   api.post(`/reconstructions/${reconId}/snap-to-blob`, { world_pos: worldPos, threshold });
 
+export const getCtHistogram = (reconId, token) =>
+  api.get(`/reconstructions/${reconId}/ct-histogram${token ? `?token=${token}` : ""}`);
+
 export const getStructures = (id, token) =>
   api.get(`/reconstructions/${id}/structures${token ? `?token=${token}` : ""}`);
 

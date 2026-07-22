@@ -108,7 +108,7 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
 
 
 from services.electrode_service import autofill_contacts
-from services.ct_electrode_extractor import build_threshold_mesh, snap_to_blob_centroid, _resolve_ct_path
+from services.ct_electrode_extractor import build_threshold_mesh, snap_to_blob_centroid, _resolve_ct_path, compute_ct_histogram
 
 # ── Fusion (CT-in-MRI-space) slice cache ──────────────────────────────────────
 # Fixed bone/metal window for the registration-QA fusion view — this is for
@@ -1589,15 +1589,17 @@ async def permanently_delete_reconstruction(
 async def get_ct_threshold_mesh(
     recon_id: int,
     threshold: float = Query(-200.0, ge=-1000, le=5000),
+    ceiling: Optional[float] = Query(None, ge=-1000, le=5000),
     token: Optional[str] = None,
     current_user: Optional[User] = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Return a surface mesh of all CT voxels above `threshold` HU.
-    The user adjusts the threshold interactively until only electrode
+    Return a surface mesh of CT voxels within the HU window (`threshold`,
+    `ceiling`]. `ceiling` is optional — omit it for a floor-only (open-top)
+    threshold. The user adjusts the window interactively until only electrode
     metal is visible, then clicks on the mesh to place contacts.
-    Results are cached per threshold value to avoid redundant processing.
+    Results are cached per (threshold, ceiling) value to avoid redundant work.
     """
     result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
     recon = result.scalar_one_or_none()
@@ -1635,10 +1637,42 @@ async def get_ct_threshold_mesh(
     loop = asyncio.get_event_loop()
     mesh_result = await loop.run_in_executor(
         None,
-        lambda: build_threshold_mesh(ct_abs, mesh_center, threshold, cache_dir, transform)
+        lambda: build_threshold_mesh(ct_abs, mesh_center, threshold, cache_dir, transform,
+                                     hu_ceiling=ceiling)
     )
 
     return JSONResponse(mesh_result)
+
+
+@app.get("/api/reconstructions/{recon_id}/ct-histogram")
+async def get_ct_histogram(
+    recon_id: int,
+    bins: int = Query(128, ge=16, le=512),
+    token: Optional[str] = None,
+    current_user: Optional[User] = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return a histogram of CT HU intensities for the threshold-slider background,
+    plus the CT's actual HU data range. Cached per CT.
+    """
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not current_user and recon.share_token != token:
+        raise HTTPException(status_code=403, detail="Access denied")
+    ct_abs = _abs(recon.ct_path) if recon.ct_path else None
+    if not ct_abs or not os.path.exists(ct_abs):
+        raise HTTPException(status_code=400, detail="No CT file for this reconstruction")
+
+    cache_dir = os.path.join(os.path.dirname(ct_abs), "ct_cache")
+    loop = asyncio.get_event_loop()
+    hist = await loop.run_in_executor(
+        None,
+        lambda: compute_ct_histogram(ct_abs, cache_dir=cache_dir, bins=bins)
+    )
+    return JSONResponse(hist)
 
 
 # ─── Serve React frontend (added for standalone .exe build) ──────────────────

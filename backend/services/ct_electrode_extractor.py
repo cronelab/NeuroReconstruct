@@ -42,28 +42,35 @@ def build_threshold_mesh(
     hu_threshold: float = 1500.0,
     cache_dir: str = None,
     transform: np.ndarray = None,
+    hu_ceiling: float = None,
 ) -> dict:
     """
-    Load CT NIfTI, threshold at hu_threshold, run marching cubes on the
-    binary mask, align to brain mesh coordinates, and return geometry.
+    Load CT NIfTI, window voxels to the HU range (hu_threshold, hu_ceiling],
+    run marching cubes on the binary mask, align to brain mesh coordinates,
+    and return geometry.
 
     Args:
         ct_path:      Path to CT NIfTI file
         mesh_center:  [x,y,z] offset of the MRI brain mesh center
-        hu_threshold: HU value above which voxels are rendered
+        hu_threshold: lower HU bound — voxels strictly above this are included
         cache_dir:    Directory to cache mesh JSON by threshold value
         transform:    Optional (4,4) array mapping CT world RAS -> MRI world RAS.
                       If provided, vertices are transformed into MRI space before
                       subtracting mesh_center.
+        hu_ceiling:   Optional upper HU bound — voxels at or below this are kept.
+                      None (default) means no upper limit (floor-only, open top).
 
     Returns:
         dict with vertices, faces, vertex_count, face_count
     """
-    # Cache key includes whether a transform is applied
+    # Cache key includes whether a transform is applied and the ceiling value
     reg_flag = "reg" if transform is not None else "noreg"
+    ceil_flag = "open" if hu_ceiling is None else f"{hu_ceiling:g}"
 
     if cache_dir:
-        cache_key = hashlib.md5(f"{ct_path}_{hu_threshold}_{reg_flag}".encode()).hexdigest()[:12]
+        cache_key = hashlib.md5(
+            f"{ct_path}_{hu_threshold}_{ceil_flag}_{reg_flag}".encode()
+        ).hexdigest()[:12]
         cache_path = os.path.join(cache_dir, f"ct_threshold_{cache_key}.json")
         if os.path.exists(cache_path):
             with open(cache_path) as f:
@@ -74,8 +81,11 @@ def build_threshold_mesh(
     data = img.get_fdata()
     affine = img.affine
 
-    # Create binary mask of voxels above threshold
-    binary = (data > hu_threshold).astype(np.float32)
+    # Create binary mask of voxels inside the HU window (floor, ceiling]
+    mask = data > hu_threshold
+    if hu_ceiling is not None:
+        mask &= data <= hu_ceiling
+    binary = mask.astype(np.float32)
 
     if not binary.any():
         return {
@@ -84,6 +94,7 @@ def build_threshold_mesh(
             "vertex_count": 0,
             "face_count": 0,
             "hu_threshold": hu_threshold,
+            "hu_ceiling": hu_ceiling,
             "empty": True,
         }
 
@@ -103,6 +114,7 @@ def build_threshold_mesh(
             "vertices": [], "faces": [],
             "vertex_count": 0, "face_count": 0,
             "hu_threshold": hu_threshold,
+            "hu_ceiling": hu_ceiling,
             "error": str(e),
         }
 
@@ -128,7 +140,61 @@ def build_threshold_mesh(
         "vertex_count": len(verts_aligned),
         "face_count": len(faces),
         "hu_threshold": hu_threshold,
+        "hu_ceiling": hu_ceiling,
         "empty": False,
+    }
+
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(result, f)
+
+    return result
+
+
+def compute_ct_histogram(
+    ct_path: str,
+    hu_min: float = -1000.0,
+    bins: int = 128,
+    cache_dir: str = None,
+) -> dict:
+    """
+    Compute a histogram of CT HU values for the threshold slider background.
+
+    The upper end of the histogram (and therefore the slider's ceiling range)
+    is the CT's actual maximum HU (`data_max`) — data-driven, so extended-scale
+    or metal-artifact-reduction CTs that store metal above the usual 12-bit
+    3071 ceiling are not clipped. Returns bin edges, per-bin counts, and the
+    real HU data range. Cached to disk since it's static per CT.
+    """
+    # `_v2` busts caches written by the earlier fixed-3100-ceiling version.
+    if cache_dir:
+        cache_key = hashlib.md5(
+            f"{ct_path}_{hu_min}_{bins}_hist_v2".encode()
+        ).hexdigest()[:12]
+        cache_path = os.path.join(cache_dir, f"ct_histogram_{cache_key}.json")
+        if os.path.exists(cache_path):
+            with open(cache_path) as f:
+                return json.load(f)
+
+    img = nib.load(_resolve_ct_path(ct_path))
+    data = img.get_fdata()
+
+    data_min = float(np.min(data))
+    data_max = float(np.max(data))
+
+    # Data-driven top of range; guard against a degenerate flat volume.
+    hu_max = data_max if data_max > hu_min else hu_min + 100.0
+
+    counts, edges = np.histogram(data, bins=bins, range=(hu_min, hu_max))
+
+    result = {
+        "bin_edges": edges.round(1).tolist(),      # length bins+1
+        "counts": counts.astype(int).tolist(),     # length bins
+        "hu_min": hu_min,
+        "hu_max": round(hu_max, 1),
+        "data_min": round(data_min, 1),
+        "data_max": round(data_max, 1),
     }
 
     if cache_dir:
