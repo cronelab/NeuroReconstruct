@@ -43,6 +43,12 @@ export const useAppStore = create((set, get) => ({
   isEditorMode: false,
   setEditorMode: (v) => set({ isEditorMode: v }),
 
+  // "Place contacts" mode — when true, clicking the CT places contacts and the
+  // structure/electrode hover interactions are suppressed. Placement is disabled
+  // in the hover modes. Toggled by the editor's "Place contacts" button.
+  placeMode: false,
+  setPlaceMode: (v) => set({ placeMode: v }),
+
   // Mesh data cache
   meshData: null,
   setMeshData: (data) => set({ meshData: data }),

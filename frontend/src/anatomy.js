@@ -33,17 +33,20 @@ export function isInsideMesh(point, mesh) {
   return votes >= 2;
 }
 
-// Closest cortical gyrus to a point (nearest mesh vertex ≈ nearest surface).
-// Subcortical nuclei are excluded: white matter is named by overlying cortex,
-// not by the nearest deep nucleus.
-export function nearestCorticalStructure(point, structuresData) {
+// A contact is labeled with the nearest structure only if it is within this many
+// mm of that structure's surface; beyond it the contact is left unlabelled.
+export const MAX_LABEL_DIST_MM = 2;
+
+// Closest structure to a point (nearest mesh vertex ≈ nearest surface), across
+// BOTH cortical gyri and subcortical nuclei.
+export function nearestStructure(point, structuresData) {
   if (!structuresData) return null;
   const px = point.x, py = point.y, pz = point.z;
   let best = null;
   let bestD2 = Infinity;
   for (const key in structuresData) {
     const s = structuresData[key];
-    if (!s || !s.vertices || s.group === 'subcortical') continue;
+    if (!s || !s.vertices) continue;
     const v = s.vertices;
     let localMin = Infinity;
     for (let i = 0; i < v.length; i += 3) {
@@ -100,31 +103,36 @@ export function structuresCentroid(structuresData) {
   return n ? new THREE.Vector3(sx / n, sy / n, sz / n) : new THREE.Vector3(0, 0, 0);
 }
 
-// Which structure a point sits in: an enclosing structure if any (a subcortical
-// nucleus is preferred when several overlap), otherwise the nearest cortical gyrus.
+// Which structure a contact sits in: an enclosing structure if any (a subcortical
+// nucleus is preferred when several overlap), otherwise the nearest cortical or
+// subcortical structure but only within MAX_LABEL_DIST_MM. Returns null when the
+// contact is inside nothing and more than MAX_LABEL_DIST_MM from every structure
+// (i.e. unlabelled).
 export function structureAtPoint(point, structuresData, meshes) {
   const insideKeys = [];
   meshes.forEach((mesh, key) => {
-    if (isInsideMesh(point, mesh)) insideKeys.push(key);
+    if (mesh && isInsideMesh(point, mesh)) insideKeys.push(key);
   });
   if (insideKeys.length) {
     const pick = insideKeys.find(k => structuresData[k]?.group === 'subcortical') || insideKeys[0];
     const s = structuresData[pick];
     return { key: pick, label: s?.label || pick, color: s?.color || '#e8edf2', inside: true, dist: 0 };
   }
-  const near = nearestCorticalStructure(point, structuresData);
-  return near ? { ...near, inside: false } : null;
+  const near = nearestStructure(point, structuresData);
+  return near && near.dist <= MAX_LABEL_DIST_MM ? { ...near, inside: false } : null;
 }
 
-const _pDeep = new THREE.Vector3();
-const _pSup = new THREE.Vector3();
+const _pt = new THREE.Vector3();
 
 // "insertion region-target region" label for a shaft:
-//   target     = structure at the deepmost contact       (nearest the centre)
-//   insertion  = structure at the most superficial contact (farthest from centre)
-// Depth is measured over ALL placed contacts, not just the numbered endpoints, so
-// an electrode whose tip overshoots the deepest point is still labeled correctly.
-// Returns null when the shaft has no placed contacts.
+//   insertion = region of the most SUPERFICIAL contact that has a label
+//   target    = region of the most DEEP contact that has a label
+// Every placed contact is resolved to a region (structureAtPoint); contacts that
+// are unlabelled (inside nothing and >MAX_LABEL_DIST_MM from any structure) are
+// skipped, so the two ends are the shallowest/deepest anatomically-labeled
+// contacts rather than the physical tip/entry (which often sit in white matter).
+// Depth is measured by distance to the anatomical centre (nearer = deeper).
+// Returns null when no placed contact resolves to a label.
 export function computeShaftAnatomyLabel(shaft, structuresData, meshes, centroid) {
   const contacts = (shaft.contacts || [])
     .filter(c => c.x_mm != null && c.y_mm != null && c.z_mm != null);
@@ -134,19 +142,16 @@ export function computeShaftAnatomyLabel(shaft, structuresData, meshes, centroid
     const dx = c.x_mm - centroid.x, dy = c.y_mm - centroid.y, dz = c.z_mm - centroid.z;
     return dx * dx + dy * dy + dz * dz;
   };
-  // Nearest the anatomical centre → deepest (target); farthest → superficial (insertion).
-  let deep = contacts[0], superficial = contacts[0];
-  let dMin = d2(contacts[0]), dMax = dMin;
+
+  let deep = null, superficial = null; // among labeled contacts only
   for (const c of contacts) {
+    const region = structureAtPoint(_pt.set(c.x_mm, c.y_mm, c.z_mm), structuresData, meshes);
+    if (!region) continue; // unlabelled contact — skip
     const dd = d2(c);
-    if (dd < dMin) { dMin = dd; deep = c; }
-    if (dd > dMax) { dMax = dd; superficial = c; }
+    if (!deep || dd < deep.dd) deep = { label: region.label, dd };        // nearest centre = deepest
+    if (!superficial || dd > superficial.dd) superficial = { label: region.label, dd }; // farthest = most superficial
   }
+  if (!deep) return null; // no contact resolved to a label
 
-  const target = structureAtPoint(_pDeep.set(deep.x_mm, deep.y_mm, deep.z_mm), structuresData, meshes);
-  const insertion = structureAtPoint(_pSup.set(superficial.x_mm, superficial.y_mm, superficial.z_mm), structuresData, meshes);
-
-  const tName = target?.label || 'Unknown';
-  const iName = insertion?.label || 'Unknown';
-  return `${iName}-${tName}`;
+  return `${superficial.label}-${deep.label}`;
 }

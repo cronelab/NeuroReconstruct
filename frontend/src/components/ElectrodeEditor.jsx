@@ -369,7 +369,7 @@ export default function ElectrodeEditor({
   showStructures, setShowStructures, onLoadStructures,
   structureOpacity, setStructureOpacity,
 }) {
-  const { reconstruction, selectedShaftId, setSelectedShaftId, structuresData, structureVisible, setStructureVisible, setStructureVisibleMany } = useAppStore();
+  const { reconstruction, selectedShaftId, setSelectedShaftId, structuresData, structureVisible, setStructureVisible, setStructureVisibleMany, placeMode, setPlaceMode } = useAppStore();
   const [localStructuresLoading, setLocalStructuresLoading] = useState(false);
 
   // CT HU window: floor (lower bound) + ceiling (upper bound). Ceiling defaults
@@ -801,9 +801,24 @@ export default function ElectrodeEditor({
       )}
 
       {/* ── SHAFT HEADER ── */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 14px', borderBottom: '1px solid #1e2530', flexShrink: 0, background: '#111418' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', rowGap: 6, padding: '8px 14px', borderBottom: '1px solid #1e2530', flexShrink: 0, background: '#111418' }}>
         <span style={{ ...s.sectionTitle, marginBottom: 0 }}>Electrode Shafts</span>
-        <div style={{ display: 'flex', gap: 6 }}>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end', flex: '1 1 100%', minWidth: 0 }}>
+          {!isLocked && (
+            <button
+              onClick={() => setPlaceMode(!placeMode)}
+              title={placeMode
+                ? 'Place-contacts mode is ON — click the CT to place contacts. Click to turn off and re-enable hover.'
+                : 'Turn on place-contacts mode to place contacts by clicking the CT. Hover interactions are disabled while it is on.'}
+              style={{ ...s.btn, padding: '4px 10px',
+                background: placeMode ? '#0d2a1a' : 'transparent',
+                color: placeMode ? '#00e676' : '#7a8a99',
+                border: `1px solid ${placeMode ? '#00e67655' : '#2a3340'}`,
+                cursor: 'pointer' }}
+            >
+              {placeMode ? '◎ Placing' : '◎ Place contacts'}
+            </button>
+          )}
           {!isLocked && (
             <button
               onClick={handleAutofillLabels}

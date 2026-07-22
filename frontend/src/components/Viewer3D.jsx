@@ -4,7 +4,7 @@ import { OrbitControls, Line, Html, PerspectiveCamera, Billboard } from '@react-
 import * as THREE from 'three';
 import { useAppStore } from '../store';
 import CTArtifactMesh from './CTArtifactMesh';
-import { isInsideMesh, nearestCorticalStructure } from '../anatomy';
+import { isInsideMesh, structureAtPoint } from '../anatomy';
 
 // ── Brain Mesh ────────────────────────────────────────────────────────────────
 function BrainMesh({ meshData, opacity }) {
@@ -206,16 +206,28 @@ function LoadingOverlay({ message }) {
 // editor's auto-label action so both derive a contact's region identically).
 
 export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLoading, onContactPlaced, showMri, mriOpacity, ctThreshold, ctOpacityOverride, activeContactNumber, structuresData, structureVisible, structureOpacity }) {
-  const { meshData, brainOpacity, reconstruction, isEditorMode, selectedShaftId, shaftVisibility, contactScale } = useAppStore();
+  const { meshData, brainOpacity, reconstruction, isEditorMode, selectedShaftId, shaftVisibility, contactScale, placeMode } = useAppStore();
   const [hoveredStruct, setHoveredStruct] = React.useState(null);
 
-  // Hover mode:
+  // Interaction mode has three states:
   //   'structure' → hover a structure surface, highlight the contacts inside it
   //   'electrode' → hover a contact, name the structure(s) it resides in
+  //   'place'     → placeMode is on: click the CT to place contacts; hover is off
+  // hoverMode selects between the two hover modes; placeMode (store) overrides both.
   const [hoverMode, setHoverMode] = React.useState('structure');
   const hoverModeRef = React.useRef(hoverMode);
   hoverModeRef.current = hoverMode;
+  const placeModeRef = React.useRef(placeMode);
+  placeModeRef.current = placeMode;
   const [hoveredContact, setHoveredContact] = React.useState(null);
+
+  // Placement is only permitted in place mode; hovers are only active outside it.
+  const activeMode = placeMode ? 'place' : hoverMode;
+
+  // Leaving hover state behind when place mode turns on would strand a tooltip/ring.
+  React.useEffect(() => {
+    if (placeMode) { setHoveredStruct(null); setHoveredContact(null); }
+  }, [placeMode]);
 
   // Registry of currently-rendered (visible) structure meshes, keyed by structure.
   // Populated by StructureMesh via onRegister; consulted in electrode-centric mode.
@@ -229,28 +241,19 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
   structuresDataRef.current = structuresData;
 
   const handleContactHover = React.useCallback((contactId, pos, color, label, radius) => {
-    if (hoverModeRef.current !== 'electrode') return;
+    if (placeModeRef.current || hoverModeRef.current !== 'electrode') return;
     const p = new THREE.Vector3(pos[0], pos[1], pos[2]);
     const sd = structuresDataRef.current || {};
-    const inside = [];
-    structMeshesRef.current.forEach((mesh, key) => {
-      if (!mesh) return;
-      mesh.updateMatrixWorld(true);
-      if (isInsideMesh(p, mesh)) {
-        const s = sd[key];
-        inside.push({ key, label: s?.label || key, color: s?.color || '#e8edf2' });
-      }
-    });
-    // Inside no labeled structure (e.g. cortical white matter) → report the
-    // nearest cortical gyrus rather than "outside labeled structures".
-    const nearest = inside.length === 0 ? nearestCorticalStructure(p, sd) : null;
-    setHoveredContact({ id: contactId, pos, color, label, radius, structures: inside, nearest });
+    // Region the contact sits in: enclosing structure, else nearest within 2 mm,
+    // else null (unlabelled). Same resolution the auto-label uses.
+    const region = structureAtPoint(p, sd, structMeshesRef.current);
+    setHoveredContact({ id: contactId, pos, color, label, radius, region });
   }, []);
 
   const handleContactUnhover = React.useCallback(() => setHoveredContact(null), []);
 
   const handleStructureHover = React.useCallback((key, color, label, mesh) => {
-    if (hoverModeRef.current !== 'structure') return;
+    if (placeModeRef.current || hoverModeRef.current !== 'structure') return;
     if (!mesh) return;
     mesh.updateMatrixWorld(true);
     // Read directly from store state — bypasses any closure/ref staleness
@@ -276,6 +279,10 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
 
   const shafts = reconstruction?.electrode_shafts || [];
   const selectedShaft = shafts.find(s => s.id === selectedShaftId) || null;
+
+  // Contact placement works by clicking the CT mesh, which is only interactive in
+  // place mode. In the hover modes the CT mesh is inert so hovers reach structures
+  // and contacts, and placement is disabled.
 
   const ctOpacity = ctOpacityOverride != null
     ? ctOpacityOverride
@@ -307,7 +314,7 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
             <StructureMesh key={key} meshData={s} color={s.color}
               structKey={key} structLabel={s.label} opacity={structureOpacity ?? 0.45}
               visible={structureVisible?.[key] !== false}
-              interactive={hoverMode === 'structure'}
+              interactive={activeMode === 'structure'}
               onRegister={registerStructMesh}
               onHover={handleStructureHover} onUnhover={handleStructureUnhover} />
           ) : null
@@ -329,7 +336,7 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
             selectedShaft={selectedShaft}
             opacity={ctOpacity}
             activeContactNumber={activeContactNumber}
-            raycastable={hoverMode !== 'electrode'}
+            raycastable={placeMode}
           />
         )}
 
@@ -345,8 +352,21 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
         />
       </Canvas>
 
-      {/* Hover-mode toggle — only meaningful once structures are loaded */}
-      {structuresData && Object.keys(structuresData).length > 0 && (
+      {/* Place-mode badge — placement is active, hover is suspended */}
+      {placeMode ? (
+        <div
+          style={{
+            position: 'absolute', top: isEditorMode ? 56 : 16, left: 16,
+            background: '#0d2a1acc', backdropFilter: 'blur(8px)',
+            border: '1px solid #00e67655', borderRadius: 4, padding: '6px 12px',
+            fontFamily: 'IBM Plex Mono, monospace', fontSize: 10, pointerEvents: 'none',
+            color: '#00e676', display: 'flex', alignItems: 'center', gap: 8,
+          }}
+        >
+          <span>◎ PLACE CONTACTS MODE</span>
+        </div>
+      ) : structuresData && Object.keys(structuresData).length > 0 && (
+        /* Hover-mode toggle — only meaningful once structures are loaded */
         <button
           onClick={() => {
             setHoveredStruct(null);
@@ -381,22 +401,22 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
           fontFamily: 'IBM Plex Mono, monospace', fontSize: 11,
           boxShadow: `0 0 12px ${hoveredContact.color}44`,
         }}>
-          <div style={{ color: hoveredContact.color, marginBottom: (hoveredContact.structures.length || hoveredContact.nearest) ? 4 : 0 }}>
+          <div style={{ color: hoveredContact.color, marginBottom: 4 }}>
             {hoveredContact.label}
           </div>
-          {hoveredContact.structures.length > 0 ? (
-            hoveredContact.structures.map(s => (
-              <div key={s.key} style={{ color: s.color, fontSize: 10 }}>{s.label}</div>
-            ))
-          ) : hoveredContact.nearest ? (
-            <div>
-              <div style={{ color: hoveredContact.nearest.color, fontSize: 10 }}>{hoveredContact.nearest.label}</div>
-              <span style={{ color: '#7a8a99', fontSize: 9 }}>
-                nearest cortex · {hoveredContact.nearest.dist.toFixed(1)} mm
-              </span>
-            </div>
+          {hoveredContact.region ? (
+            hoveredContact.region.inside ? (
+              <div style={{ color: hoveredContact.region.color, fontSize: 10 }}>{hoveredContact.region.label}</div>
+            ) : (
+              <div>
+                <div style={{ color: hoveredContact.region.color, fontSize: 10 }}>{hoveredContact.region.label}</div>
+                <span style={{ color: '#7a8a99', fontSize: 9 }}>
+                  nearest · {hoveredContact.region.dist.toFixed(1)} mm
+                </span>
+              </div>
+            )
           ) : (
-            <span style={{ color: '#7a8a99' }}>outside labeled structures</span>
+            <span style={{ color: '#7a8a99' }}>unlabelled</span>
           )}
         </div>
       )}
@@ -428,7 +448,7 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
         <span>LEFT DRAG — rotate</span>
         <span>RIGHT DRAG — pan</span>
         <span>SCROLL — zoom</span>
-        {isEditorMode && selectedShaft && activeContactNumber != null && <span style={{ color: '#ffdd00' }}>CLICK ELECTRODE — place {selectedShaft?.name}{activeContactNumber}</span>}
+        {isEditorMode && placeMode && selectedShaft && activeContactNumber != null && <span style={{ color: '#ffdd00' }}>CLICK ELECTRODE — place {selectedShaft?.name}{activeContactNumber}</span>}
       </div>
 
       {/* Active shaft indicator */}
