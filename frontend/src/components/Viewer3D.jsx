@@ -4,6 +4,7 @@ import { OrbitControls, Line, Html, PerspectiveCamera, Billboard } from '@react-
 import * as THREE from 'three';
 import { useAppStore } from '../store';
 import CTArtifactMesh from './CTArtifactMesh';
+import { isInsideMesh, nearestCorticalStructure } from '../anatomy';
 
 // ── Brain Mesh ────────────────────────────────────────────────────────────────
 function BrainMesh({ meshData, opacity }) {
@@ -201,61 +202,8 @@ function LoadingOverlay({ message }) {
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
-// ── Point-in-mesh test ────────────────────────────────────────────────────────
-// Cast from far outside toward the point, count intersections before reaching it.
-// Casting from outside (not from inside) avoids Three.js back-face culling issues.
-// Majority vote across 3 axes handles degenerate mesh edges/vertices.
-const _rc = new THREE.Raycaster();
-const _box = new THREE.Box3();
-function isInsideMesh(point, mesh) {
-  // Quick bbox reject
-  _box.setFromObject(mesh);
-  if (!_box.containsPoint(point)) return false;
-
-  const OFFSET = 500;
-  const axes = [
-    [new THREE.Vector3(point.x + OFFSET, point.y, point.z), new THREE.Vector3(-1, 0, 0)],
-    [new THREE.Vector3(point.x, point.y + OFFSET, point.z), new THREE.Vector3( 0,-1, 0)],
-    [new THREE.Vector3(point.x, point.y, point.z + OFFSET), new THREE.Vector3( 0, 0,-1)],
-  ];
-  let votes = 0;
-  for (const [origin, dir] of axes) {
-    _rc.set(origin, dir);
-    const hits = _rc.intersectObject(mesh, false).filter(h => h.distance < OFFSET - 0.01);
-    if (hits.length % 2 === 1) votes++;
-  }
-  return votes >= 2;
-}
-
-// ── Nearest cortical structure ────────────────────────────────────────────────
-// For contacts that fall inside no labeled structure (typically cortical white
-// matter), report the closest cortical gyrus instead of "outside". Distance is
-// approximated by the nearest mesh vertex — cortical meshes are dense enough that
-// this closely tracks true surface distance, and it avoids per-triangle work on a
-// hover. Subcortical nuclei are excluded: white matter is labeled by overlying
-// cortex, not by the nearest deep nucleus.
-function nearestCorticalStructure(point, structuresData) {
-  if (!structuresData) return null;
-  const px = point.x, py = point.y, pz = point.z;
-  let best = null;
-  let bestD2 = Infinity;
-  for (const key in structuresData) {
-    const s = structuresData[key];
-    if (!s || !s.vertices || s.group === 'subcortical') continue;
-    const v = s.vertices;
-    let localMin = Infinity;
-    for (let i = 0; i < v.length; i += 3) {
-      const dx = v[i] - px, dy = v[i + 1] - py, dz = v[i + 2] - pz;
-      const d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 < localMin) localMin = d2;
-    }
-    if (localMin < bestD2) {
-      bestD2 = localMin;
-      best = { key, label: s.label || key, color: s.color || '#e8edf2' };
-    }
-  }
-  return best ? { ...best, dist: Math.sqrt(bestD2) } : null;
-}
+// Point-in-mesh and nearest-cortical helpers live in ../anatomy (shared with the
+// editor's auto-label action so both derive a contact's region identically).
 
 export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLoading, onContactPlaced, showMri, mriOpacity, ctThreshold, ctOpacityOverride, activeContactNumber, structuresData, structureVisible, structureOpacity }) {
   const { meshData, brainOpacity, reconstruction, isEditorMode, selectedShaftId, shaftVisibility, contactScale } = useAppStore();

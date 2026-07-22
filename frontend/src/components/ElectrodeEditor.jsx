@@ -3,6 +3,7 @@ import { useAppStore } from '../store';
 import { createShaft, autofillShaft, deleteContact, updateShaft, initContacts } from '../api';
 import api from '../api';
 import CtHistogramSlider from './CtHistogramSlider';
+import { buildStructureMeshes, structuresCentroid, computeShaftAnatomyLabel } from '../anatomy';
 
 const ELECTRODE_TYPES = [
   { value: 'depth', label: 'Depth (sEEG)' },
@@ -400,6 +401,8 @@ export default function ElectrodeEditor({
   const [deleteShaftError, setDeleteShaftError] = useState(null);
   const [autofilling, setAutofilling] = useState(false);
   const [autofillMsg, setAutofillMsg] = useState('');
+  const [labelingBusy, setLabelingBusy] = useState(false);
+  const [labelMsg, setLabelMsg] = useState('');
   const [leftWidth, setLeftWidth] = React.useState(150);
   const isDragging = React.useRef(false);
 
@@ -516,6 +519,46 @@ export default function ElectrodeEditor({
     } finally {
       setAutofilling(false);
       setTimeout(() => setAutofillMsg(''), 4000);
+    }
+  };
+
+  // Auto-label each depth shaft as "insertion region-target region", where the
+  // target is the structure at the deepmost contact and the insertion is the
+  // structure at the most superficial contact. Overwrites existing labels.
+  const handleAutofillLabels = async () => {
+    if (isLocked || labelingBusy) return;
+    if (!structuresData || Object.keys(structuresData).length === 0) {
+      setLabelMsg('✗ Load brain structures first');
+      setTimeout(() => setLabelMsg(''), 4000);
+      return;
+    }
+    const depthShafts = shafts.filter(sh => sh.electrode_type === 'depth');
+    if (depthShafts.length === 0) {
+      setLabelMsg('✗ No depth electrodes to label');
+      setTimeout(() => setLabelMsg(''), 4000);
+      return;
+    }
+    setLabelingBusy(true);
+    setLabelMsg('Deriving anatomy…');
+    let meshes = null;
+    try {
+      meshes = buildStructureMeshes(structuresData);
+      const centroid = structuresCentroid(structuresData);
+      let updated = 0, skipped = 0;
+      for (const sh of depthShafts) {
+        const label = computeShaftAnatomyLabel(sh, structuresData, meshes, centroid);
+        if (!label) { skipped++; continue; }
+        await updateShaft(sh.id, { label });
+        updated++;
+      }
+      await onShaftsUpdated?.();
+      setLabelMsg(`✓ Labeled ${updated} electrode${updated !== 1 ? 's' : ''}${skipped ? ` · ${skipped} skipped (no contacts)` : ''}`);
+    } catch (e) {
+      setLabelMsg('✗ Failed: ' + (e.response?.data?.detail || e.message || 'error'));
+    } finally {
+      if (meshes) meshes.forEach(m => m.geometry.dispose());
+      setLabelingBusy(false);
+      setTimeout(() => setLabelMsg(''), 5000);
     }
   };
 
@@ -761,6 +804,16 @@ export default function ElectrodeEditor({
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 14px', borderBottom: '1px solid #1e2530', flexShrink: 0, background: '#111418' }}>
         <span style={{ ...s.sectionTitle, marginBottom: 0 }}>Electrode Shafts</span>
         <div style={{ display: 'flex', gap: 6 }}>
+          {!isLocked && (
+            <button
+              onClick={handleAutofillLabels}
+              disabled={labelingBusy}
+              title="Auto-fill each depth electrode's label as “insertion region-target region” from the brain structures (overwrites existing labels). Requires loaded structures."
+              style={{ ...s.btn, padding: '4px 10px', background: '#1a1522', color: labelingBusy ? '#7a8a99' : '#c8a2ff', border: '1px solid #3a2a52', cursor: labelingBusy ? 'default' : 'pointer' }}
+            >
+              {labelingBusy ? 'Labeling…' : '🏷 Auto-label'}
+            </button>
+          )}
           {undoAvailable && (
             <button
               style={{ ...s.btn, ...s.btnUndo, padding: '4px 10px' }}
@@ -780,6 +833,11 @@ export default function ElectrodeEditor({
           </button>
         </div>
       </div>
+      {labelMsg && (
+        <div style={{ padding: '6px 14px', fontSize: 12, fontFamily: 'IBM Plex Mono, monospace', color: labelMsg.startsWith('✗') ? '#ff8a80' : '#c8a2ff', borderBottom: '1px solid #1e2530', background: '#0d1015', flexShrink: 0 }}>
+          {labelMsg}
+        </div>
+      )}
 
       {/* ── New shaft form ────────────────────────────────── */}
       {showNewShaft && (
