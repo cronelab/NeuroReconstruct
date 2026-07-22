@@ -109,6 +109,7 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
   const inFlightRef = useRef(new Set());
   const queueRef = useRef([]); // pending prefetch indices
   const activeCountRef = useRef(0);
+  const pendingCbRef = useRef(new Map()); // idx -> [onDone,...] waiting on an in-flight fetch
 
   const sliceIdxRef = useRef(0);
   const sliceCountRef = useRef(1);
@@ -309,9 +310,20 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
   }, []); // eslint-disable-line
 
   const doFetch = useCallback(async (idx, onDone) => {
-    if (!reconId || inFlightRef.current.has(idx)) return;
+    if (!reconId) return;
     if (idx >= 0 && cacheRef.current.has(idx)) {
       onDone?.(cacheRef.current.get(idx), idx);
+      return;
+    }
+    if (inFlightRef.current.has(idx)) {
+      // Already loading (e.g. a prefetch). Attach this waiter so dragging onto
+      // an in-flight slice still displays it once the fetch resolves, instead
+      // of silently dropping the request.
+      if (onDone) {
+        const arr = pendingCbRef.current.get(idx) || [];
+        arr.push(onDone);
+        pendingCbRef.current.set(idx, arr);
+      }
       return;
     }
     inFlightRef.current.add(idx);
@@ -348,11 +360,14 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
       const entry = { bitmap, worldCoord, voxelSize, pxWidthMm, pxHeightMm };
       if (actual >= 0) cacheRef.current.set(actual, entry);
       onDone?.(entry, actual);
+      const waiters = pendingCbRef.current.get(idx);
+      if (waiters) { pendingCbRef.current.delete(idx); waiters.forEach(cb => cb(entry, actual)); }
     } catch (e) {
       setErrorMsg(e.message);
       setStatus('error');
     } finally {
       inFlightRef.current.delete(idx);
+      pendingCbRef.current.delete(idx); // clear any waiters stranded by an error
       activeCountRef.current = Math.max(0, activeCountRef.current - 1);
       processQueue();
     }
@@ -362,18 +377,29 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
     const clamped = Math.max(0, Math.min(sliceCountRef.current - 1, idx));
     sliceIdxRef.current = clamped;
 
+    // Move the scrollbar/label to the requested slice NOW, synchronously —
+    // the input is controlled by sliceLabel.idx, so if we waited for the async
+    // image to load the thumb would snap back to the previous value mid-drag.
+    setSliceLabel({ idx: clamped, count: sliceCountRef.current });
+    onSliceChange?.(clamped, sliceCountRef.current);
+
+    // Point the overlay at THIS slice (cached bitmap or nothing) so we never
+    // paint a different slice's shading over the new base while it loads.
+    if (useAppStore.getState().structuresData) {
+      overlayRef.current = overlayCacheRef.current.get(clamped) || null;
+    }
+
     const showEntry = (entry, actual) => {
-      if (sliceIdxRef.current !== actual) return; // superseded
+      if (sliceIdxRef.current !== actual) return; // superseded by a newer scroll
       currentEntryRef.current = entry;
-      setSliceLabel({ idx: actual, count: sliceCountRef.current });
       setStatus('ok');
       triggerDraw();
-      onSliceChange?.(actual, sliceCountRef.current);
     };
 
     if (cacheRef.current.has(clamped)) {
       showEntry(cacheRef.current.get(clamped), clamped);
     } else {
+      triggerDraw(); // redraw immediately (clears stale overlay) while the base loads
       doFetch(clamped, showEntry);
     }
 
@@ -385,7 +411,7 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
 
     // Fetch structure overlay for this slice if structures are loaded
     if (useAppStore.getState().structuresData) fetchOverlay(clamped);
-  }, [doFetch, triggerDraw, processQueue]);
+  }, [doFetch, triggerDraw, processQueue, onSliceChange, fetchOverlay]);
 
   // When structuresData loads/unloads or visibility changes, clear cache and re-fetch
   useEffect(() => {

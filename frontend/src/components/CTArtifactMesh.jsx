@@ -19,7 +19,6 @@ export default function CTArtifactMesh({ meshData, isEditorMode, onContactPlaced
     return geo;
   }, [meshData]);
 
-  console.log('[CTArtifactMesh] rendering, opacity=', opacity, 'geo=', geometry ? 'ok' : 'null', 'meshData=', meshData?.vertices?.length);
   if (!geometry) return null;
 
   const canPlace = isEditorMode && !!selectedShaft && activeContactNumber != null;
