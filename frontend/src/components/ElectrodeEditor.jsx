@@ -392,6 +392,9 @@ export default function ElectrodeEditor({
   });
 
   const [editingShaft, setEditingShaft] = useState(null); // shaft being inline-edited
+  const [shaftToDelete, setShaftToDelete] = useState(null); // { id, name } pending delete
+  const [deletingShaft, setDeletingShaft] = useState(false);
+  const [deleteShaftError, setDeleteShaftError] = useState(null);
   const [autofilling, setAutofilling] = useState(false);
   const [autofillMsg, setAutofillMsg] = useState('');
   const [leftWidth, setLeftWidth] = React.useState(150);
@@ -514,18 +517,25 @@ export default function ElectrodeEditor({
     }
   };
 
-  const handleDeleteShaft = async (shaftId, shaftName) => {
-    if (isLocked) return;
-    if (!window.confirm(`Delete electrode shaft "${shaftName}" and all its contacts? This cannot be undone.`)) return;
+  // Shaft deletion uses an in-app confirmation modal (not window.confirm, which
+  // browsers silently suppress once dialogs are blocked — making delete appear
+  // to do nothing). `shaftToDelete` holds { id, name } for the pending delete.
+  const confirmDeleteShaft = async () => {
+    if (!shaftToDelete) return;
+    setDeletingShaft(true);
+    setDeleteShaftError(null);
     try {
-      await api.delete(`/reconstructions/shafts/${shaftId}`);
-      if (selectedShaftId === shaftId) {
+      await api.delete(`/reconstructions/shafts/${shaftToDelete.id}`);
+      if (selectedShaftId === shaftToDelete.id) {
         setSelectedShaftId(null);
         setActiveContactNumber?.(null);
       }
+      setShaftToDelete(null);
       await onShaftsUpdated?.();
     } catch (e) {
-      alert('Failed to delete shaft: ' + (e.response?.data?.detail || e.message));
+      setDeleteShaftError(e.response?.data?.detail || e.message || 'Delete failed');
+    } finally {
+      setDeletingShaft(false);
     }
   };
 
@@ -902,11 +912,13 @@ export default function ElectrodeEditor({
                 <span style={s.shaftName}>{shaft.name}</span>
                 {shaft.label && <span style={s.shaftLabel}>{shaft.label}</span>}
                 <span style={{ ...s.shaftMeta, marginLeft: 'auto', fontSize: 12 }}>{shaft.electrode_type.toUpperCase()}</span>
-                <button
-                  onClick={e => { e.stopPropagation(); handleDeleteShaft(shaft.id, shaft.name); }}
-                  style={{ background: 'none', border: 'none', color: '#ff525488', cursor: 'pointer', fontSize: 18, padding: '0 4px', lineHeight: 1 }}
-                  title="Delete shaft"
-                >✕</button>
+                {!isLocked && (
+                  <button
+                    onClick={e => { e.stopPropagation(); setDeleteShaftError(null); setShaftToDelete({ id: shaft.id, name: shaft.name }); }}
+                    style={{ background: 'none', border: 'none', color: '#ff525488', cursor: 'pointer', fontSize: 18, padding: '0 4px', lineHeight: 1 }}
+                    title="Delete shaft"
+                  >✕</button>
+                )}
               </div>
 
               <div style={s.shaftMeta}>
@@ -988,6 +1000,48 @@ export default function ElectrodeEditor({
           >
             {autofilling ? '⟳ Fitting spline...' : '⚡ Autofill Remaining Contacts'}
           </button>
+        </div>
+      )}
+
+      {/* ── Delete-shaft confirmation dialog ──────────────────── */}
+      {shaftToDelete && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+        }}>
+          <div style={{
+            background: '#111418', border: '1px solid #2a3340', borderRadius: 8,
+            padding: 28, maxWidth: 360, width: '90%', fontFamily: 'IBM Plex Sans, sans-serif',
+          }}>
+            <div style={{ fontSize: 18, fontWeight: 600, color: '#e8edf2', marginBottom: 10 }}>
+              Delete electrode shaft?
+            </div>
+            <div style={{ fontSize: 13, color: '#b0bec5', marginBottom: 24, lineHeight: 1.6 }}>
+              Shaft <strong style={{ color: '#e8edf2' }}>{shaftToDelete.name}</strong> and all
+              its contacts will be permanently removed. This cannot be undone.
+            </div>
+            {deleteShaftError && (
+              <div style={{ fontSize: 12, color: '#ff5252', marginBottom: 16, fontFamily: 'IBM Plex Mono, monospace' }}>
+                {deleteShaftError}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+              <button
+                onClick={() => { setShaftToDelete(null); setDeleteShaftError(null); }}
+                disabled={deletingShaft}
+                style={{ padding: '8px 20px', background: 'transparent', color: '#7a8a99', border: '1px solid #2a3340', borderRadius: 4, fontSize: 13, cursor: deletingShaft ? 'not-allowed' : 'pointer', fontFamily: 'IBM Plex Sans, sans-serif' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDeleteShaft}
+                disabled={deletingShaft}
+                style={{ padding: '8px 20px', background: '#1a1010', color: '#ff5252', border: '1px solid #ff525444', borderRadius: 4, fontSize: 13, fontWeight: 600, cursor: deletingShaft ? 'not-allowed' : 'pointer', fontFamily: 'IBM Plex Sans, sans-serif', opacity: deletingShaft ? 0.6 : 1 }}
+              >
+                {deletingShaft ? 'Deleting…' : 'Delete Shaft'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
