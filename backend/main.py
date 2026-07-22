@@ -547,6 +547,8 @@ async def list_reconstructions(
                 if recon.ct_path else False
             ),
             "registration_confirmed": getattr(recon, "registration_confirmed", False) or False,
+            "export_status": getattr(recon, "export_status", "none") or "none",
+            "exported_at": getattr(recon, "exported_at", None),
             "electrode_shafts": shafts_data,
         })
     return out
@@ -861,6 +863,8 @@ async def get_reconstruction(
             if recon.ct_path else False
         ),
         "registration_confirmed": getattr(recon, "registration_confirmed", False) or False,
+        "export_status": getattr(recon, "export_status", "none") or "none",
+        "exported_at": getattr(recon, "exported_at", None),
         "electrode_shafts": shafts_data,
     }
 
@@ -903,6 +907,143 @@ async def confirm_registration(
     recon.registration_confirmed = confirmed
     await db.commit()
     return {"registration_confirmed": recon.registration_confirmed}
+
+
+# ── MNI export pipeline ─────────────────────────────────────────────────────────
+
+@app.post("/api/reconstructions/{recon_id}/export")
+async def start_mni_export(
+    recon_id: int,
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Kick off the MNI152 export pipeline (MRI/CT/electrodes → MNI space).
+    Only available once the reconstruction is marked complete. Re-runnable.
+    """
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Reconstruction not found")
+    if not (getattr(recon, "is_complete", False) or False):
+        raise HTTPException(status_code=409, detail="Reconstruction must be marked complete before export")
+    if not recon.mesh_path or not os.path.exists(_abs(recon.mesh_path) or ""):
+        raise HTTPException(status_code=409, detail="Brain mesh not available yet")
+    if getattr(recon, "export_status", "none") == "exporting":
+        raise HTTPException(status_code=409, detail="Export already in progress")
+
+    recon.export_status = "exporting"
+    await db.commit()
+    background_tasks.add_task(_export_mni_background, recon_id)
+    return {"export_status": "exporting"}
+
+
+async def _export_mni_background(recon_id: int):
+    """Background task: register MRI/CT/electrodes into MNI152 space."""
+    from database import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+            recon = result.scalar_one_or_none()
+            if not recon:
+                return
+            mri_abs = _abs(recon.mri_path) if recon.mri_path else None
+            mesh_abs = _abs(recon.mesh_path) if recon.mesh_path else None
+            ct_abs = _abs(recon.ct_path) if recon.ct_path else None
+
+            # Gather placed contacts with their shaft name
+            shafts_result = await db.execute(
+                select(ElectrodeShaft).where(ElectrodeShaft.reconstruction_id == recon_id)
+            )
+            shafts = shafts_result.scalars().all()
+            contacts = []
+            for shaft in shafts:
+                c_result = await db.execute(
+                    select(ElectrodeContact)
+                    .where(ElectrodeContact.shaft_id == shaft.id)
+                    .where(ElectrodeContact.x_mm != None)
+                    .order_by(ElectrodeContact.contact_number)
+                )
+                for c in c_result.scalars().all():
+                    contacts.append({
+                        "shaft_name": shaft.name,
+                        "contact_number": c.contact_number,
+                        "x_mm": c.x_mm, "y_mm": c.y_mm, "z_mm": c.z_mm,
+                    })
+
+        if not mri_abs or not os.path.exists(mri_abs):
+            raise RuntimeError("MRI not available for export")
+        if not mesh_abs or not os.path.exists(mesh_abs):
+            raise RuntimeError("Brain mesh not available for export")
+
+        recon_dir = os.path.dirname(mesh_abs)
+        with open(mesh_abs) as f:
+            mesh_center = json.load(f).get("center", [0.0, 0.0, 0.0])
+
+        from services.registration import get_transform_path
+        ct_to_mri_npy = get_transform_path(ct_abs) if ct_abs else None
+
+        from services.mni_registration import export_reconstruction_to_mni
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, export_reconstruction_to_mni,
+            recon_dir, mri_abs, ct_abs, ct_to_mri_npy, contacts, mesh_center,
+        )
+        status = "exported"
+        print(f"[MNI] Export succeeded for recon {recon_id}")
+    except Exception:
+        import traceback
+        print(f"[MNI ERROR] Export failed for recon {recon_id}:")
+        traceback.print_exc()
+        status = "error"
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            update(Reconstruction)
+            .where(Reconstruction.id == recon_id)
+            .values(export_status=status,
+                    exported_at=datetime.utcnow() if status == "exported" else None,
+                    updated_at=datetime.utcnow())
+        )
+        await db.commit()
+
+
+@app.get("/api/reconstructions/{recon_id}/export/download")
+async def download_mni_export(
+    recon_id: int,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Download the MNI export artifacts as a zip."""
+    import zipfile
+
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Reconstruction not found")
+    if not recon.mesh_path:
+        raise HTTPException(status_code=404, detail="No export available")
+    export_dir = os.path.join(os.path.dirname(_abs(recon.mesh_path)), "export")
+    if not os.path.isdir(export_dir):
+        raise HTTPException(status_code=404, detail="No export available — run the export first")
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fn in sorted(os.listdir(export_dir)):
+            if fn.startswith("_"):
+                continue  # skip intermediates
+            full = os.path.join(export_dir, fn)
+            if os.path.isfile(full):
+                zf.write(full, arcname=fn)
+    buf.seek(0)
+    safe_pid = "".join(ch for ch in (recon.patient_id or "recon") if ch.isalnum() or ch in "-_")
+    fname = f"{safe_pid}_mni_export.zip"
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @app.get("/api/reconstructions/{recon_id}/mri-slice")

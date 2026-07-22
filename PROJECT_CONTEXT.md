@@ -67,7 +67,8 @@ If broken: `pip install "numpy<2.0"`
 | `services/ct_electrode_extractor.py` | CT mesh generation (HU threshold + marching cubes) and `snap_to_blob_centroid()` — snaps a clicked world position to nearest bright CT blob centroid within 8mm. Applies the registration transform so CT aligns with the brain mesh. |
 | `services/electrode_service.py` | Autofill: cubic spline fit parameterized by contact number (not arc length). Interpolates between placed contacts, linear extrapolation beyond the manual range. Blob-snap applied to interpolated contacts only. |
 | `services/structure_extractor.py` | **ACTIVE — patient-specific, wired to UI.** antspynet `deep_atropos` (subcortical) + `desikan_killiany_tourville_labeling` (cortical DKT) run on the patient's own T1 — native space, no MNI atlas. Extracts ~84 structures across 6 groups as meshes aligned to the brain mesh. Cached as per-structure JSON + `structures_cortical.nii.gz`. (Superseded the old parked nilearn/Harvard-Oxford MNI152 approach.) |
-| `migrate_shaft_fields.py` / `migrate_lock_fields.py` / `migrate_deleted_at.py` / `migrate_registration_confirmed.py` | One-time, idempotent column-add migrations for existing DBs (shaft metadata, `is_complete`/`is_locked`, `deleted_at`, `registration_confirmed`). |
+| `services/mni_registration.py` | **Export pipeline — step 1.** Registers the completed reconstruction into MNI152 standard space. ANTs affine+SyN (`type_of_transform="SyNRA"`) MRI→MNI; CT resampled into MRI (via `ct_to_mri.npy`) then warped to MNI; electrode contacts (MRI-space RAS) pushed through as points via `apply_transforms_to_points`. CPU-forced. Writes artifacts to `recon_dir/export/`: `MRI_mni.nii.gz`, `CT_mni.nii.gz`, transform files, `electrodes_mni.csv`/`.json`, `export_manifest.json`. **Coordinate care:** RAS↔LPS flip for points (`_ras_to_lps`); points travel the *inverse* transform direction vs. images. MNI template from `ants.get_ants_data('mni')` (downloaded/cached on first run). |
+| `migrate_shaft_fields.py` / `migrate_lock_fields.py` / `migrate_deleted_at.py` / `migrate_registration_confirmed.py` / `migrate_export_status.py` | One-time, idempotent column-add migrations for existing DBs (shaft metadata, `is_complete`/`is_locked`, `deleted_at`, `registration_confirmed`, `export_status`/`exported_at`). |
 
 ### Frontend (`frontend/src/`)
 
@@ -100,7 +101,7 @@ users:              id, username, hashed_password, role (viewer/editor/admin), c
 reconstructions:    id, patient_id, label, share_token, created_by,
                     created_at, updated_at, mesh_path, mri_path, ct_path,
                     status, is_complete, is_locked,
-                    registration_confirmed, deleted_at
+                    registration_confirmed, export_status, exported_at, deleted_at
 
 electrode_shafts:   id, reconstruction_id, name, label,
                     electrode_type (depth/strip/grid), color, visible,
@@ -154,6 +155,19 @@ CT→MRI registration accuracy previously had no check beyond "does `ct_to_mri.n
 
 ---
 
+### MNI152 Export Pipeline (step 1 — this branch `mni-registration`)
+Once a reconstruction is **marked complete**, an **"⤓ Export to MNI"** button appears in the
+Header (editor/admin only). It calls `POST /export`, which sets `export_status="exporting"` and
+runs `_export_mni_background` → `services/mni_registration.export_reconstruction_to_mni`. The
+Header polls `GET /reconstructions/{id}` every 5s and flips to **"⬇ Download MNI export"** when
+`export_status="exported"` (or a red retry button on `error`). Re-runnable (Unlock → re-complete →
+export overwrites `recon_dir/export/`). This is the **first step** of a larger export pipeline;
+downstream steps (atlas region labeling of MNI coords, group templates, reports) will consume the
+persisted transforms + `electrodes_mni.csv`. **Accuracy checkpoint before trusting output:** verify
+`electrodes_mni.csv` coords sit inside the MNI bounding box and a left-hemisphere contact has
+`x_mni < 0` (the service logs an in-box % + L/R split; a flip means fixing the RAS/LPS handling or
+the `whichtoinvert` point-transform direction in `transform_contacts_to_mni`).
+
 ## API Endpoints (Key)
 
 ```
@@ -172,6 +186,8 @@ GET    /api/reconstructions/{id}/fusion-slice       CT resampled into MRI plane 
 POST   /api/reconstructions/{id}/prerender-slices   warm slice cache
 GET    /api/reconstructions/{id}/structures         ACTIVE - patient-specific antspynet meshes
 PATCH  /api/reconstructions/{id}/registration-confirm  set/clear registration_confirmed
+POST   /api/reconstructions/{id}/export              start MNI152 export (409 unless is_complete); bg task
+GET    /api/reconstructions/{id}/export/download     zip of recon_dir/export/ artifacts
 
 POST   /api/shafts                                  create shaft
 PATCH  /api/shafts/{id}                             update shaft fields

@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAppStore } from '../store';
-import api, { getShareLink } from '../api';
+import api, { getShareLink, startMniExport, downloadMniExport, getReconstruction } from '../api';
 
 const s = {
   header: {
@@ -71,6 +71,51 @@ export default function Header({ onBack, onNavigate }) {
   const isLocked = reconstruction?.is_locked || false;
   const isComplete = reconstruction?.is_complete || false;
   const canEdit = user && (user.role === 'editor' || user.role === 'admin');
+  const exportStatus = reconstruction?.export_status || 'none';
+
+  // Poll while an MNI export is running so the button flips to Download when done.
+  useEffect(() => {
+    if (exportStatus !== 'exporting' || !reconstruction) return;
+    const id = reconstruction.id;
+    const timer = setInterval(async () => {
+      try {
+        const res = await getReconstruction(id);
+        const st = res.data?.export_status;
+        if (st && st !== 'exporting') {
+          setReconstruction({ ...reconstruction, export_status: st, exported_at: res.data?.exported_at });
+        }
+      } catch (e) { /* keep polling */ }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [exportStatus, reconstruction?.id]);
+
+  const handleExport = async () => {
+    if (!reconstruction || busy) return;
+    setBusy(true);
+    try {
+      await startMniExport(reconstruction.id);
+      setReconstruction({ ...reconstruction, export_status: 'exporting' });
+    } catch (e) {
+      alert(e?.response?.data?.detail || 'Could not start MNI export');
+    } finally { setBusy(false); }
+  };
+
+  const handleDownloadExport = async () => {
+    if (!reconstruction) return;
+    try {
+      const res = await downloadMniExport(reconstruction.id);
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${reconstruction.patient_id || 'recon'}_mni_export.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (e) {
+      alert('Could not download MNI export');
+    }
+  };
 
   const handleShare = async () => {
     if (!reconstruction) return;
@@ -198,6 +243,32 @@ export default function Header({ onBack, onNavigate }) {
               Cancel
             </button>
           </div>
+        )}
+
+        {/* Export to MNI — only once complete */}
+        {isComplete && exportStatus === 'exporting' && (
+          <button disabled style={{ ...s.btn, background: '#1a1a0d', color: '#ffab40', border: '1px solid #ffab4044', cursor: 'default' }}>
+            ⟳ Exporting to MNI…
+          </button>
+        )}
+        {isComplete && exportStatus === 'exported' && (
+          <button
+            onClick={handleDownloadExport}
+            style={{ ...s.btn, background: '#002233', color: '#00d4ff', border: '1px solid #00d4ff44' }}
+            title="Download MNI-space NIfTIs, transforms, and electrode coordinates"
+          >
+            ⬇ Download MNI export
+          </button>
+        )}
+        {isComplete && (exportStatus === 'none' || exportStatus === 'error') && (
+          <button
+            disabled={busy}
+            onClick={handleExport}
+            style={{ ...s.btn, background: exportStatus === 'error' ? '#2a0d0d' : 'transparent', color: exportStatus === 'error' ? '#ff8a80' : '#00d4ff', border: `1px solid ${exportStatus === 'error' ? '#5a1a1a' : '#00d4ff44'}`, opacity: busy ? 0.5 : 1 }}
+            title={exportStatus === 'error' ? 'Previous export failed — click to retry' : 'Register CT/MRI/electrodes to MNI152 and export'}
+          >
+            {exportStatus === 'error' ? '⟳ Retry MNI export' : '⤓ Export to MNI'}
+          </button>
         )}
 
         {/* Share */}

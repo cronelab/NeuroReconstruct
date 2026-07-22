@@ -41,6 +41,9 @@ class Reconstruction(Base):
     is_complete = Column(Boolean, default=False)
     is_locked = Column(Boolean, default=False)
     registration_confirmed = Column(Boolean, default=False)
+    # MNI export pipeline: none | exporting | exported | error
+    export_status = Column(String, default="none")
+    exported_at = Column(DateTime, nullable=True)
     deleted_at = Column(DateTime, nullable=True)
     created_by_user = relationship("User", back_populates="reconstructions")
     electrode_shafts = relationship("ElectrodeShaft", back_populates="reconstruction", cascade="all, delete-orphan")

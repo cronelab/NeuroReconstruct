@@ -83,6 +83,13 @@ export const getStructures = (id, token) =>
 export const confirmRegistration = (id, confirmed) =>
   api.patch(`/reconstructions/${id}/registration-confirm`, { confirmed });
 
+// ── MNI export pipeline ─────────────────────────────────────────────────────────
+export const startMniExport = (id) =>
+  api.post(`/reconstructions/${id}/export`);
+
+export const downloadMniExport = (id) =>
+  api.get(`/reconstructions/${id}/export/download`, { responseType: 'blob' });
+
 export const uploadReconstructionFiles = (reconId, formData) =>
   api.post(`/reconstructions/${reconId}/files`, formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
