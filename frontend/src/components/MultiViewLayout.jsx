@@ -27,7 +27,7 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
 
   // Fusion view is only meaningful when a CT is registered to the MRI.
   const hasFusion = !!reconstruction?.has_ct && !!reconstruction?.has_registration;
-  const VIEWS = hasFusion ? [...BASE_VIEWS, FUSION_VIEW] : BASE_VIEWS;
+  const VIEWS = hasFusion ? [FUSION_VIEW, ...BASE_VIEWS] : BASE_VIEWS;
   const regConfirmed = !!reconstruction?.registration_confirmed;
 
   const handleConfirmRegistration = useCallback(async (value) => {

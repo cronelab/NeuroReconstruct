@@ -64,7 +64,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
   // CT threshold mesh state
   const [ctMeshData, setCtMeshData] = useState(null);
   const [ctMeshLoading, setCtMeshLoading] = useState(false);
-  const [currentThreshold, setCurrentThreshold] = useState(0);
+  const [currentThreshold, setCurrentThreshold] = useState(1500);
   const [undoStack, setUndoStack] = useState([]); // [{shaftId, contactNumber}]
   const [showMri, setShowMri] = useState(false);
   const [showStructures, setShowStructures] = useState(false);
@@ -191,7 +191,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
   // Auto-load CT mesh as soon as editor mode is active and CT is available.
   // Depends on reconstruction so it fires once reconstruction has loaded,
   // and again if the user toggles editor mode.
-  const DEFAULT_THRESHOLD = 0;
+  const DEFAULT_THRESHOLD = 1500;
 
   // Load CT when editor mode activated OR when a locked recon with CT first loads
   useEffect(() => {

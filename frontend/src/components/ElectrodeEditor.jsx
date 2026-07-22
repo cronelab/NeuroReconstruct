@@ -135,7 +135,7 @@ const COLOR_PALETTE = [
 ];
 
 // Checkbox that can render a dash (indeterminate) when only some descendants are checked
-function TriStateCheckbox({ checked, indeterminate, onChange, style }) {
+function TriStateCheckbox({ checked, indeterminate, onChange, onClick, style }) {
   const ref = React.useRef(null);
   useEffect(() => {
     if (ref.current) ref.current.indeterminate = !!indeterminate && !checked;
@@ -146,6 +146,7 @@ function TriStateCheckbox({ checked, indeterminate, onChange, style }) {
       type="checkbox"
       checked={checked}
       onChange={onChange}
+      onClick={onClick}
       style={{ width: 15, height: 15, flexShrink: 0, cursor: 'pointer', ...style }}
     />
   );
@@ -367,9 +368,8 @@ export default function ElectrodeEditor({
 }) {
   const { reconstruction, selectedShaftId, setSelectedShaftId, structuresData, structureVisible, setStructureVisible, setStructureVisibleMany } = useAppStore();
   const [localStructuresLoading, setLocalStructuresLoading] = useState(false);
-  const [collapsedGroups, setCollapsedGroups] = useState({});
 
-  const [huThreshold, setHuThreshold] = useState(0);
+  const [huThreshold, setHuThreshold] = useState(1500);
   const debouncedThreshold = useDebounce(huThreshold, 400);
 
   const [showNewShaft, setShowNewShaft] = useState(false);
@@ -587,8 +587,26 @@ export default function ElectrodeEditor({
               </button>
             )}
           </div>
-          {structuresData && Object.keys(structuresData).length > 0 && (
+          {structuresData && Object.keys(structuresData).length > 0 && (() => {
+            const allKeys = Object.entries(structuresData).filter(([,s]) => s.vertices).map(([k]) => k);
+            const aVis    = allKeys.map(k => structureVisible?.[k] !== false);
+            const aAllOn  = aVis.length > 0 && aVis.every(v => v);
+            const aAllOff = aVis.every(v => !v);
+            const allState = { checked: aAllOn, indeterminate: !aAllOn && !aAllOff };
+            return (
             <div style={{ maxHeight: 480, overflowY: 'auto' }}>
+              {/* Master toggle — show/hide all brain structures (subcortical + cortical) at once */}
+              {allKeys.length > 0 && (
+                <label style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '4px 0 8px', marginBottom: 6, borderBottom: '1px solid #1a1e24', cursor: 'pointer' }}>
+                  <TriStateCheckbox
+                    checked={allState.checked}
+                    indeterminate={allState.indeterminate}
+                    onChange={e => setStructureVisibleMany(allKeys, e.target.checked)}
+                    style={{ accentColor: '#74C0FC' }}
+                  />
+                  <span style={{ fontSize: 12, color: '#c8d4e0', fontFamily: 'IBM Plex Mono, monospace' }}>Show brain structures</span>
+                </label>
+              )}
               {['subcortical', 'frontal', 'temporal', 'parietal', 'occipital', 'cingulate'].filter(g =>
                 Object.values(structuresData).some(s => s.group === g && s.vertices)
               ).map(group => {
@@ -608,18 +626,22 @@ export default function ElectrodeEditor({
                 const toggleKeys = (keys, v) => setStructureVisibleMany(keys, v);
 
                 const groupState = stateOf(entries);
-                const isCollapsed = collapsedGroups[group] !== false; // default: collapsed
+                // Subsections show only when the group has at least one visible structure
+                // (checked or indeterminate). A fully-unchecked group is collapsed.
+                const expanded = groupState.checked || groupState.indeterminate;
 
                 return (
                   <div key={group} style={{ marginBottom: 6, borderBottom: '1px solid #1a1e24' }}>
-                    {/* Level 1 — Group */}
+                    {/* Level 1 — Group. Row/checkbox toggles the whole group; the
+                        subsection tree follows the checked state. */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 0', cursor: 'pointer' }}
-                      onClick={() => setCollapsedGroups(prev => ({ ...prev, [group]: !isCollapsed }))}>
-                      <span style={{ fontSize: 10, color: '#7a8a99', width: 10, textAlign: 'center', flexShrink: 0 }}>{isCollapsed ? '▸' : '▾'}</span>
+                      onClick={() => toggleKeys(keysOf(entries), !groupState.checked)}>
+                      <span style={{ fontSize: 10, color: '#7a8a99', width: 10, textAlign: 'center', flexShrink: 0 }}>{expanded ? '▾' : '▸'}</span>
                       <TriStateCheckbox
                         checked={groupState.checked}
                         indeterminate={groupState.indeterminate}
-                        onChange={e => { e.stopPropagation(); toggleKeys(keysOf(entries), e.target.checked); }}
+                        onClick={e => e.stopPropagation()}
+                        onChange={e => toggleKeys(keysOf(entries), e.target.checked)}
                         style={{ accentColor: '#74C0FC' }}
                       />
                       <span style={{ fontSize: 11, fontWeight: 600, color: '#c8d4e0', textTransform: 'uppercase', letterSpacing: '0.06em', fontFamily: 'IBM Plex Mono, monospace', flex: 1 }}>
@@ -628,7 +650,7 @@ export default function ElectrodeEditor({
                       <span style={{ fontSize: 10, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>{entries.length}</span>
                     </div>
 
-                    {!isCollapsed && (
+                    {expanded && (
                       <div style={{ paddingLeft: 20, paddingBottom: 8 }}>
                         {/* Midline structures — full width */}
                         {midline.map(([key, s]) => {
@@ -656,7 +678,8 @@ export default function ElectrodeEditor({
                                     <TriStateCheckbox
                                       checked={sideState.checked}
                                       indeterminate={sideState.indeterminate}
-                                      onChange={e => { e.stopPropagation(); toggleKeys(keysOf(sideEntries), e.target.checked); }}
+                                      onClick={e => e.stopPropagation()}
+                                      onChange={e => toggleKeys(keysOf(sideEntries), e.target.checked)}
                                       style={{ width: 13, height: 13 }} />
                                     <span style={{ fontSize: 10, color: '#7a8a99', textTransform: 'uppercase', letterSpacing: '0.05em', fontFamily: 'IBM Plex Mono, monospace' }}>{side}</span>
                                   </div>
@@ -686,7 +709,8 @@ export default function ElectrodeEditor({
                 );
               })}
             </div>
-          )}
+            );
+          })()}
           {structuresData && Object.keys(structuresData).length === 0 && (
             <div style={{ fontSize: 11, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>No structures found</div>
           )}
