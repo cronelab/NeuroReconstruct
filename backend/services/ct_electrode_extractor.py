@@ -265,23 +265,41 @@ def snap_to_blob_centroid(
         print(f"[SNAP] No voxels above threshold in region — returning original")
         return world_pos
 
-    from skimage.measure import label as sk_label
-    labeled = sk_label(binary_region, connectivity=3)
+    # ── Intensity × proximity weighted centroid (robust to close neighbours) ──
+    # A connected-component centroid fails when CT blooming bridges close
+    # contacts into one blob — the mean lands in the GAP between them, so every
+    # click near either contact snaps to the same midpoint. Instead, anchor to
+    # the CLICK: weight each above-threshold voxel by (HU - threshold) — locking
+    # onto the bright metal core — times a Gaussian in physical distance from the
+    # click, which keeps the result on the contact the user aimed at and
+    # suppresses a neighbour a couple mm away. No connected components, so a
+    # merged blob no longer collapses distinct contacts to one point.
+    region_shape = np.array(region.shape)
+    local_vox = np.clip(vox - lo, 0, region_shape - 1).astype(float)
 
-    local_vox = np.clip(vox - lo, 0, np.array(binary_region.shape) - 1)
-    comp_id = labeled[local_vox[0], local_vox[1], local_vox[2]]
+    # Per-axis voxel size (mm) for physical distances (handles anisotropy).
+    vox_dims = np.sqrt((affine[:3, :3] ** 2).sum(axis=0))
 
-    print(f"[SNAP] binary voxels: {binary_region.sum()}, comp_id: {comp_id}")
-    if comp_id == 0:
-        labeled_coords = np.argwhere(labeled > 0)
-        if len(labeled_coords) == 0:
-            return world_pos
-        dists = np.linalg.norm(labeled_coords - local_vox, axis=1)
-        nearest = labeled_coords[np.argmin(dists)]
-        comp_id = labeled[nearest[0], nearest[1], nearest[2]]
+    coords = np.argwhere(binary_region)  # region-local voxels above threshold
+    if len(coords) == 0:
+        print("[SNAP] No metal near click — returning original")
+        return world_pos
 
-    comp_voxels = np.argwhere(labeled == comp_id) + lo
-    centroid_vox = comp_voxels.mean(axis=0)
+    hu = region[coords[:, 0], coords[:, 1], coords[:, 2]].astype(float)
+    offs_mm = (coords - local_vox) * vox_dims       # mm offset from click
+    d2 = (offs_mm ** 2).sum(axis=1)                 # squared mm distance
+    SIGMA_MM = 0.9                                   # < typical contact spacing
+    w = (hu - hu_threshold) * np.exp(-0.5 * d2 / (SIGMA_MM ** 2))
+
+    if w.sum() <= 0:
+        # Click landed far from any metal core — snap to the nearest metal voxel.
+        centroid_region = coords[np.argmin(d2)].astype(float)
+    else:
+        centroid_region = (coords * w[:, None]).sum(axis=0) / w.sum()
+
+    centroid_vox = centroid_region + lo  # region-local → full-volume voxel
+    print(f"[SNAP] binary voxels: {binary_region.sum()}, "
+          f"weighted centroid(vox)={np.round(centroid_vox, 1)}")
 
     # CT voxel → CT world RAS
     centroid_hom = np.append(centroid_vox, 1.0)
