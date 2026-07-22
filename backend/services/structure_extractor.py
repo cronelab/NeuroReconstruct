@@ -23,6 +23,7 @@ from skimage.filters import gaussian
 import trimesh
 import json
 import os
+import concurrent.futures
 
 # ── Structure catalog ─────────────────────────────────────────────────────────
 # FreeSurfer/DKT label indices as output by antspynet DKT parcellation.
@@ -237,6 +238,34 @@ def _labels_to_mesh(label_data: np.ndarray, affine: np.ndarray,
     }
 
 
+# ── Parallel mesh extraction workers ─────────────────────────────────────────
+# Per-structure mesh extraction is CPU-bound and independent across structures,
+# so it runs in a ProcessPoolExecutor. Each worker loads the label volume once
+# (in the initializer) rather than receiving the full array with every task.
+
+_WORKER_LABEL_DATA = None
+_WORKER_AFFINE = None
+_WORKER_CENTER = None
+
+
+def _mesh_worker_init(label_path: str, center: np.ndarray) -> None:
+    """Runs once per worker process: cache the shared label volume in globals."""
+    global _WORKER_LABEL_DATA, _WORKER_AFFINE, _WORKER_CENTER
+    img = nib.load(label_path)
+    _WORKER_LABEL_DATA = img.get_fdata()
+    _WORKER_AFFINE = img.affine
+    _WORKER_CENTER = center
+
+
+def _mesh_worker_task(key: str, label_indices: list, max_faces: int):
+    """Extract one structure's mesh from the worker-local label volume."""
+    mesh_data = _labels_to_mesh(
+        _WORKER_LABEL_DATA, _WORKER_AFFINE, label_indices, _WORKER_CENTER,
+        max_faces=max_faces,
+    )
+    return key, mesh_data
+
+
 # ── Main segmentation entry point ─────────────────────────────────────────────
 
 def extract_all_structures(mri_mesh_path: str, output_dir: str,
@@ -293,6 +322,12 @@ def extract_all_structures(mri_mesh_path: str, output_dir: str,
 
     print(f"[STRUCT] Running patient-specific segmentation on {mri_nifti_path}")
 
+    # Segmentation runs on CPU only. Hide any GPU from TensorFlow before antspynet
+    # imports it — benchmarking showed the GPU gives no speedup for this pipeline
+    # (the cost is CPU-bound ANTs preprocessing + mesh extraction, not the small
+    # GPU-able inference), so CPU keeps the environment simple and deterministic.
+    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
     try:
         import ants
         import antspynet
@@ -343,22 +378,41 @@ def extract_all_structures(mri_mesh_path: str, output_dir: str,
           f"{center} (should land inside above range)")
     print(f"[STRUCT] DKT label values present (sample): {unique_cort[:30]}")
 
-    # Extract all structures — subcortical at full res, cortical at reduced res
-    for key, info in ALL_STRUCTURES.items():
-        if key in results:
-            continue
-        out_path = os.path.join(structures_dir, f"{key}.json")
-        max_faces = 8000 if info["group"] in CORTICAL_GROUPS else 10000
-        mesh_data = _labels_to_mesh(cort_data, cort_affine, info["labels"], center,
-                                     max_faces=max_faces)
-        if mesh_data:
-            full = {**info, "key": key, **mesh_data}
-            with open(out_path, "w") as f:
-                json.dump(full, f)
-            results[key] = full
-            print(f"[STRUCT] {info['label']}: {mesh_data['face_count']} faces")
-        else:
-            print(f"[STRUCT] {info['label']}: no voxels found for labels {info['labels']}")
+    # Extract all structures in parallel — each structure's marching-cubes is
+    # independent, so fan the loop out across CPU cores. Workers reload the label
+    # volume from disk (via initializer) to avoid pickling the full array per task.
+    pending = [(key, info) for key, info in ALL_STRUCTURES.items() if key not in results]
+
+    if pending:
+        max_workers = min(len(pending), max(1, (os.cpu_count() or 2) - 1), 8)
+        print(f"[STRUCT] Extracting {len(pending)} structures on {max_workers} worker(s)...")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_mesh_worker_init,
+            initargs=(cortical_label_path, center),
+        ) as pool:
+            futures = {
+                pool.submit(
+                    _mesh_worker_task, key, info["labels"],
+                    8000 if info["group"] in CORTICAL_GROUPS else 10000,
+                ): (key, info)
+                for key, info in pending
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                key, info = futures[fut]
+                try:
+                    _, mesh_data = fut.result()
+                except Exception as e:
+                    print(f"[STRUCT] {info['label']}: extraction failed ({e})")
+                    continue
+                if mesh_data:
+                    full = {**info, "key": key, **mesh_data}
+                    with open(os.path.join(structures_dir, f"{key}.json"), "w") as f:
+                        json.dump(full, f)
+                    results[key] = full
+                    print(f"[STRUCT] {info['label']}: {mesh_data['face_count']} faces")
+                else:
+                    print(f"[STRUCT] {info['label']}: no voxels found for labels {info['labels']}")
 
     print(f"[STRUCT] Done. {len(results)}/{len(ALL_STRUCTURES)} structures extracted.")
     return results
