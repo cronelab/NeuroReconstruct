@@ -1,4 +1,16 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import LocatorOverlay from './LocatorOverlay';
+
+// Locator config per axis — mirrors MultiViewLayout so the fusion viewer's
+// navigation thumbnail matches the regular 2D slice viewer:
+//   axial    → coronal thumbnail, horizontal line at axial Z position
+//   sagittal → coronal thumbnail, vertical line at sagittal X position
+//   coronal  → sagittal thumbnail, vertical line at coronal Y position
+const LOCATOR_CONFIG = {
+  axial:    { refAxis: 'coronal',  lineType: 'horizontal' },
+  sagittal: { refAxis: 'coronal',  lineType: 'vertical' },
+  coronal:  { refAxis: 'sagittal', lineType: 'vertical' },
+};
 
 /**
  * Registration-QA fusion viewer.
@@ -246,6 +258,14 @@ function FusionCanvas({ reconId, axis }) {
             <div style={{ marginBottom: 6 }}>⚠ Could not load fusion slice</div>
             <div style={{ color: '#4a5568', fontSize: 10 }}>{errorMsg}</div>
           </div>
+        )}
+        {status === 'ok' && LOCATOR_CONFIG[axis] && (
+          <LocatorOverlay
+            reconId={reconId}
+            refAxis={LOCATOR_CONFIG[axis].refAxis}
+            lineType={LOCATOR_CONFIG[axis].lineType}
+            fraction={sliceLabel.count > 1 ? 1 - sliceLabel.idx / (sliceLabel.count - 1) : 0.5}
+          />
         )}
       </div>
 

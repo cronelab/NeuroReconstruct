@@ -366,6 +366,7 @@ export default function ElectrodeEditor({
   activeContactNumber, setActiveContactNumber,
   currentThreshold,
   showStructures, setShowStructures, onLoadStructures,
+  structureOpacity, setStructureOpacity,
 }) {
   const { reconstruction, selectedShaftId, setSelectedShaftId, structuresData, structureVisible, setStructureVisible, setStructureVisibleMany } = useAppStore();
   const [localStructuresLoading, setLocalStructuresLoading] = useState(false);
@@ -635,6 +636,16 @@ export default function ElectrodeEditor({
                   />
                   <span style={{ fontSize: 12, color: '#c8d4e0', fontFamily: 'IBM Plex Mono, monospace' }}>Show brain structures</span>
                 </label>
+              )}
+              {/* Structure surface transparency — mirrors the MRI opacity slider */}
+              {allKeys.length > 0 && setStructureOpacity && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '0 0 8px', marginBottom: 6, borderBottom: '1px solid #1a1e24' }}>
+                  <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace', flexShrink: 0 }}>Opacity</span>
+                  <input type="range" min={0.05} max={1} step={0.05} value={structureOpacity ?? 0.45}
+                    onChange={e => setStructureOpacity(parseFloat(e.target.value))}
+                    style={{ flex: 1, accentColor: '#74C0FC' }} />
+                  <span style={{ fontSize: 11, fontFamily: 'IBM Plex Mono, monospace', color: '#7a8a99', width: 32, textAlign: 'right', flexShrink: 0 }}>{Math.round((structureOpacity ?? 0.45) * 100)}%</span>
+                </div>
               )}
               {['subcortical', 'frontal', 'temporal', 'parietal', 'occipital', 'cingulate'].filter(g =>
                 Object.values(structuresData).some(s => s.group === g && s.vertices)

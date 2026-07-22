@@ -72,6 +72,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
   const [showStructures, setShowStructures] = useState(false);
   const [structuresLoading, setStructuresLoading] = useState(false);
   const [mriOpacity, setMriOpacity] = useState(0.3);
+  const [structureOpacity, setStructureOpacity] = useState(0.45);
   const [showCt, setShowCt] = useState(false);
   const [ctOpacityOverride, setCtOpacityOverride] = useState(0.6);
   const [rightWidth, setRightWidth] = useState(480);
@@ -321,6 +322,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
             activeContactNumber={isLocked ? null : activeContactNumber}
             structuresData={structuresData}
             structureVisible={structureVisible}
+            structureOpacity={structureOpacity}
           />
           {pollingForMesh && !loading && (
             <div style={{ position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)', background: '#111418', border: '1px solid #1a1a0d', borderRadius: 4, padding: '8px 16px', fontSize: 11, color: '#ffab40', fontFamily: 'IBM Plex Mono, monospace', display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -382,6 +384,8 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
             onLoadStructures={loadStructures}
             showStructures={showStructures}
             setShowStructures={setShowStructures}
+            structureOpacity={structureOpacity}
+            setStructureOpacity={setStructureOpacity}
           />
         </div>
       </>) : (

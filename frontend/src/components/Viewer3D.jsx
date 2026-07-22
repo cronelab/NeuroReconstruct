@@ -130,7 +130,7 @@ function SceneLights() {
 
 // ── Camera setup ──────────────────────────────────────────────────────────────
 
-function StructureMesh({ meshData, color, structKey, structLabel, onHover, onUnhover }) {
+function StructureMesh({ meshData, color, structKey, structLabel, opacity = 0.45, onHover, onUnhover }) {
   const meshRef = React.useRef();
   const geo = React.useMemo(() => {
     if (!meshData) return null;
@@ -149,7 +149,7 @@ function StructureMesh({ meshData, color, structKey, structLabel, onHover, onUnh
       onPointerOver={(e) => { e.stopPropagation(); onHover?.(structKey, color, structLabel, meshRef.current); }}
       onPointerOut={(e)  => { e.stopPropagation(); onUnhover?.(); }}
     >
-      <meshPhongMaterial color={color} transparent opacity={0.45} side={THREE.DoubleSide} depthWrite={false} />
+      <meshPhongMaterial color={color} transparent opacity={opacity} side={THREE.DoubleSide} depthWrite={false} />
     </mesh>
   );
 }
@@ -209,7 +209,7 @@ function isInsideMesh(point, mesh) {
   return votes >= 2;
 }
 
-export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLoading, onContactPlaced, showMri, mriOpacity, ctThreshold, ctOpacityOverride, activeContactNumber, structuresData, structureVisible }) {
+export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLoading, onContactPlaced, showMri, mriOpacity, ctThreshold, ctOpacityOverride, activeContactNumber, structuresData, structureVisible, structureOpacity }) {
   const { meshData, brainOpacity, reconstruction, isEditorMode, selectedShaftId, shaftVisibility, contactScale } = useAppStore();
   const [hoveredStruct, setHoveredStruct] = React.useState(null);
 
@@ -264,7 +264,7 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
         {structuresData && Object.entries(structuresData).map(([key, s]) =>
           structureVisible?.[key] !== false && s.vertices ? (
             <StructureMesh key={key} meshData={s} color={s.color}
-              structKey={key} structLabel={s.label}
+              structKey={key} structLabel={s.label} opacity={structureOpacity ?? 0.45}
               onHover={handleStructureHover} onUnhover={handleStructureUnhover} />
           ) : null
         )}
