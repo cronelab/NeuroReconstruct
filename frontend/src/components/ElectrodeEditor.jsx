@@ -391,7 +391,9 @@ export default function ElectrodeEditor({
     contact_diameter_mm: 0.8,
   });
 
-  const [editingShaft, setEditingShaft] = useState(null); // shaft being inline-edited
+  const [editingShaft, setEditingShaft] = useState(null); // { id, name, label, color } draft being edited
+  const [savingShaftEdit, setSavingShaftEdit] = useState(false);
+  const [editShaftError, setEditShaftError] = useState(null);
   const [shaftToDelete, setShaftToDelete] = useState(null); // { id, name } pending delete
   const [deletingShaft, setDeletingShaft] = useState(false);
   const [deleteShaftError, setDeleteShaftError] = useState(null);
@@ -466,13 +468,22 @@ export default function ElectrodeEditor({
     }
   };
 
-  const handleUpdateShaftField = async (shaft, field, value) => {
-    if (isLocked) return;
+  const handleSaveShaftEdit = async () => {
+    if (isLocked || !editingShaft) return;
+    setSavingShaftEdit(true);
+    setEditShaftError(null);
     try {
-      await updateShaft(shaft.id, { [field]: value });
+      await updateShaft(editingShaft.id, {
+        name: (editingShaft.name || '').toUpperCase().trim(),
+        label: (editingShaft.label ?? '').trim(),
+        color: editingShaft.color,
+      });
+      setEditingShaft(null);
       await onShaftsUpdated?.();
     } catch (e) {
-      console.error('Failed to update shaft', e);
+      setEditShaftError(e.response?.data?.detail || e.message || 'Update failed');
+    } finally {
+      setSavingShaftEdit(false);
     }
   };
 
@@ -885,7 +896,6 @@ export default function ElectrodeEditor({
           </div>
         ) : shafts.map(shaft => {
           const isSelected = shaft.id === selectedShaftId;
-          const isEditing = editingShaft === shaft.id;
           const contacts = shaft.contacts || [];
           const manual = contacts.filter(c => c.is_manual).length;
 
@@ -914,6 +924,13 @@ export default function ElectrodeEditor({
                 <span style={{ ...s.shaftMeta, marginLeft: 'auto', fontSize: 12 }}>{shaft.electrode_type.toUpperCase()}</span>
                 {!isLocked && (
                   <button
+                    onClick={e => { e.stopPropagation(); setEditShaftError(null); setEditingShaft({ id: shaft.id, name: shaft.name || '', label: shaft.label || '', color: shaft.color }); }}
+                    style={{ background: 'none', border: 'none', color: '#7a8a99', cursor: 'pointer', fontSize: 14, padding: '0 4px', lineHeight: 1 }}
+                    title="Edit shaft"
+                  >✎</button>
+                )}
+                {!isLocked && (
+                  <button
                     onClick={e => { e.stopPropagation(); setDeleteShaftError(null); setShaftToDelete({ id: shaft.id, name: shaft.name }); }}
                     style={{ background: 'none', border: 'none', color: '#ff525488', cursor: 'pointer', fontSize: 18, padding: '0 4px', lineHeight: 1 }}
                     title="Delete shaft"
@@ -924,32 +941,6 @@ export default function ElectrodeEditor({
               <div style={s.shaftMeta}>
                 <span>{contacts.length} placed · {manual} manual</span>
               </div>
-
-              {/* Inline edit when selected */}
-              {isSelected && (
-                <div style={{ marginTop: 8 }} onClick={e => e.stopPropagation()}>
-                  <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
-                    <div style={{ flex: '0 0 60px' }}>
-                      <label style={s.label}>Prefix</label>
-                      <input defaultValue={shaft.name}
-                        onBlur={e => handleUpdateShaftField(shaft, 'name', e.target.value.toUpperCase())}
-                        style={{ width: '100%' }} />
-                    </div>
-                    <div style={{ flex: 1 }}>
-                      <label style={s.label}>Label</label>
-                      <input defaultValue={shaft.label || ''}
-                        placeholder="e.g. Left Amygdala"
-                        onBlur={e => handleUpdateShaftField(shaft, 'label', e.target.value)}
-                        style={{ width: '100%' }} />
-                    </div>
-                    <div style={{ flex: '0 0 auto' }}>
-                      <label style={s.label}>Color</label>
-                      <ColorPicker value={shaft.color} onChange={hex => handleUpdateShaftField(shaft, 'color', hex)} />
-                    </div>
-                  </div>
-
-                </div>
-              )}
             </div>
           );
         })}
@@ -1000,6 +991,69 @@ export default function ElectrodeEditor({
           >
             {autofilling ? '⟳ Fitting spline...' : '⚡ Autofill Remaining Contacts'}
           </button>
+        </div>
+      )}
+
+      {/* ── Edit-shaft dialog ─────────────────────────────────── */}
+      {editingShaft && (
+        <div style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.75)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000,
+        }}>
+          <div style={{
+            background: '#111418', border: '1px solid #2a3340', borderRadius: 8,
+            padding: 28, maxWidth: 400, width: '90%', fontFamily: 'IBM Plex Sans, sans-serif',
+          }}>
+            <div style={{ fontSize: 18, fontWeight: 600, color: '#e8edf2', marginBottom: 18 }}>
+              Edit electrode shaft
+            </div>
+
+            <label style={s.label}>Name (prefix)</label>
+            <input
+              value={editingShaft.name}
+              onChange={e => setEditingShaft(sh => ({ ...sh, name: e.target.value.toUpperCase() }))}
+              onKeyDown={e => { if (e.key === 'Enter' && editingShaft.name.trim()) handleSaveShaftEdit(); }}
+              autoFocus
+              style={{ width: '100%', marginBottom: 14, boxSizing: 'border-box' }}
+            />
+
+            <label style={s.label}>Full label</label>
+            <input
+              value={editingShaft.label}
+              placeholder="e.g. Left Amygdala"
+              onChange={e => setEditingShaft(sh => ({ ...sh, label: e.target.value }))}
+              onKeyDown={e => { if (e.key === 'Enter' && editingShaft.name.trim()) handleSaveShaftEdit(); }}
+              style={{ width: '100%', marginBottom: 14, boxSizing: 'border-box' }}
+            />
+
+            <label style={s.label}>Color</label>
+            <div style={{ marginBottom: 8 }}>
+              <ColorPicker value={editingShaft.color} onChange={hex => setEditingShaft(sh => ({ ...sh, color: hex }))} />
+            </div>
+
+            {editShaftError && (
+              <div style={{ fontSize: 12, color: '#ff5252', marginBottom: 16, fontFamily: 'IBM Plex Mono, monospace' }}>
+                {editShaftError}
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 18 }}>
+              <button
+                onClick={() => { setEditingShaft(null); setEditShaftError(null); }}
+                disabled={savingShaftEdit}
+                style={{ padding: '8px 20px', background: 'transparent', color: '#7a8a99', border: '1px solid #2a3340', borderRadius: 4, fontSize: 13, cursor: savingShaftEdit ? 'not-allowed' : 'pointer', fontFamily: 'IBM Plex Sans, sans-serif' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveShaftEdit}
+                disabled={savingShaftEdit || !editingShaft.name.trim()}
+                style={{ padding: '8px 20px', background: '#0d2233', color: '#00d4ff', border: '1px solid #00d4ff44', borderRadius: 4, fontSize: 13, fontWeight: 600, cursor: (savingShaftEdit || !editingShaft.name.trim()) ? 'not-allowed' : 'pointer', fontFamily: 'IBM Plex Sans, sans-serif', opacity: (savingShaftEdit || !editingShaft.name.trim()) ? 0.6 : 1 }}
+              >
+                {savingShaftEdit ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
