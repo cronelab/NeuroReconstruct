@@ -285,6 +285,7 @@ Register users via the API: `POST /api/auth/register`
 ## Known Limitations
 
 - `numpy < 2.0` required in the conda environment
+- Structure segmentation runs on **CPU only** (GPU was benchmarked and gave no speedup — the pipeline is bottlenecked by CPU-bound ANTs preprocessing + mesh extraction, not GPU-able inference). First computation for a case takes a couple of minutes; results are cached to disk afterward. The per-structure mesh extraction is parallelized across CPU cores.
 - antspynet / tensorflow cannot be bundled in the PyInstaller exe — structures are borrowed from cached reconstructions in demo mode
 - Registration in the exe may differ slightly from dev due to bundled DLL numerical differences (known PyInstaller limitation)
 - SQLite is sufficient for single-lab use; migrate to Postgres before multi-site deployment
