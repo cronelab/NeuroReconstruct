@@ -7,7 +7,7 @@ import * as THREE from 'three';
  *   low threshold (full head) → very transparent so anatomy is visible but not overwhelming
  *   high threshold (metal only) → fully opaque so electrodes are crisp and distinct
  */
-export default function CTArtifactMesh({ meshData, isEditorMode, onContactPlaced, selectedShaft, opacity = 0.5, activeContactNumber }) {
+export default function CTArtifactMesh({ meshData, isEditorMode, onContactPlaced, selectedShaft, opacity = 0.5, activeContactNumber, raycastable = true }) {
   const [hovered, setHovered] = useState(false);
 
   const geometry = useMemo(() => {
@@ -33,6 +33,7 @@ export default function CTArtifactMesh({ meshData, isEditorMode, onContactPlaced
   return (
     <mesh
       geometry={geometry}
+      {...(raycastable ? {} : { raycast: () => null })}
       onClick={handleClick}
       onPointerOver={(e) => {
         e.stopPropagation();

@@ -25,14 +25,14 @@ function BrainMesh({ meshData, opacity }) {
 }
 
 // ── Single contact — sphere ──────────────────────────────────────────────────
-function Contact({ position, color, label, isManual, isSelected, onClick, radius = 1.5 }) {
+function Contact({ position, color, label, isManual, isSelected, onClick, radius = 1.5, onHover, onUnhover }) {
   const [hovered, setHovered] = useState(false);
   return (
     <group position={position}>
       <mesh
         onClick={(e) => { e.stopPropagation(); onClick?.(); }}
-        onPointerOver={(e) => { e.stopPropagation(); setHovered(true); document.body.style.cursor = 'pointer'; }}
-        onPointerOut={() => { setHovered(false); document.body.style.cursor = 'default'; }}
+        onPointerOver={(e) => { e.stopPropagation(); setHovered(true); document.body.style.cursor = 'pointer'; onHover?.(); }}
+        onPointerOut={() => { setHovered(false); document.body.style.cursor = 'default'; onUnhover?.(); }}
       >
         <sphereGeometry args={[radius, 16, 16]} />
         <meshPhysicalMaterial
@@ -60,7 +60,7 @@ function Contact({ position, color, label, isManual, isSelected, onClick, radius
 }
 
 // ── Electrode shaft — spheres + connecting line ───────────────────────────────
-function ElectrodeShaft({ shaft }) {
+function ElectrodeShaft({ shaft, onContactHover, onContactUnhover }) {
   const { selectedContactId, setSelectedContactId, shaftVisibility, contactScale } = useAppStore();
   const visible = shaftVisibility[shaft.id] !== false && shaft.visible;
   if (!visible || !shaft.contacts?.length) return null;
@@ -93,6 +93,8 @@ function ElectrodeShaft({ shaft }) {
             isManual={contact.is_manual} isSelected={isSelected}
             radius={radius}
             onClick={() => setSelectedContactId(isSelected ? null : contactId)}
+            onHover={() => onContactHover?.(contactId, pos, color, label, radius)}
+            onUnhover={() => onContactUnhover?.(contactId)}
           />
         );
       })}
@@ -130,7 +132,7 @@ function SceneLights() {
 
 // ── Camera setup ──────────────────────────────────────────────────────────────
 
-function StructureMesh({ meshData, color, structKey, structLabel, opacity = 0.45, onHover, onUnhover }) {
+function StructureMesh({ meshData, color, structKey, structLabel, opacity = 0.45, visible = true, interactive = true, onHover, onUnhover, onRegister }) {
   const meshRef = React.useRef();
   const geo = React.useMemo(() => {
     if (!meshData) return null;
@@ -143,11 +145,27 @@ function StructureMesh({ meshData, color, structKey, structLabel, opacity = 0.45
     return g;
   }, [meshData]);
 
+  // Register/unregister this mesh with the parent so electrode-centric mode can
+  // test contacts against every visible structure, not just the hovered one.
+  React.useEffect(() => {
+    if (!geo) return undefined;
+    onRegister?.(structKey, meshRef.current);
+    return () => onRegister?.(structKey, null);
+  }, [geo, structKey, onRegister]);
+
   if (!geo) return null;
   return (
-    <mesh ref={meshRef} geometry={geo}
-      onPointerOver={(e) => { e.stopPropagation(); onHover?.(structKey, color, structLabel, meshRef.current); }}
-      onPointerOut={(e)  => { e.stopPropagation(); onUnhover?.(); }}
+    // `visible` toggles whether the mesh is DRAWN, but the mesh always stays in the
+    // scene so isInsideMesh can raycast it (Mesh.raycast ignores visibility) — this
+    // is what lets electrode-centric hover name a structure even when it's hidden.
+    //
+    // Pointer handlers are attached only in structure-centric mode AND only while the
+    // mesh is visible: in electrode-centric mode we want NO handlers so the small
+    // contact spheres win the hover (r3f only raycasts objects that have handlers),
+    // and a hidden structure must not intercept hover in structure-centric mode.
+    <mesh ref={meshRef} geometry={geo} visible={visible}
+      onPointerOver={interactive && visible ? (e) => { e.stopPropagation(); onHover?.(structKey, color, structLabel, meshRef.current); } : undefined}
+      onPointerOut={interactive && visible ? (e) => { e.stopPropagation(); onUnhover?.(); } : undefined}
     >
       <meshPhongMaterial color={color} transparent opacity={opacity} side={THREE.DoubleSide} depthWrite={false} />
     </mesh>
@@ -209,11 +227,82 @@ function isInsideMesh(point, mesh) {
   return votes >= 2;
 }
 
+// ── Nearest cortical structure ────────────────────────────────────────────────
+// For contacts that fall inside no labeled structure (typically cortical white
+// matter), report the closest cortical gyrus instead of "outside". Distance is
+// approximated by the nearest mesh vertex — cortical meshes are dense enough that
+// this closely tracks true surface distance, and it avoids per-triangle work on a
+// hover. Subcortical nuclei are excluded: white matter is labeled by overlying
+// cortex, not by the nearest deep nucleus.
+function nearestCorticalStructure(point, structuresData) {
+  if (!structuresData) return null;
+  const px = point.x, py = point.y, pz = point.z;
+  let best = null;
+  let bestD2 = Infinity;
+  for (const key in structuresData) {
+    const s = structuresData[key];
+    if (!s || !s.vertices || s.group === 'subcortical') continue;
+    const v = s.vertices;
+    let localMin = Infinity;
+    for (let i = 0; i < v.length; i += 3) {
+      const dx = v[i] - px, dy = v[i + 1] - py, dz = v[i + 2] - pz;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < localMin) localMin = d2;
+    }
+    if (localMin < bestD2) {
+      bestD2 = localMin;
+      best = { key, label: s.label || key, color: s.color || '#e8edf2' };
+    }
+  }
+  return best ? { ...best, dist: Math.sqrt(bestD2) } : null;
+}
+
 export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLoading, onContactPlaced, showMri, mriOpacity, ctThreshold, ctOpacityOverride, activeContactNumber, structuresData, structureVisible, structureOpacity }) {
   const { meshData, brainOpacity, reconstruction, isEditorMode, selectedShaftId, shaftVisibility, contactScale } = useAppStore();
   const [hoveredStruct, setHoveredStruct] = React.useState(null);
 
+  // Hover mode:
+  //   'structure' → hover a structure surface, highlight the contacts inside it
+  //   'electrode' → hover a contact, name the structure(s) it resides in
+  const [hoverMode, setHoverMode] = React.useState('structure');
+  const hoverModeRef = React.useRef(hoverMode);
+  hoverModeRef.current = hoverMode;
+  const [hoveredContact, setHoveredContact] = React.useState(null);
+
+  // Registry of currently-rendered (visible) structure meshes, keyed by structure.
+  // Populated by StructureMesh via onRegister; consulted in electrode-centric mode.
+  const structMeshesRef = React.useRef(new Map());
+  const registerStructMesh = React.useCallback((key, mesh) => {
+    if (mesh) structMeshesRef.current.set(key, mesh);
+    else structMeshesRef.current.delete(key);
+  }, []);
+
+  const structuresDataRef = React.useRef(structuresData);
+  structuresDataRef.current = structuresData;
+
+  const handleContactHover = React.useCallback((contactId, pos, color, label, radius) => {
+    if (hoverModeRef.current !== 'electrode') return;
+    const p = new THREE.Vector3(pos[0], pos[1], pos[2]);
+    const sd = structuresDataRef.current || {};
+    const inside = [];
+    structMeshesRef.current.forEach((mesh, key) => {
+      if (!mesh) return;
+      mesh.updateMatrixWorld(true);
+      if (isInsideMesh(p, mesh)) {
+        const s = sd[key];
+        inside.push({ key, label: s?.label || key, color: s?.color || '#e8edf2' });
+      }
+    });
+    // Inside no labeled structure (e.g. cortical white matter) → report the
+    // nearest cortical gyrus rather than "outside labeled structures".
+    const nearest = inside.length === 0 ? nearestCorticalStructure(p, sd) : null;
+    setHoveredContact({ id: contactId, pos, color, label, radius, structures: inside, nearest });
+  }, []);
+
+  const handleContactUnhover = React.useCallback(() => setHoveredContact(null), []);
+
   const handleStructureHover = React.useCallback((key, color, label, mesh) => {
+    if (hoverModeRef.current !== 'structure') return;
     if (!mesh) return;
     mesh.updateMatrixWorld(true);
     // Read directly from store state — bypasses any closure/ref staleness
@@ -261,18 +350,29 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
         )}
 
         {/* CT threshold mesh */}
+        {/* Render every structure that has geometry, even when hidden: electrode-
+            centric hover tests contacts against these meshes, so they must stay in
+            the scene (registered + raycastable) regardless of the visibility toggle.
+            Hidden ones are simply not drawn (visible=false). */}
         {structuresData && Object.entries(structuresData).map(([key, s]) =>
-          structureVisible?.[key] !== false && s.vertices ? (
+          s.vertices ? (
             <StructureMesh key={key} meshData={s} color={s.color}
               structKey={key} structLabel={s.label} opacity={structureOpacity ?? 0.45}
+              visible={structureVisible?.[key] !== false}
+              interactive={hoverMode === 'structure'}
+              onRegister={registerStructMesh}
               onHover={handleStructureHover} onUnhover={handleStructureUnhover} />
           ) : null
         )}
 
-        {/* Contact highlight rings */}
+        {/* Contact highlight rings — structure-centric: all contacts inside hovered structure */}
         {hoveredStruct && hoveredStruct.rings.map(c => (
           <ContactRing key={c.id} position={c.pos} color={c.color} radius={c.radius} />
         ))}
+        {/* Contact highlight ring — electrode-centric: the single hovered contact */}
+        {hoveredContact && (
+          <ContactRing position={hoveredContact.pos} color={hoveredContact.color} radius={hoveredContact.radius ?? 1.5} />
+        )}
         {ctMeshData && (
           <CTArtifactMesh
             meshData={ctMeshData}
@@ -281,17 +381,77 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
             selectedShaft={selectedShaft}
             opacity={ctOpacity}
             activeContactNumber={activeContactNumber}
+            raycastable={hoverMode !== 'electrode'}
           />
         )}
 
         {/* Electrode shafts */}
-        {shafts.map(shaft => <ElectrodeShaft key={shaft.id} shaft={shaft} />)}
+        {shafts.map(shaft => (
+          <ElectrodeShaft key={shaft.id} shaft={shaft}
+            onContactHover={handleContactHover} onContactUnhover={handleContactUnhover} />
+        ))}
 
         <OrbitControls enablePan enableZoom enableRotate
           zoomSpeed={1.2} panSpeed={0.8} rotateSpeed={0.6}
           mouseButtons={{ LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN }}
         />
       </Canvas>
+
+      {/* Hover-mode toggle — only meaningful once structures are loaded */}
+      {structuresData && Object.keys(structuresData).length > 0 && (
+        <button
+          onClick={() => {
+            setHoveredStruct(null);
+            setHoveredContact(null);
+            setHoverMode(m => (m === 'structure' ? 'electrode' : 'structure'));
+          }}
+          title={hoverMode === 'structure'
+            ? 'Structure-centric: hover a structure to highlight the contacts inside it'
+            : 'Electrode-centric: hover a contact to name the structure it sits in'}
+          style={{
+            position: 'absolute', top: isEditorMode ? 56 : 16, left: 16,
+            background: '#111418cc', backdropFilter: 'blur(8px)',
+            border: '1px solid #2a3646', borderRadius: 4, padding: '6px 12px',
+            fontFamily: 'IBM Plex Mono, monospace', fontSize: 10, cursor: 'pointer',
+            color: '#c8d4e0', display: 'flex', alignItems: 'center', gap: 8,
+          }}
+        >
+          <span style={{ color: '#7a8a99' }}>Hover</span>
+          <span style={{ color: '#74C0FC' }}>
+            {hoverMode === 'structure' ? 'structure → contacts' : 'contact → structure'}
+          </span>
+          <span style={{ color: '#4a5568' }}>⇄</span>
+        </button>
+      )}
+
+      {/* Electrode-centric hover tooltip — which structure(s) the contact sits in */}
+      {hoveredContact && (
+        <div style={{
+          position: 'absolute', top: 16, right: 16, pointerEvents: 'none',
+          background: 'rgba(10,12,16,0.92)', border: `1px solid ${hoveredContact.color}`,
+          borderRadius: 4, padding: '6px 12px', maxWidth: 260,
+          fontFamily: 'IBM Plex Mono, monospace', fontSize: 11,
+          boxShadow: `0 0 12px ${hoveredContact.color}44`,
+        }}>
+          <div style={{ color: hoveredContact.color, marginBottom: (hoveredContact.structures.length || hoveredContact.nearest) ? 4 : 0 }}>
+            {hoveredContact.label}
+          </div>
+          {hoveredContact.structures.length > 0 ? (
+            hoveredContact.structures.map(s => (
+              <div key={s.key} style={{ color: s.color, fontSize: 10 }}>{s.label}</div>
+            ))
+          ) : hoveredContact.nearest ? (
+            <div>
+              <div style={{ color: hoveredContact.nearest.color, fontSize: 10 }}>{hoveredContact.nearest.label}</div>
+              <span style={{ color: '#7a8a99', fontSize: 9 }}>
+                nearest cortex · {hoveredContact.nearest.dist.toFixed(1)} mm
+              </span>
+            </div>
+          ) : (
+            <span style={{ color: '#7a8a99' }}>outside labeled structures</span>
+          )}
+        </div>
+      )}
 
       {/* Structure hover tooltip */}
       {hoveredStruct && (
