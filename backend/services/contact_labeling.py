@@ -7,10 +7,24 @@ using the DKT/deep_atropos label volume that ``structure_extractor`` caches as
 
 Depth (sEEG) contacts frequently land in white matter between gyri -- on real
 data only ~40-50% of contacts fall directly inside a labeled structure. Rather
-than reporting those as simply "unlabeled", we also search a small radius for
-the nearest labeled voxel and report it with its distance, so a contact can be
-read as e.g. "1.4 mm from Left Hippocampus". ``distance_mm == 0`` means the
-contact is inside the structure.
+than reporting those as simply "unlabeled", we look at the neighbourhood and
+report the structure that occupies most of it, with the distance to it, so a
+contact reads as e.g. "1.4 mm from Left Hippocampus".
+
+Assignment rules:
+  * contact voxel carries a catalog label -> that structure,
+    ``distance_mm = 0``, ``vote_share = 1.0``
+  * otherwise -> **plurality vote** among all catalog-labeled voxels within
+    the search radius; the label holding the most voxels wins. Ties break
+    toward the label with a voxel closest to the contact. ``vote_share`` is
+    the winner's fraction of the votes, so a 0.9 assignment can be told apart
+    from a marginal 0.35 one. ``distance_mm`` is the distance to the *winning*
+    structure, not to the overall nearest voxel.
+  * no catalog voxel within the radius -> unassigned
+
+Voting rather than nearest-voxel because a single stray voxel of a neighbouring
+parcel should not decide the label. All voxels have equal volume, so a vote
+count is a volume share of the neighbourhood.
 
 The search radius is deliberately tight (2 mm): a structure several millimetres
 away is weak evidence about where a contact actually sits, and leaving such a
@@ -106,50 +120,71 @@ def label_contacts(label_volume_path: str, contacts_world_ras,
         if np.any(ijk < 0) or np.any(ijk >= shape):
             out.append({
                 "structure": "", "structure_key": "", "group": "",
-                "distance_mm": None, "voxel_content": "Outside segmentation FOV",
+                "distance_mm": None, "vote_share": None,
+                "voxel_content": "Outside segmentation FOV",
             })
             continue
 
         raw = int(data[tuple(ijk)])
         if raw in lut:
+            # Direct hit: the contact is inside this structure, no vote needed.
             key, label, group = lut[raw]
             out.append({
                 "structure": label, "structure_key": key, "group": group,
-                "distance_mm": 0.0, "voxel_content": label,
+                "distance_mm": 0.0, "vote_share": 1.0, "voxel_content": label,
             })
             continue
 
         voxel_content = NON_CATALOG_LABELS.get(raw, f"Unknown (label {raw})")
 
-        # Fallback: nearest catalog-labeled voxel within the search radius
+        # Fallback: plurality vote among catalog-labeled voxels within the radius.
+        # Voting rather than nearest-voxel because a single stray voxel of a
+        # neighbouring parcel should not decide the label -- the label that
+        # occupies most of the neighbourhood is the better answer. Since all
+        # voxels have equal volume, a vote count is a volume share.
+        unassigned = {
+            "structure": "", "structure_key": "", "group": "",
+            "distance_mm": None, "vote_share": None, "voxel_content": voxel_content,
+        }
+
         lo = np.maximum(ijk - half, 0)
         hi = np.minimum(ijk + half + 1, shape)
         sub_mask = is_catalog[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
         if not sub_mask.any():
-            out.append({
-                "structure": "", "structure_key": "", "group": "",
-                "distance_mm": None, "voxel_content": voxel_content,
-            })
+            out.append(unassigned)
             continue
 
-        # World-space distance to each candidate (affine may be oblique)
+        # World-space distance to each candidate (affine may be oblique), then
+        # restrict the box of candidates to an actual sphere of search_radius_mm.
         idx = np.argwhere(sub_mask) + lo
         idx_hom = np.concatenate([idx, np.ones((len(idx), 1))], axis=1)
         world = (affine @ idx_hom.T).T[:, :3]
         d = np.linalg.norm(world - p, axis=1)
-        best = int(np.argmin(d))
-        if d[best] > search_radius_mm:
-            out.append({
-                "structure": "", "structure_key": "", "group": "",
-                "distance_mm": None, "voxel_content": voxel_content,
-            })
+        within = d <= search_radius_mm
+        if not within.any():
+            out.append(unassigned)
             continue
 
-        raw_near = int(data[tuple(idx[best])])
-        key, label, group = lut[raw_near]
+        idx, d = idx[within], d[within]
+        voter_labels = data[idx[:, 0], idx[:, 1], idx[:, 2]]
+
+        uniq, counts = np.unique(voter_labels, return_counts=True)
+        top = counts.max()
+        tied = uniq[counts == top]
+        if len(tied) == 1:
+            winner = int(tied[0])
+        else:
+            # Deterministic tie-break: among tied labels, the one with a voxel
+            # closest to the contact wins.
+            winner = int(min(tied, key=lambda L: d[voter_labels == L].min()))
+
+        key, label, group = lut[winner]
         out.append({
             "structure": label, "structure_key": key, "group": group,
-            "distance_mm": round(float(d[best]), 2), "voxel_content": voxel_content,
+            # distance to the winning structure, not to the overall nearest voxel
+            "distance_mm": round(float(d[voter_labels == winner].min()), 2),
+            "vote_share": round(float(top) / len(voter_labels), 2),
+            "voxel_content": voxel_content,
         })
 
     return out
@@ -170,7 +205,7 @@ def write_contact_structure_csv(csv_path: str, contacts: list, labels: list) -> 
     with open(csv_path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(["shaft_name", "contact_number", "structure", "group",
-                    "distance_mm", "voxel_content"])
+                    "distance_mm", "vote_share", "voxel_content"])
         for c, lab in zip(contacts, labels):
             d = lab["distance_mm"]
             if d == 0.0:
@@ -179,10 +214,12 @@ def write_contact_structure_csv(csv_path: str, contacts: list, labels: list) -> 
                 n_none += 1
             else:
                 n_near += 1
+            vs = lab.get("vote_share")
             w.writerow([
                 c.get("shaft_name", ""), c.get("contact_number"),
                 lab["structure"], lab["group"],
                 "" if d is None else f"{d:.2f}",
+                "" if vs is None else f"{vs:.2f}",
                 lab["voxel_content"],
             ])
 
