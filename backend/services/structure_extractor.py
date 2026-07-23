@@ -1,19 +1,34 @@
 """
 Patient-specific brain structure segmentation using antspynet.
 
-Two segmentation passes on the patient's native T1 MRI:
-  1. deep_atropos()                        — subcortical + tissue classes
-  2. desikan_killiany_tourville_labeling() — cortical parcellation (DKT atlas)
+A single segmentation pass on the patient's native T1 MRI:
+  antspynet.desikan_killiany_tourville_labeling(do_preprocessing=True)
+
+Despite the name, this one model emits **both** cortical (DKT) and subcortical
+labels into a single volume, cached as `structures_cortical.nii.gz`. The
+`do_preprocessing=True` flag runs N4 bias correction, brain extraction, and
+template registration internally — that preprocessing, not the inference, is
+the bulk of the runtime.
 
 All label volumes are in the patient's native MRI space — no MNI atlas,
 no standard-space registration. Every structure mesh is unique to this patient.
 
-Structures extracted:
-  Subcortical: hippocampus (L/R), amygdala (L/R), thalamus (L/R),
-               caudate (L/R), putamen (L/R), pallidum (L/R), brainstem,
-               cerebellum
-  Cortical:    precentral (motor), postcentral (sensory),
-               superior temporal gyrus, insula, cingulate (L/R each)
+Cortical vs subcortical is a *label-numbering* convention (FreeSurfer scheme),
+not two separate algorithms:
+  Cortical (DKT): hemisphere as an offset — left 1000+, right 2000+, same
+                  region id within each (e.g. precentral 1024 / 2024)
+  Subcortical:    plain FreeSurfer indices, not offset-paired
+                  (e.g. hippocampus 17 / 53, thalamus 10 / 49)
+  Midline:        may claim several indices (cerebellum 6,7,8,45,46,47)
+  Not anatomy:    0 background/WM, 2/41 cerebral WM, 4/43 lateral ventricles,
+                  14/15 3rd/4th ventricle, 24 CSF — absent from the catalog
+                  below (see services/contact_labeling.py, NON_CATALOG_LABELS)
+
+The ALL_STRUCTURES catalog is what turns those indices into anatomy: ~84
+structures across 6 groups (subcortical, frontal, temporal, parietal,
+occipital, cingulate). The `group` field drives the Group -> Side -> Structure
+tree in the UI. A handful of the smallest DKT regions may yield no mesh — see
+the <5 voxel / <20 face guards in _labels_to_mesh.
 """
 
 import numpy as np
