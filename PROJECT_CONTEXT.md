@@ -160,8 +160,14 @@ Once a reconstruction is **marked complete**, an **"⤓ Export to MNI"** button 
 Header (editor/admin only). It calls `POST /export`, which sets `export_status="exporting"` and
 runs `_export_mni_background` → `services/mni_registration.export_reconstruction_to_mni`. The
 Header polls `GET /reconstructions/{id}` every 5s and flips to **"⬇ Download MNI export"** when
-`export_status="exported"` (or a red retry button on `error`). Re-runnable (Unlock → re-complete →
-export overwrites `recon_dir/export/`). This is the **first step** of a larger export pipeline;
+`export_status="exported"` (or a red retry button on `error`).
+
+**Staleness:** unlocking a reconstruction for editing flips `export_status` `exported → stale`
+(in `PATCH /status`, mirroring the `registration_confirmed` reset). Contacts may move during the
+edit, so the on-disk export no longer matches — the Header then shows an amber
+**"⟳ Re-export to MNI (outdated)"** instead of a Download of stale coordinates. The `exported`
+state also carries a small **⟳** button for an on-demand re-run. Re-running always overwrites
+`recon_dir/export/`. Statuses: `none | exporting | exported | stale | error`. This is the **first step** of a larger export pipeline;
 downstream steps (atlas region labeling of MNI coords, group templates, reports) will consume the
 persisted transforms + `electrodes_mni.csv`. **Accuracy checkpoint before trusting output:** verify
 `electrodes_mni.csv` coords sit inside the MNI bounding box and a left-hemisphere contact has

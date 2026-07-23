@@ -886,10 +886,21 @@ async def update_reconstruction_status(
         # Auto-lock when marked complete
         if is_complete:
             recon.is_locked = True
+        else:
+            # Unlocking re-opens editing, so any existing MNI export no longer
+            # reflects the reconstruction (contacts may move). Mark it stale so the
+            # UI offers a re-run instead of a download of outdated coordinates.
+            # Mirrors the registration_confirmed reset when registration re-runs.
+            if getattr(recon, "export_status", "none") == "exported":
+                recon.export_status = "stale"
     if is_locked is not None:
         recon.is_locked = is_locked
     await db.commit()
-    return {"is_complete": recon.is_complete, "is_locked": recon.is_locked}
+    return {
+        "is_complete": recon.is_complete,
+        "is_locked": recon.is_locked,
+        "export_status": getattr(recon, "export_status", "none") or "none",
+    }
 
 
 @app.patch("/api/reconstructions/{recon_id}/registration-confirm")

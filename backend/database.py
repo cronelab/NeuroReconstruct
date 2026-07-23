@@ -41,7 +41,8 @@ class Reconstruction(Base):
     is_complete = Column(Boolean, default=False)
     is_locked = Column(Boolean, default=False)
     registration_confirmed = Column(Boolean, default=False)
-    # MNI export pipeline: none | exporting | exported | error
+    # MNI export pipeline: none | exporting | exported | stale | error
+    # "stale" = exported, but the reconstruction was unlocked for editing since
     export_status = Column(String, default="none")
     exported_at = Column(DateTime, nullable=True)
     deleted_at = Column(DateTime, nullable=True)

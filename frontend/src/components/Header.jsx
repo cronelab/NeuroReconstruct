@@ -135,8 +135,13 @@ export default function Header({ onBack, onNavigate }) {
     if (!reconstruction || busy) return;
     setBusy(true);
     try {
-      await api.patch(`/reconstructions/${reconstruction.id}/status`, { is_complete: true, is_locked: true });
-      setReconstruction({ ...reconstruction, is_complete: true, is_locked: true });
+      const res = await api.patch(`/reconstructions/${reconstruction.id}/status`, { is_complete: true, is_locked: true });
+      setReconstruction({
+        ...reconstruction,
+        is_complete: true,
+        is_locked: true,
+        export_status: res.data?.export_status ?? reconstruction.export_status,
+      });
       setEditorMode(false);
       // Completed view defaults: MRI on, CT off — signal via store
       if (typeof window.__onMarkComplete === 'function') window.__onMarkComplete();
@@ -149,8 +154,15 @@ export default function Header({ onBack, onNavigate }) {
     setBusy(true);
     setShowUnlockWarning(false);
     try {
-      await api.patch(`/reconstructions/${reconstruction.id}/status`, { is_complete: false, is_locked: false });
-      setReconstruction({ ...reconstruction, is_complete: false, is_locked: false });
+      const res = await api.patch(`/reconstructions/${reconstruction.id}/status`, { is_complete: false, is_locked: false });
+      // Unlocking marks any existing MNI export stale — pick that up from the response
+      // so re-completing offers a re-export instead of a stale download.
+      setReconstruction({
+        ...reconstruction,
+        is_complete: false,
+        is_locked: false,
+        export_status: res.data?.export_status ?? reconstruction.export_status,
+      });
       setEditorMode(true);
     } finally { setBusy(false); }
   };
@@ -252,12 +264,32 @@ export default function Header({ onBack, onNavigate }) {
           </button>
         )}
         {isComplete && exportStatus === 'exported' && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <button
+              onClick={handleDownloadExport}
+              style={{ ...s.btn, background: '#002233', color: '#00d4ff', border: '1px solid #00d4ff44' }}
+              title="Download MNI-space NIfTIs, transforms, and electrode coordinates"
+            >
+              ⬇ Download MNI export
+            </button>
+            <button
+              disabled={busy}
+              onClick={handleExport}
+              style={{ ...s.btn, background: 'transparent', color: '#7a8a99', border: '1px solid #2a3340', padding: '5px 8px', opacity: busy ? 0.5 : 1 }}
+              title="Re-run the MNI registration and overwrite the current export"
+            >
+              ⟳
+            </button>
+          </div>
+        )}
+        {isComplete && exportStatus === 'stale' && (
           <button
-            onClick={handleDownloadExport}
-            style={{ ...s.btn, background: '#002233', color: '#00d4ff', border: '1px solid #00d4ff44' }}
-            title="Download MNI-space NIfTIs, transforms, and electrode coordinates"
+            disabled={busy}
+            onClick={handleExport}
+            style={{ ...s.btn, background: '#1a1000', color: '#ffab40', border: '1px solid #ffab4044', opacity: busy ? 0.5 : 1 }}
+            title="This reconstruction was edited after its last MNI export — the exported coordinates are outdated. Click to re-run."
           >
-            ⬇ Download MNI export
+            ⟳ Re-export to MNI (outdated)
           </button>
         )}
         {isComplete && (exportStatus === 'none' || exportStatus === 'error') && (
