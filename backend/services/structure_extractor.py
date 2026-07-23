@@ -35,6 +35,7 @@ import numpy as np
 import nibabel as nib
 from skimage import measure
 from skimage.filters import gaussian
+from scipy.ndimage import distance_transform_edt
 import trimesh
 import json
 import os
@@ -167,6 +168,44 @@ ALL_STRUCTURES = {
 
 CORTICAL_GROUPS = {"frontal", "temporal", "parietal", "occipital", "cingulate"}
 
+# ── Surface smoothing ─────────────────────────────────────────────────────────
+# DKT label boundaries are voxel-quantized, so raw marching cubes produces a
+# visible staircase. These settings affect DISPLAY MESHES ONLY -- the label
+# volume (structures_cortical.nii.gz) is never modified, so contact-to-structure
+# labeling in services/contact_labeling.py is unaffected by any change here.
+#
+# Measured across all 78 extractable structures on PY26N009_dev3, comparing mesh
+# volume against the true voxel volume of the label mask. Roughness = surface
+# area / area of an equal-volume sphere (lower is smoother):
+#     old (sigma .5 @ level .4)   mean|err| 4.9%  (always inflated, +1.1..+7.6%)
+#     fixed sigma .8 + Taubin     mean|err| 3.3%  (-10.7..-0.2%), 69/78 improved
+#     adaptive sigma + Taubin     mean|err| 2.7%  ( -6.2..-0.2%), 76/78 improved
+# and 78/78 structures came out smoother (mean roughness -6.2%).
+#
+# ITK AntiAliasBinary was benchmarked too and matched a flat sigma .8 almost
+# exactly (-2.9/-5.1% vol, rough 1.50/3.36) for more cost, so it is not used.
+#
+# level 0.5 is the midpoint of the 0/1 mask and preserves boundary position;
+# the previous 0.4 systematically inflated every structure (measured +4.9% mean
+# across 78 structures, always positive).
+SMOOTH_ISOLEVEL = 0.5
+
+# Sigma is scaled by how thick the structure actually is. A fixed sigma erodes
+# thin parcels far more than bulky ones -- with a flat 0.8, thin ribbons like
+# isthmus cingulate and pericalcarine lost ~10% volume while cerebellum lost
+# 0.2% (correlation between half-thickness and volume error: +0.50). Scaling
+# keeps the strong smoothing where it is safe and backs off where it is not.
+SMOOTH_SIGMA_MAX = 0.8          # bulky structures (thalamus, cerebellum, ...)
+SMOOTH_SIGMA_MIN = 0.5          # thin cortical ribbons
+SIGMA_REF_HALF_THICKNESS_MM = 3.5  # half-thickness at which sigma reaches the max
+# Taubin lambda/nu: shrink-free Laplacian smoothing. nu must be POSITIVE --
+# trimesh applies `vertices -= nu * dot`, so a negative nu turns the
+# compensating pass into a second shrinking pass (~7% volume loss).
+# Constraint from trimesh: 0 < 1/lambda - 1/nu < 0.1.
+TAUBIN_LAMB = 0.5
+TAUBIN_NU = 0.52
+TAUBIN_ITERATIONS = 10
+
 
 # ── ANTs → nibabel affine helper ─────────────────────────────────────────────
 
@@ -220,11 +259,19 @@ def _labels_to_mesh(label_data: np.ndarray, affine: np.ndarray,
     print(f"[STRUCT DEBUG] mask vox center: {vox_center} -> world {world_center}")
     print(f"[STRUCT DEBUG] after -= center: {world_center - center}")
 
-    smoothed = gaussian(mask, sigma=0.5)
+    # Scale smoothing to the structure's own thickness (see notes at SMOOTH_SIGMA_MAX).
+    # Peak of the interior distance transform = half-thickness, in mm so that
+    # anisotropic voxels are handled correctly.
+    vox_mm = np.linalg.norm(affine[:3, :3], axis=0)
+    half_thickness_mm = float(distance_transform_edt(mask > 0, sampling=vox_mm).max())
+    sigma = SMOOTH_SIGMA_MAX * min(1.0, half_thickness_mm / SIGMA_REF_HALF_THICKNESS_MM)
+    sigma = float(np.clip(sigma, SMOOTH_SIGMA_MIN, SMOOTH_SIGMA_MAX))
+
+    smoothed = gaussian(mask, sigma=sigma)
 
     try:
         verts_vox, faces, _, _ = measure.marching_cubes(
-            smoothed, level=0.4, step_size=1, allow_degenerate=False
+            smoothed, level=SMOOTH_ISOLEVEL, step_size=1, allow_degenerate=False
         )
     except (ValueError, RuntimeError):
         return None
@@ -242,6 +289,21 @@ def _labels_to_mesh(label_data: np.ndarray, affine: np.ndarray,
     print(f"[STRUCT DEBUG] aligned range  : {verts_aligned.min(axis=0)} - {verts_aligned.max(axis=0)}")
 
     mesh = trimesh.Trimesh(vertices=verts_aligned, faces=faces, process=False)
+
+    # Taubin smoothing on the dense mesh (before decimation) to take the
+    # remaining voxel staircase off the surface without shrinking the structure.
+    # Guarded: if smoothing produces non-finite vertices, keep the unsmoothed mesh.
+    if TAUBIN_ITERATIONS > 0 and len(mesh.faces) >= 20:
+        try:
+            before = mesh.vertices.copy()
+            trimesh.smoothing.filter_taubin(
+                mesh, lamb=TAUBIN_LAMB, nu=TAUBIN_NU, iterations=TAUBIN_ITERATIONS
+            )
+            if not np.isfinite(mesh.vertices).all():
+                mesh.vertices = before
+        except Exception:
+            mesh = trimesh.Trimesh(vertices=verts_aligned, faces=faces, process=False)
+
     if len(mesh.faces) > max_faces:
         mesh = mesh.simplify_quadric_decimation(max_faces)
 
