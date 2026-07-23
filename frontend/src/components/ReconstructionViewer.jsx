@@ -6,22 +6,8 @@ import Viewer3D from './Viewer3D';
 import LayerPanel from './LayerPanel';
 import ElectrodeEditor from './ElectrodeEditor';
 import CtHistogramSlider from './CtHistogramSlider';
+import StructurePanel from './StructurePanel';
 import api, { snapToBlob } from '../api';
-
-function StructureRow({ structKey, s, structureVisible, setStructureVisible, stripHemisphere }) {
-  const label = stripHemisphere ? s.label.replace(/^(Left|Right)\s+/i, '') : s.label;
-  const checked = structureVisible?.[structKey] !== false;
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 5 }}>
-      <input type="checkbox"
-        checked={checked}
-        onChange={e => setStructureVisible(structKey, e.target.checked)}
-        style={{ accentColor: s.color, width: 15, height: 15, flexShrink: 0, cursor: 'pointer' }} />
-      <div style={{ width: 11, height: 11, borderRadius: 2, background: s.color, flexShrink: 0 }} />
-      <span style={{ fontSize: 13, color: '#c8d4e0', fontFamily: 'IBM Plex Sans, sans-serif', lineHeight: 1.2 }}>{label}</span>
-    </div>
-  );
-}
 
 export default function ReconstructionViewer({ reconId, shareToken }) {
   const {
@@ -430,70 +416,14 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
             )}
           </div>
 
-          {/* Structures */}
-          {structuresData && Object.keys(structuresData).length > 0 && (
-            <div style={{ padding: '10px 16px', borderBottom: '1px solid #1e2530', maxHeight: 480, overflowY: 'auto' }}>
-              <div style={{ fontSize: 11, fontWeight: 600, color: '#7a8a99', textTransform: 'uppercase', letterSpacing: '0.08em', fontFamily: 'IBM Plex Mono, monospace', marginBottom: 10 }}>Structures</div>
-              {['subcortical', 'frontal', 'temporal', 'parietal', 'occipital', 'cingulate'].filter(g =>
-                Object.values(structuresData).some(s => s.group === g && s.vertices)
-              ).map(group => {
-                const entries = Object.entries(structuresData).filter(([,s]) => s.group === group && s.vertices);
-                if (!entries.length) return null;
-                const leftEntries  = entries.filter(([k]) => k.endsWith('_l'));
-                const rightEntries = entries.filter(([k]) => k.endsWith('_r'));
-                const midline      = entries.filter(([k]) => !k.endsWith('_l') && !k.endsWith('_r'));
-                const selectAll  = () => entries.forEach(([k]) => setStructureVisible(k, true));
-                const deselectAll = () => entries.forEach(([k]) => setStructureVisible(k, false));
-                const btnBase = { fontSize: 11, background: 'none', border: '1px solid #2a3440', borderRadius: 3, padding: '2px 9px', cursor: 'pointer', fontFamily: 'IBM Plex Mono, monospace' };
-                return (
-                  <div key={group} style={{ marginBottom: 14 }}>
-                    {/* Group header */}
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                      <div style={{ fontSize: 11, fontWeight: 600, color: '#7a8a99', textTransform: 'uppercase', letterSpacing: '0.06em', fontFamily: 'IBM Plex Mono, monospace' }}>{group}</div>
-                      <div style={{ display: 'flex', gap: 5 }}>
-                        <button onClick={selectAll}   style={{ ...btnBase, color: '#74C0FC' }}>All</button>
-                        <button onClick={deselectAll} style={{ ...btnBase, color: '#7a8a99' }}>None</button>
-                      </div>
-                    </div>
-                    {/* Midline structures span full width */}
-                    {midline.map(([key, s]) => (
-                      <StructureRow key={key} structKey={key} s={s}
-                        structureVisible={structureVisible} setStructureVisible={setStructureVisible}
-                        stripHemisphere={false} />
-                    ))}
-                    {/* Bilateral structures in two columns */}
-                    {(leftEntries.length > 0 || rightEntries.length > 0) && (
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', columnGap: 10 }}>
-                        <div>
-                          <div style={{ fontSize: 10, color: '#7a8a99', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 5, fontFamily: 'IBM Plex Mono, monospace' }}>Left</div>
-                          {leftEntries.map(([key, s]) => (
-                            <StructureRow key={key} structKey={key} s={s}
-                              structureVisible={structureVisible} setStructureVisible={setStructureVisible}
-                              stripHemisphere={true} />
-                          ))}
-                        </div>
-                        <div>
-                          <div style={{ fontSize: 10, color: '#7a8a99', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 5, fontFamily: 'IBM Plex Mono, monospace' }}>Right</div>
-                          {rightEntries.map(([key, s]) => (
-                            <StructureRow key={key} structKey={key} s={s}
-                              structureVisible={structureVisible} setStructureVisible={setStructureVisible}
-                              stripHemisphere={true} />
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-          {!structuresData && (
-            <div style={{ padding: '10px 16px', borderBottom: '1px solid #1e2530' }}>
-              <button onClick={loadStructures} disabled={structuresLoading}
-                style={{ fontSize: 11, color: structuresLoading ? '#4a5568' : '#74C0FC', background: 'none', border: '1px solid #1e2530', borderRadius: 4, padding: '4px 10px', cursor: structuresLoading ? 'default' : 'pointer', fontFamily: 'IBM Plex Mono, monospace' }}>
-                {structuresLoading ? 'Computing structures…' : '⊕ Load Structures'}
-              </button>
-            </div>
+          {/* Structures — same panel as the edit-mode view (master toggle, opacity,
+              hierarchical Group -> Side -> Structure tri-state tree) */}
+          {reconstruction?.has_mesh && (
+            <StructurePanel
+              onLoadStructures={loadStructures}
+              structureOpacity={structureOpacity}
+              setStructureOpacity={setStructureOpacity}
+            />
           )}
 
           {/* Shaft list — read only */}
