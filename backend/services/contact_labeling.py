@@ -9,8 +9,14 @@ Depth (sEEG) contacts frequently land in white matter between gyri -- on real
 data only ~40-50% of contacts fall directly inside a labeled structure. Rather
 than reporting those as simply "unlabeled", we also search a small radius for
 the nearest labeled voxel and report it with its distance, so a contact can be
-read as e.g. "2.3 mm from Left Hippocampus". ``distance_mm == 0`` means the
+read as e.g. "1.4 mm from Left Hippocampus". ``distance_mm == 0`` means the
 contact is inside the structure.
+
+The search radius is deliberately tight (2 mm): a structure several millimetres
+away is weak evidence about where a contact actually sits, and leaving such a
+contact unassigned is more honest than naming a region it is not in. Contacts
+with no structure inside the radius get an empty structure/distance and keep
+whatever the voxel actually contains in ``voxel_content``.
 
 Log output must stay ASCII (uvicorn stdout is cp1252 on Windows).
 """
@@ -39,7 +45,7 @@ NON_CATALOG_LABELS = {
     77: "White matter hypointensity",
 }
 
-DEFAULT_SEARCH_RADIUS_MM = 5.0
+DEFAULT_SEARCH_RADIUS_MM = 2.0
 
 
 def get_label_volume_path(recon_dir: str) -> str:
