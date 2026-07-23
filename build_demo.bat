@@ -41,8 +41,22 @@ mkdir "%DIST%"
 
 copy "%~dp0backend\dist\NeuroReconstruct.exe" "%DIST%\"
 
-:: Copy existing data and database if present
-if exist "%~dp0backend\data"          xcopy /e /i /q "%~dp0backend\data"          "%DIST%\data\"
+:: Copy existing data and database if present.
+:: Two things are deliberately left out of the demo copy:
+::   ct_cache\            regenerable CT threshold meshes (~1.4 GB). Rebuilt on
+::                        first view of each threshold, roughly 19s, and only a
+::                        couple of thresholds are ever used in a demo.
+::   *_warp.nii.gz        MNI warp fields (~147 MB). Needed only to re-run an
+::                        export, which regenerates them via ANTs.
+:: Together these were 1.5 GB of a 1.9 GB package. The exclude file is written
+:: with a relative name so a project path containing spaces cannot break
+:: xcopy's /exclude parsing.
+cd /d "%~dp0"
+> demo_exclude.tmp echo \ct_cache\
+>> demo_exclude.tmp echo mri_to_mni_warp.nii.gz
+>> demo_exclude.tmp echo mni_to_mri_invwarp.nii.gz
+if exist "%~dp0backend\data" xcopy /e /i /q /exclude:demo_exclude.tmp "%~dp0backend\data" "%DIST%\data\"
+del demo_exclude.tmp >nul 2>&1
 if exist "%~dp0backend\brain_viewer.db" copy "%~dp0backend\brain_viewer.db" "%DIST%\"
 
 :: Write a README
