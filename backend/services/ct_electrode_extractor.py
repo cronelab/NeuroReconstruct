@@ -262,7 +262,7 @@ def snap_to_blob_centroid(
     binary_region = (region > hu_threshold).astype(np.uint8)
 
     if not binary_region.any():
-        print(f"[SNAP] No voxels above threshold in region — returning original")
+        print(f"[SNAP] No voxels above threshold in region - returning original")
         return world_pos
 
     # ── Intensity × proximity weighted centroid (robust to close neighbours) ──
@@ -282,7 +282,7 @@ def snap_to_blob_centroid(
 
     coords = np.argwhere(binary_region)  # region-local voxels above threshold
     if len(coords) == 0:
-        print("[SNAP] No metal near click — returning original")
+        print("[SNAP] No metal near click - returning original")
         return world_pos
 
     hu = region[coords[:, 0], coords[:, 1], coords[:, 2]].astype(float)

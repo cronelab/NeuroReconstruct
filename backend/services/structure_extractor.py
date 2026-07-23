@@ -201,7 +201,7 @@ def _labels_to_mesh(label_data: np.ndarray, affine: np.ndarray,
     vox_center = (vox_min + vox_max) / 2.0
     vox_center_hom = np.append(vox_center, 1.0)
     world_center = (affine @ vox_center_hom)[:3]
-    print(f"[STRUCT DEBUG] mask vox bbox  : {vox_min} – {vox_max}")
+    print(f"[STRUCT DEBUG] mask vox bbox  : {vox_min} - {vox_max}")
     print(f"[STRUCT DEBUG] mask vox center: {vox_center} -> world {world_center}")
     print(f"[STRUCT DEBUG] after -= center: {world_center - center}")
 
@@ -223,8 +223,8 @@ def _labels_to_mesh(label_data: np.ndarray, affine: np.ndarray,
 
     # Subtract brain mesh center → Three.js space
     verts_aligned = verts_world - center
-    print(f"[STRUCT DEBUG] world range    : {verts_world.min(axis=0)} – {verts_world.max(axis=0)}")
-    print(f"[STRUCT DEBUG] aligned range  : {verts_aligned.min(axis=0)} – {verts_aligned.max(axis=0)}")
+    print(f"[STRUCT DEBUG] world range    : {verts_world.min(axis=0)} - {verts_world.max(axis=0)}")
+    print(f"[STRUCT DEBUG] aligned range  : {verts_aligned.min(axis=0)} - {verts_aligned.max(axis=0)}")
 
     mesh = trimesh.Trimesh(vertices=verts_aligned, faces=faces, process=False)
     if len(mesh.faces) > max_faces:
@@ -374,7 +374,7 @@ def extract_all_structures(mri_mesh_path: str, output_dir: str,
     for c in corners:
         w = cort_affine @ c
         print(f"[STRUCT DEBUG]   vox {c[:3].astype(int)} -> world {w[:3]}")
-    print(f"[STRUCT DEBUG] Brain center vs DKT extent — offset = "
+    print(f"[STRUCT DEBUG] Brain center vs DKT extent - offset = "
           f"{center} (should land inside above range)")
     print(f"[STRUCT] DKT label values present (sample): {unique_cort[:30]}")
 

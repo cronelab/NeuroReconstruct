@@ -736,7 +736,7 @@ async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str,
                     if ct_preregistered:
                         # CT already in MRI space — save identity, skip computation
                         _np.save(transform_path, _np.eye(4))
-                        print(f"[REG] CT marked as pre-registered — identity transform saved for recon {recon_id}")
+                        print(f"[REG] CT marked as pre-registered - identity transform saved for recon {recon_id}")
                     else:
                         loop = asyncio.get_event_loop()
                         await loop.run_in_executor(
@@ -1781,7 +1781,7 @@ async def get_ct_threshold_mesh(
             transform = load_transform(tp)
             print(f"[CT MESH] Using registered transform")
         else:
-            print(f"[CT MESH] No transform found — displaying unregistered CT")
+            print(f"[CT MESH] No transform found - displaying unregistered CT")
     except Exception as e:
         print(f"[CT MESH] Could not load transform: {e}")
 

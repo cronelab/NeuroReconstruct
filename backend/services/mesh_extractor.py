@@ -80,13 +80,13 @@ def _skull_strip_morphological(data: np.ndarray, affine: np.ndarray,
     mean_vox_mm = float(vox_sizes.mean())
     erode_r = max(3, round(8.0 / mean_vox_mm))
     dilate_r = erode_r + 2
-    print(f"[MESH] Voxel size ~{mean_vox_mm:.2f} mm — erode r={erode_r}, dilate r={dilate_r}")
+    print(f"[MESH] Voxel size ~{mean_vox_mm:.2f} mm - erode r={erode_r}, dilate r={dilate_r}")
 
     eroded = binary_erosion(binary, ball(erode_r))
     labeled, n = nd_label(eroded)
 
     if n == 0:
-        print("[MESH] Erosion removed everything — using raw largest component")
+        print("[MESH] Erosion removed everything - using raw largest component")
         labeled, n = nd_label(binary)
 
     sizes = np.bincount(labeled.ravel())

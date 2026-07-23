@@ -10,7 +10,7 @@ async def create_admin():
         result = await db.execute(select(User).where(User.username == "admin"))
         existing = result.scalar_one_or_none()
         if existing:
-            print("Admin user already exists — deleting and recreating...")
+            print("Admin user already exists - deleting and recreating...")
             await db.delete(existing)
             await db.commit()
 
@@ -21,7 +21,7 @@ async def create_admin():
         )
         db.add(admin)
         await db.commit()
-        print("✓ Admin user created successfully")
+        print("[OK] Admin user created successfully")
         print("  Username: admin")
         print("  Password: changeme")
 

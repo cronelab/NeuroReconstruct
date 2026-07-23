@@ -18,8 +18,8 @@ cols = [row[1] for row in cursor.fetchall()]
 if "deleted_at" not in cols:
     cursor.execute("ALTER TABLE reconstructions ADD COLUMN deleted_at DATETIME NULL")
     conn.commit()
-    print("✓ Added deleted_at column to reconstructions table")
+    print("[OK] Added deleted_at column to reconstructions table")
 else:
-    print("✓ deleted_at column already exists — nothing to do")
+    print("[OK] deleted_at column already exists - nothing to do")
 
 conn.close()
