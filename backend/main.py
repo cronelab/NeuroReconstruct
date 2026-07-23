@@ -59,9 +59,10 @@ def _get_mri_volume(mri_path: str):
 
 def _render_slice(mri_path: str, axis: str, slice_idx: int):
     """Return (png_bytes, shape, world_coord, voxel_size_mm, count, actual_idx,
-    inv_affine, vol_shape, px_w_mm, px_h_mm), cached. px_w_mm/px_h_mm are the
-    physical mm-per-pixel along the displayed width/height, for aspect-correct
-    rendering of anisotropic voxels."""
+    inv_affine, vol_shape, px_w_mm, px_h_mm, plane_normal, plane_offset), cached.
+    px_w_mm/px_h_mm are the physical mm-per-pixel along the displayed width/height,
+    for aspect-correct rendering of anisotropic voxels. plane_normal/plane_offset
+    define the slice plane exactly — see the comment on their computation below."""
     vol = _get_mri_volume(mri_path)
     data = vol["data"]
     affine = vol["affine"]
@@ -89,8 +90,35 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
     png_bytes = buf.getvalue()
 
     voxel_sizes = np.sqrt((affine[:3, :3] ** 2).sum(axis=0))
-    world_coord = float(affine[ax, 3] + affine[ax, ax] * slice_idx)
     voxel_size_mm = float(voxel_sizes[ax])
+    inv_affine = np.linalg.inv(affine)
+
+    # ── Slice plane geometry in world RAS ─────────────────────────────────────
+    # A constant-voxel-index plane is perpendicular to a world axis only when the
+    # affine is axis-aligned. Oblique acquisitions (AC-PC tilt and friends) are
+    # rotated, so "the world coordinate of this slice" is not one number — it
+    # varies across the plane. On this project's own data a constant-index axial
+    # plane sweeps ~18 mm of world z, i.e. ~31 slices. Hence two values:
+    #
+    #   world_coord  — the value at the CENTRE of the plane. A representative
+    #                  figure for labels and readouts, and identical to the old
+    #                  corner-voxel formula whenever the affine is axis-aligned.
+    #
+    #   plane_normal / plane_offset — the plane itself, as  normal · P = offset
+    #                  with |normal| == 1. So |normal · P - offset| is the exact
+    #                  perpendicular distance in mm from any world point P to
+    #                  this slice, for any affine.
+    #
+    # To test whether a point lies on this slice, use plane_normal/plane_offset.
+    # Never compare a point's world x/y/z against world_coord.
+    row = inv_affine[ax, :3]                  # ∇(voxel index `ax`) w.r.t. world
+    row_norm = float(np.linalg.norm(row))
+    plane_normal = (row / row_norm).tolist()
+    plane_offset = float((slice_idx - inv_affine[ax, 3]) / row_norm)
+
+    centre_vox = [(d - 1) / 2.0 for d in data.shape]
+    centre_vox[ax] = float(slice_idx)
+    world_coord = float((affine @ np.array([*centre_vox, 1.0]))[ax])
 
     # Physical mm-per-pixel of the *displayed* image. After the np.fliplr(np.rot90)
     # above, displayed WIDTH maps to the slice's "row" data-axis and displayed
@@ -100,9 +128,9 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
     px_w_mm = float(voxel_sizes[row_ax])
     px_h_mm = float(voxel_sizes[col_ax])
 
-    inv_affine = np.linalg.inv(affine)
     result = (png_bytes, sl_uint8.shape, world_coord, voxel_size_mm, n, slice_idx,
-              inv_affine.flatten().tolist(), list(data.shape), px_w_mm, px_h_mm)
+              inv_affine.flatten().tolist(), list(data.shape), px_w_mm, px_h_mm,
+              plane_normal, plane_offset)
     vol["png_cache"][key] = result  # cache the full tuple
     return result
 
@@ -250,13 +278,16 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
     if slice_idx < 0 or slice_idx >= n_mri:
         slice_idx = n_mri // 2
 
-    world_coord = float(mri_aff[ax, 3] + mri_aff[ax, ax] * slice_idx)
-
-    # Find the DKT voxel index that corresponds to this world coordinate
-    step = float(laff[ax, ax])
-    if abs(step) < 1e-6:
-        return None
-    dkt_idx = int(round((world_coord - float(laff[ax, 3])) / step))
+    # Find the DKT voxel index matching this MRI slice. Go through world space with
+    # the full affines rather than each volume's [ax, ax] diagonal term — the
+    # diagonal shortcut silently assumes both grids are axis-aligned, which oblique
+    # acquisitions are not. In practice the DKT labels are resampled onto the MRI's
+    # own grid, so this resolves to dkt_idx == slice_idx; doing it properly just
+    # means that stays true if the label volume ever lands on a different grid.
+    centre_vox = [(d - 1) / 2.0 for d in mri_data.shape]
+    centre_vox[ax] = float(slice_idx)
+    world_centre = mri_aff @ np.array([*centre_vox, 1.0])
+    dkt_idx = int(round((np.linalg.inv(laff) @ world_centre)[ax]))
     dkt_idx = max(0, min(ldata.shape[ax] - 1, dkt_idx))
 
     # Extract label slice
@@ -1086,7 +1117,8 @@ async def get_mri_slice(
     result_data = await loop.run_in_executor(
         None, _render_slice, mri_abs, axis, slice_idx
     )
-    png_bytes, shape, world_coord, voxel_size_mm, count, actual_idx, inv_affine, vol_shape, px_w_mm, px_h_mm = result_data
+    (png_bytes, shape, world_coord, voxel_size_mm, count, actual_idx, inv_affine,
+     vol_shape, px_w_mm, px_h_mm, plane_normal, plane_offset) = result_data
 
     return FastAPIResponse(
         content=png_bytes,
@@ -1096,7 +1128,13 @@ async def get_mri_slice(
             "X-Slice-Count": str(count),
             "X-Slice-Width": str(shape[1]),
             "X-Slice-Height": str(shape[0]),
+            # Plane centre — for display only. To test whether a world point is on
+            # this slice, use the plane headers below; on an oblique volume this
+            # value is only correct at the middle of the image.
             "X-Slice-World-Coord": str(world_coord),
+            # Exact slice plane: |normal · P - offset| = mm from P to this slice.
+            "X-Slice-Plane-Normal": json.dumps(plane_normal),
+            "X-Slice-Plane-Offset": str(plane_offset),
             "X-Voxel-Size-Mm": str(voxel_size_mm),
             "X-Display-Px-Width-Mm": str(px_w_mm),
             "X-Display-Px-Height-Mm": str(px_h_mm),
