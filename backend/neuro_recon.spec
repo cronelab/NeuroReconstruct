@@ -12,7 +12,7 @@ trimesh_datas    = collect_data_files("trimesh")
 scipy_datas      = collect_data_files("scipy")
 matplotlib_datas = collect_data_files("matplotlib")
 ants_datas       = collect_data_files("ants")
-antspynet_datas  = collect_data_files("antspynet")
+# antspynet is deliberately NOT collected -- see the excludes list below.
 
 frontend_build = os.path.join("..", "frontend", "build")
 
@@ -64,7 +64,7 @@ a = Analysis(
     datas=[
         (frontend_build, "frontend_build"),
         ("services", "services"),
-    ] + nibabel_datas + skimage_datas + trimesh_datas + scipy_datas + matplotlib_datas + ants_datas + antspynet_datas,
+    ] + nibabel_datas + skimage_datas + trimesh_datas + scipy_datas + matplotlib_datas + ants_datas,
     hiddenimports=[
         "uvicorn.logging","uvicorn.loops","uvicorn.loops.auto","uvicorn.loops.asyncio",
         "uvicorn.protocols","uvicorn.protocols.http","uvicorn.protocols.http.auto",
@@ -96,11 +96,21 @@ a = Analysis(
         "SimpleITK",
         "matplotlib","matplotlib.pyplot","matplotlib.backends",
         "matplotlib.backends.backend_agg",
-        "ants","ants.plotting","antspynet",
+        # ants only -- antspynet would pull in the whole TensorFlow stack.
+        "ants","ants.plotting",
     ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=["IPython","jupyter","PyQt5","PyQt6","tkinter","nilearn","sklearn"],
+    # antspynet (deep-learning skull stripping / parcellation) and its
+    # TensorFlow stack are excluded: they account for the bulk of the bundle
+    # size and the frozen build never reaches them. main.py borrows a donor
+    # mesh and a cached structures volume when frozen, and every antspynet
+    # import in services/ is function-local and guarded, so a missing module
+    # degrades to the documented fallback instead of raising. CT->MRI
+    # coregistration is SimpleITK-only and is unaffected; plain `ants` is
+    # still bundled for the MNI export path.
+    excludes=["IPython","jupyter","PyQt5","PyQt6","tkinter","nilearn","sklearn",
+              "tensorflow","keras","antspynet","tensorboard","h5py"],
     cipher=block_cipher,
     noarchive=False,
 )
