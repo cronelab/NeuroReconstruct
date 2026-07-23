@@ -185,7 +185,7 @@ GET    /api/auth/me
 GET    /api/reconstructions                         list with shaft/contact counts
 POST   /api/reconstructions                         upload MRI+CT, triggers mesh extraction
 GET    /api/reconstructions/{id}                    single with all shafts
-PATCH  /api/reconstructions/{id}/status             set is_complete, is_locked
+PATCH  /api/reconstructions/{id}/status             set is_complete, is_locked (editor/admin)
 GET    /api/reconstructions/{id}/mesh               brain surface mesh JSON
 GET    /api/reconstructions/{id}/ct-mesh            CT threshold mesh JSON
 GET    /api/reconstructions/{id}/mri-slice          ?axis=axial&slice_idx=90

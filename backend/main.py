@@ -874,7 +874,11 @@ async def update_reconstruction_status(
     recon_id: int,
     is_complete: Optional[bool] = Body(None, embed=True),
     is_locked: Optional[bool] = Body(None, embed=True),
-    current_user: Optional[User] = Depends(get_current_user),
+    # require_editor, not Optional[get_current_user]: this endpoint mutates
+    # complete/lock state and cascades to export_status (unlocking marks an
+    # existing MNI export stale). It previously declared current_user as
+    # Optional and never checked it, so it accepted unauthenticated requests.
+    current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
