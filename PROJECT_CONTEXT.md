@@ -151,7 +151,7 @@ GPU acceleration for antspynet was explored 2026-07-22 and **rolled back**. Benc
 **Mesh-loop parallelization (implemented 2026-07-22):** the per-structure mesh extraction (marching cubes + smoothing + decimation, ~84 independent structures) now runs in a `ProcessPoolExecutor` (`min(cpu_count-1, 8)` workers). Workers load the cortical label volume once each via `_mesh_worker_init` (from `structures_cortical.nii.gz`) rather than pickling the array per task; `_mesh_worker_task` calls `_labels_to_mesh`. Only the CPU mesh phase (~47 s serial) is parallelized — the antspynet DKT call is unchanged. Still-open CPU lever (not built): reuse the brain extraction already done in `mesh_extractor.py` instead of re-running antspynet preprocessing.
 
 ### Registration QA — Fusion Viewer + Manual Confirmation
-CT→MRI registration accuracy previously had no check beyond "does `ct_to_mri.npy` exist". Added a Fusion view (`/fusion-slice` resamples the CT onto the MRI plane via true oblique 3D trilinear resampling; frontend overlays it red over the MRI with a blend slider) and a `registration_confirmed` flag an editor sets via "Looks correct" — auto-resets whenever registration re-runs. Not a hard gate; surfaces an "unreviewed" banner/badge. **Status: on branch `registration-qa` (PR #2), not yet merged to main.** Follow-ups not built: persisted MI metric, square spyglass lens, at-a-glance ReconCard badge.
+CT→MRI registration accuracy previously had no check beyond "does `ct_to_mri.npy` exist". Added a Fusion view (`/fusion-slice` resamples the CT onto the MRI plane via true oblique 3D trilinear resampling; frontend overlays it red over the MRI with a blend slider) and a `registration_confirmed` flag an editor sets via "Looks correct" — auto-resets whenever registration re-runs. Not a hard gate; surfaces an "unreviewed" banner/badge. **Status: merged to `main` (PR #2).** Follow-ups not built: persisted MI metric, square spyglass lens, at-a-glance ReconCard badge.
 
 ---
 
@@ -207,11 +207,12 @@ POST   /api/reconstructions/{id}/snap-to-blob       snap world pos to CT blob
 
 **Last worked on (2026-07-22):** Built the **MNI152 export pipeline (step 1)** on branch `mni-registration` — **PR #4** (targets `main` directly, open, not merged). See the "MNI152 Export Pipeline" design section above. Verified end-to-end on real data (`PY26N009_dev3`, 93 contacts): MRI warps into MNI152 (SyNRA), 100% of contacts inside the MNI bounding box, correct hemispheres and medial→lateral sEEG geometry (RAS/LPS + point-transform direction confirmed). Artifacts land in `recon_dir/export/`. (Note: `gh` CLI is installed but not authenticated on this box — the PR was created via the GitHub API using git's stored credential.)
 
-**Earlier (2026-07-21):** Got the app running end-to-end and shipped fixes/features across two PR branches off `main`:
-- `fix-bcrypt-and-mri-modality` (**PR #1**): bcrypt startup-crash fix, MRI T1/T2 modality selector, file-input layout fix, open3d dependency (fixes mesh-decimation crash on real data), hierarchical brain-structure checkbox tree.
-- `registration-qa` (**PR #2**, stacked on PR #1): fusion slice viewer + manual registration confirmation. See design section above.
+**Already merged to `main`** (verified live on GitHub 2026-07-22):
+- **PR #1** `fix-bcrypt-and-mri-modality`: bcrypt startup-crash fix, MRI T1/T2 modality selector, file-input layout fix, open3d dependency (fixes mesh-decimation crash on real data), hierarchical brain-structure checkbox tree.
+- **PR #2** `registration-qa`: fusion slice viewer + manual CT–MRI registration confirmation. See design section above.
+- **PR #3** `segmentation-cpu-parallel-mesh`: parallelized per-structure mesh extraction, segmentation kept CPU-only. See design section above.
 
-None of PR #1, #2, or #4 is merged to `main` yet. Prior verification (`PY26N009_dev1`): mesh extraction, CT registration (valid rigid transform, MI −0.58), ~84 patient-specific structures, and the fusion overlay (CT skull concentric around MRI brain).
+So `main` already contains all of the above; **PR #4** (`mni-registration`, still open) branched from `main` and sits on top of them — no stacking/rebase needed. Prior verification (`PY26N009_dev1`): mesh extraction, CT registration (valid rigid transform, MI −0.58), ~84 patient-specific structures, and the fusion overlay (CT skull concentric around MRI brain).
 
 **Working:**
 - 3D brain + CT + electrode + **patient-specific structure** visualization
@@ -219,7 +220,7 @@ None of PR #1, #2, or #4 is merged to `main` yet. Prior verification (`PY26N009_
 - Electrode placement workflow (click CT → snap to blob → place contact)
 - Autofill (spline fit)
 - Lock/complete workflow, role-based auth
-- CT→MRI registration + fusion-view QA (on branch)
+- CT→MRI registration + fusion-view QA (merged, PR #2)
 
 **Note:** the JSX compile issue previously flagged in `ElectrodeEditor.jsx` (`{/* ── SHAFT HEADER ── */}`) is resolved — the comment has its closing brace and the file compiles.
 
@@ -227,7 +228,7 @@ None of PR #1, #2, or #4 is merged to `main` yet. Prior verification (`PY26N009_
 
 ## Next Steps
 
-1. **Merge PR #1 then PR #2** (retarget PR #2 to `main` after PR #1 merges); **PR #4** (MNI export) targets `main` directly and can merge independently
+1. **Review & merge PR #4** (`mni-registration` → `main`, open) — PR #1/#2/#3 are already merged
 2. **Registration-QA follow-ups** — persist the SimpleITK MI metric (currently logged then discarded), square spyglass lens in the fusion view, at-a-glance registration badge on ReconCard
 3. **MNI export — next steps (step 1 shipped in PR #4)** — atlas region labeling of MNI coords (which standard-atlas region each contact falls in), group-template building, report generation; all consume `recon_dir/export/` transforms + `electrodes_mni.csv`
 4. **CSV/Excel export of electrode coordinates** — shaft name, contact number, x/y/z mm. High clinical value for sharing with analysis tools (native-space complement to the MNI CSV)
