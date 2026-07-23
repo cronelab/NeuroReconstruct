@@ -33,33 +33,70 @@ export function isInsideMesh(point, mesh) {
   return votes >= 2;
 }
 
-// A contact is labeled with the nearest structure only if it is within this many
-// mm of that structure's surface; beyond it the contact is left unlabelled.
+// Radius of the plurality-vote search for the nearest-structure fallback. Mirrors
+// DEFAULT_SEARCH_RADIUS_MM in the backend's contact_labeling.py: structure-mesh
+// vertices beyond this distance are not evidence about where a contact sits, so a
+// contact with no structure vertex inside the radius is left unlabelled.
 export const MAX_LABEL_DIST_MM = 2;
 
-// Closest structure to a point (nearest mesh vertex ≈ nearest surface), across
-// BOTH cortical gyri and subcortical nuclei.
+// Structure a point most likely sits in, by a plurality vote among structure-mesh
+// vertices within MAX_LABEL_DIST_MM — the mesh-space analog of the voxel plurality
+// vote in the backend's contact_labeling.py. Each vertex within the radius casts
+// one vote for its structure; the structure holding the most votes wins, rather
+// than the single nearest vertex, so a lone stray vertex of a neighbouring parcel
+// does not decide the label. Ties break toward the structure with a vertex closest
+// to the point (matching the backend's nearest-voxel tie-break). Considers BOTH
+// cortical gyri and subcortical nuclei.
+//
+// `dist` is the distance to the winning structure's nearest vertex (not the overall
+// nearest vertex); `voteShare` is the winner's fraction of the votes, so a decisive
+// label can be told apart from a marginal one. Returns null when no structure vertex
+// lies within MAX_LABEL_DIST_MM.
+//
+// Note: mesh vertices are surface samples, not the uniform-volume voxels the backend
+// votes over, so a vote here is a surface-sampling share rather than a strict volume
+// share — the frontend has no label volume, so vertices are the available candidates.
 export function nearestStructure(point, structuresData) {
   if (!structuresData) return null;
   const px = point.x, py = point.y, pz = point.z;
-  let best = null;
-  let bestD2 = Infinity;
+  const r2 = MAX_LABEL_DIST_MM * MAX_LABEL_DIST_MM;
+
+  // Per-structure vote count and nearest squared distance (for the tie-break and
+  // the reported distance), plus the total number of voters for vote_share.
+  let winner = null;
+  let totalVotes = 0;
   for (const key in structuresData) {
     const s = structuresData[key];
     if (!s || !s.vertices) continue;
     const v = s.vertices;
-    let localMin = Infinity;
+    let votes = 0;
+    let minD2 = Infinity;
     for (let i = 0; i < v.length; i += 3) {
       const dx = v[i] - px, dy = v[i + 1] - py, dz = v[i + 2] - pz;
       const d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 < localMin) localMin = d2;
+      if (d2 <= r2) {
+        votes++;
+        if (d2 < minD2) minD2 = d2;
+      }
     }
-    if (localMin < bestD2) {
-      bestD2 = localMin;
-      best = { key, label: s.label || key, color: s.color || '#e8edf2' };
+    if (votes === 0) continue;
+    totalVotes += votes;
+    // Plurality: more votes wins outright; equal votes break toward the closer
+    // structure (smaller nearest-vertex distance).
+    if (!winner || votes > winner.votes || (votes === winner.votes && minD2 < winner.minD2)) {
+      winner = { key, votes, minD2 };
     }
   }
-  return best ? { ...best, dist: Math.sqrt(bestD2) } : null;
+  if (!winner) return null;
+
+  const s = structuresData[winner.key];
+  return {
+    key: winner.key,
+    label: s.label || winner.key,
+    color: s.color || '#e8edf2',
+    dist: Math.sqrt(winner.minD2),
+    voteShare: winner.votes / totalVotes,
+  };
 }
 
 // Build (non-rendered) Three.js meshes for every structure with geometry, keyed
@@ -104,10 +141,10 @@ export function structuresCentroid(structuresData) {
 }
 
 // Which structure a contact sits in: an enclosing structure if any (a subcortical
-// nucleus is preferred when several overlap), otherwise the nearest cortical or
-// subcortical structure but only within MAX_LABEL_DIST_MM. Returns null when the
-// contact is inside nothing and more than MAX_LABEL_DIST_MM from every structure
-// (i.e. unlabelled).
+// nucleus is preferred when several overlap), otherwise the plurality-vote winner
+// among structure vertices within MAX_LABEL_DIST_MM. Returns null when the contact
+// is inside nothing and no structure vertex lies within MAX_LABEL_DIST_MM (i.e.
+// unlabelled) — the radius gate is enforced inside nearestStructure.
 export function structureAtPoint(point, structuresData, meshes) {
   const insideKeys = [];
   meshes.forEach((mesh, key) => {
@@ -119,37 +156,91 @@ export function structureAtPoint(point, structuresData, meshes) {
     return { key: pick, label: s?.label || pick, color: s?.color || '#e8edf2', inside: true, dist: 0 };
   }
   const near = nearestStructure(point, structuresData);
-  return near && near.dist <= MAX_LABEL_DIST_MM ? { ...near, inside: false } : null;
+  return near ? { ...near, inside: false } : null;
 }
 
 const _pt = new THREE.Vector3();
 
+// Principal axis (unit direction) of a set of points — the shaft's trajectory,
+// as the dominant eigenvector of the contacts' 3x3 covariance. Found by power
+// iteration seeded with the first→last chord, which for a roughly-collinear
+// contact string already points along the shaft, so it converges in a few steps.
+// Returns a zero direction for a single/degenerate point (caller handles it).
+function principalAxis(points) {
+  const n = points.length;
+  let mx = 0, my = 0, mz = 0;
+  for (const p of points) { mx += p.x; my += p.y; mz += p.z; }
+  mx /= n; my /= n; mz /= n;
+
+  // Symmetric covariance accumulators.
+  let cxx = 0, cyy = 0, czz = 0, cxy = 0, cxz = 0, cyz = 0;
+  for (const p of points) {
+    const dx = p.x - mx, dy = p.y - my, dz = p.z - mz;
+    cxx += dx * dx; cyy += dy * dy; czz += dz * dz;
+    cxy += dx * dy; cxz += dx * dz; cyz += dy * dz;
+  }
+
+  // Seed with the chord between the first and last contact.
+  let vx = points[n - 1].x - points[0].x;
+  let vy = points[n - 1].y - points[0].y;
+  let vz = points[n - 1].z - points[0].z;
+  let len = Math.hypot(vx, vy, vz);
+  if (len < 1e-9) return { origin: new THREE.Vector3(mx, my, mz), dir: new THREE.Vector3() };
+  vx /= len; vy /= len; vz /= len;
+
+  for (let it = 0; it < 16; it++) {
+    const nx = cxx * vx + cxy * vy + cxz * vz;
+    const ny = cxy * vx + cyy * vy + cyz * vz;
+    const nz = cxz * vx + cyz * vy + czz * vz;
+    len = Math.hypot(nx, ny, nz);
+    if (len < 1e-9) break; // covariance annihilates v (all points coincident)
+    vx = nx / len; vy = ny / len; vz = nz / len;
+  }
+  return { origin: new THREE.Vector3(mx, my, mz), dir: new THREE.Vector3(vx, vy, vz) };
+}
+
 // "insertion region-target region" label for a shaft:
 //   insertion = region of the most SUPERFICIAL contact that has a label
-//   target    = region of the most DEEP contact that has a label
-// Every placed contact is resolved to a region (structureAtPoint); contacts that
-// are unlabelled (inside nothing and >MAX_LABEL_DIST_MM from any structure) are
-// skipped, so the two ends are the shallowest/deepest anatomically-labeled
-// contacts rather than the physical tip/entry (which often sit in white matter).
-// Depth is measured by distance to the anatomical centre (nearer = deeper).
-// Returns null when no placed contact resolves to a label.
+//   target    = region of the most DEEP (tip) contact that has a label
+// The two ends are found from the shaft's own trajectory: contacts are projected
+// onto their principal axis, and the two extremes of that projection are the
+// physical ends — not the lowest/highest contact number, and not the contacts
+// nearest/farthest from the anatomical centre (which can pick a mid-shaft contact
+// when the shaft does not point at the centre). The anatomical centre is used only
+// to orient the axis: the tip is the trajectory end that sits deeper in the brain,
+// i.e. the extreme nearer the centre.
+//
+// Every placed contact is resolved to a region (structureAtPoint); unlabelled
+// contacts (inside nothing and >MAX_LABEL_DIST_MM from any structure — typically
+// white matter) are skipped, so a tip sitting in white matter falls back to the
+// deepest labeled contact along the trajectory rather than leaving the shaft
+// unlabelled. Returns null when no placed contact resolves to a label.
 export function computeShaftAnatomyLabel(shaft, structuresData, meshes, centroid) {
   const contacts = (shaft.contacts || [])
     .filter(c => c.x_mm != null && c.y_mm != null && c.z_mm != null);
   if (contacts.length === 0) return null;
 
-  const d2 = (c) => {
-    const dx = c.x_mm - centroid.x, dy = c.y_mm - centroid.y, dz = c.z_mm - centroid.z;
-    return dx * dx + dy * dy + dz * dz;
-  };
+  const pts = contacts.map(c => new THREE.Vector3(c.x_mm, c.y_mm, c.z_mm));
+  const axis = principalAxis(pts);
+  const proj = pts.map(p => _pt.copy(p).sub(axis.origin).dot(axis.dir));
+
+  // Trajectory extremes, then orient so larger `depth` = deeper (toward the tip).
+  // The tip end is whichever projection extreme sits nearer the anatomical centre.
+  let iLo = 0, iHi = 0;
+  for (let i = 1; i < proj.length; i++) {
+    if (proj[i] < proj[iLo]) iLo = i;
+    if (proj[i] > proj[iHi]) iHi = i;
+  }
+  const hiIsDeep = pts[iHi].distanceToSquared(centroid) < pts[iLo].distanceToSquared(centroid);
+  const depth = (i) => (hiIsDeep ? proj[i] : -proj[i]);
 
   let deep = null, superficial = null; // among labeled contacts only
-  for (const c of contacts) {
-    const region = structureAtPoint(_pt.set(c.x_mm, c.y_mm, c.z_mm), structuresData, meshes);
+  for (let i = 0; i < contacts.length; i++) {
+    const region = structureAtPoint(pts[i], structuresData, meshes);
     if (!region) continue; // unlabelled contact — skip
-    const dd = d2(c);
-    if (!deep || dd < deep.dd) deep = { label: region.label, dd };        // nearest centre = deepest
-    if (!superficial || dd > superficial.dd) superficial = { label: region.label, dd }; // farthest = most superficial
+    const dep = depth(i);
+    if (!deep || dep > deep.dep) deep = { label: region.label, dep };            // deepest along trajectory = tip
+    if (!superficial || dep < superficial.dep) superficial = { label: region.label, dep }; // shallowest = insertion
   }
   if (!deep) return null; // no contact resolved to a label
 
