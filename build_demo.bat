@@ -4,6 +4,20 @@ echo ============================================================
 echo  NeuroReconstruct — Demo Build
 echo ============================================================
 
+:: 0. Activate the conda environment and verify the toolchain is reachable.
+:: 'conda activate' only works in a shell where conda has been initialized, so
+:: check for pyinstaller rather than trusting the activate call to have worked.
+call conda activate neuro-recon >nul 2>&1
+where pyinstaller >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: pyinstaller not found on PATH.
+    echo   The 'neuro-recon' conda environment is not active.
+    echo   Run this from an Anaconda Prompt, or run 'conda init cmd.exe' once
+    echo   and open a new terminal, then re-run this script.
+    pause
+    exit /b 1
+)
+
 :: 1. Build React frontend
 echo.
 echo [1/3] Building React frontend...
