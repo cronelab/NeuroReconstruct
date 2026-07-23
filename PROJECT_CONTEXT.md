@@ -205,11 +205,13 @@ POST   /api/reconstructions/{id}/snap-to-blob       snap world pos to CT blob
 
 *(Update this section each session)*
 
-**Last worked on (2026-07-21):** Got the app running end-to-end and shipped several fixes/features across two PR branches off `main`:
+**Last worked on (2026-07-22):** Built the **MNI152 export pipeline (step 1)** on branch `mni-registration` — **PR #4** (targets `main` directly, open, not merged). See the "MNI152 Export Pipeline" design section above. Verified end-to-end on real data (`PY26N009_dev3`, 93 contacts): MRI warps into MNI152 (SyNRA), 100% of contacts inside the MNI bounding box, correct hemispheres and medial→lateral sEEG geometry (RAS/LPS + point-transform direction confirmed). Artifacts land in `recon_dir/export/`. (Note: `gh` CLI is installed but not authenticated on this box — the PR was created via the GitHub API using git's stored credential.)
+
+**Earlier (2026-07-21):** Got the app running end-to-end and shipped fixes/features across two PR branches off `main`:
 - `fix-bcrypt-and-mri-modality` (**PR #1**): bcrypt startup-crash fix, MRI T1/T2 modality selector, file-input layout fix, open3d dependency (fixes mesh-decimation crash on real data), hierarchical brain-structure checkbox tree.
 - `registration-qa` (**PR #2**, stacked on PR #1): fusion slice viewer + manual registration confirmation. See design section above.
 
-Neither PR is merged to `main` yet. Verified end-to-end against real patient data (`PY26N009_dev1`): mesh extraction, CT registration (valid rigid transform, MI −0.58), ~84 patient-specific structures, and the fusion overlay (CT skull concentric around MRI brain).
+None of PR #1, #2, or #4 is merged to `main` yet. Prior verification (`PY26N009_dev1`): mesh extraction, CT registration (valid rigid transform, MI −0.58), ~84 patient-specific structures, and the fusion overlay (CT skull concentric around MRI brain).
 
 **Working:**
 - 3D brain + CT + electrode + **patient-specific structure** visualization
@@ -225,15 +227,16 @@ Neither PR is merged to `main` yet. Verified end-to-end against real patient dat
 
 ## Next Steps
 
-1. **Merge PR #1 then PR #2** (retarget PR #2 to `main` after PR #1 merges)
+1. **Merge PR #1 then PR #2** (retarget PR #2 to `main` after PR #1 merges); **PR #4** (MNI export) targets `main` directly and can merge independently
 2. **Registration-QA follow-ups** — persist the SimpleITK MI metric (currently logged then discarded), square spyglass lens in the fusion view, at-a-glance registration badge on ReconCard
-3. **CSV/Excel export of electrode coordinates** — shaft name, contact number, x/y/z mm. High clinical value for sharing with analysis tools
-4. **Contact-to-structure labeling** — now feasible since structures are patient-specific; report which DKT/subcortical region each contact falls in
-5. **Fill the 6 missing DKT structures** — accumbens, frontal pole, temporal pole (bilateral) report "no voxels"; verify label indices vs. the antspynet DKT scheme
-6. **Test with more multi-patient data** — multiple shafts, verify autofill and slice projections across cases
-7. **Share link review mode** — read-only viewer for completed reconstructions without login (token generated, endpoint exists, UI not fully wired)
-8. **FreeSurfer surface import** — upload lh.pial/rh.pial as brain surface instead of marching cubes
-9. **AWS deployment** — behind JHU VPN IP allowlist, HTTPS, proper secret management; migrate SQLite → Postgres for multi-user
+3. **MNI export — next steps (step 1 shipped in PR #4)** — atlas region labeling of MNI coords (which standard-atlas region each contact falls in), group-template building, report generation; all consume `recon_dir/export/` transforms + `electrodes_mni.csv`
+4. **CSV/Excel export of electrode coordinates** — shaft name, contact number, x/y/z mm. High clinical value for sharing with analysis tools (native-space complement to the MNI CSV)
+5. **Contact-to-structure labeling** — now feasible since structures are patient-specific; report which DKT/subcortical region each contact falls in
+6. **Fill the 6 missing DKT structures** — accumbens, frontal pole, temporal pole (bilateral) report "no voxels"; verify label indices vs. the antspynet DKT scheme
+7. **Test with more multi-patient data** — multiple shafts, verify autofill and slice projections across cases
+8. **Share link review mode** — read-only viewer for completed reconstructions without login (token generated, endpoint exists, UI not fully wired)
+9. **FreeSurfer surface import** — upload lh.pial/rh.pial as brain surface instead of marching cubes
+10. **AWS deployment** — behind JHU VPN IP allowlist, HTTPS, proper secret management; migrate SQLite → Postgres for multi-user
 
 ---
 
