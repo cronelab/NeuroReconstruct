@@ -124,8 +124,12 @@ Double-click `NeuroReconstruct.exe`. The app opens automatically in your browser
 `brain_viewer.db` and `data/` must stay next to the .exe — the app writes alongside the
 executable, not into its temporary extraction directory.
 
-To run on a different port (for example alongside a dev server already using 8000), set
-`NEURO_PORT`:
+If port 8000 is already in use — a dev server, another copy of the demo — the app probes
+upward and starts on the first free port (8001, 8002, …), printing the port it chose and
+opening the browser there. No configuration needed.
+
+To pin a specific port instead, set `NEURO_PORT`. This is honoured verbatim: if that port
+is taken the app reports the conflict rather than moving to another one.
 
 ```bash
 set NEURO_PORT=8010
@@ -159,7 +163,7 @@ NeuroReconstruct.exe
 | `main.py` | FastAPI app. All endpoints: auth, reconstruction CRUD, mesh serving, MRI slice rendering (with in-memory cache), electrode management, CT mesh generation, snap-to-blob, brain structures. |
 | `database.py` | SQLAlchemy async models: `User`, `Reconstruction`, `ElectrodeShaft`, `ElectrodeContact`. SQLite via aiosqlite. |
 | `auth.py` | JWT creation/verification, bcrypt password hashing, `get_current_user` FastAPI dependency. |
-| `launcher.py` | PyInstaller entry point. Sets `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1` before any imports to ensure deterministic registration, and `NEURO_DATA_DIR` before importing `database.py` so the DB lands next to the .exe. Serves on `NEURO_PORT` (default 8000). |
+| `launcher.py` | PyInstaller entry point. Sets `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1` before any imports to ensure deterministic registration, and `NEURO_DATA_DIR` before importing `database.py` so the DB lands next to the .exe. Serves on `NEURO_PORT` if set, otherwise the first free port from 8000 upward. |
 | `neuro_recon.spec` | PyInstaller spec for the standalone exe. Resolves bundled DLLs from `sys.prefix`, and excludes antspynet/TensorFlow (see Known Limitations). |
 
 #### Services (`backend/services/`)
