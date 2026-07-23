@@ -36,6 +36,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
 import json
 import shutil
+import time
 from datetime import datetime
 
 import numpy as np
@@ -213,11 +214,20 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
     os.makedirs(out_dir, exist_ok=True)
     center = np.asarray(mesh_center, dtype=np.float64).reshape(3)
 
+    # Phase timings land in the manifest so slow runs / regressions are visible
+    # without re-instrumenting. SyN registration dominates; everything else is seconds.
+    t_start = time.perf_counter()
+    durations = {}
+
     # Step 1: MRI -> MNI
+    _t = time.perf_counter()
     reg = register_mri_to_mni(mri_path, out_dir)
+    durations["mri_to_mni"] = round(time.perf_counter() - _t, 1)
+    print(f"[MNI] MRI->MNI took {durations['mri_to_mni']:.1f}s")
 
     # Step 2: CT -> MNI (optional)
     ct_written = False
+    _t = time.perf_counter()
     if ct_path and os.path.exists(ct_path) and ct_to_mri_npy and os.path.exists(ct_to_mri_npy):
         try:
             ct_to_mri_ras = np.load(ct_to_mri_npy)
@@ -237,8 +247,10 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
             print("[MNI] CT warped into MNI space.")
         except Exception as e:
             print(f"[MNI] WARNING: CT->MNI failed ({e}); continuing without CT_mni")
+    durations["ct_to_mni"] = round(time.perf_counter() - _t, 1) if ct_written else None
 
     # Step 3: electrodes -> MNI
+    _t = time.perf_counter()
     placed = [c for c in contacts if c.get("x_mm") is not None]
     world = np.array([[c["x_mm"] + center[0],
                        c["y_mm"] + center[1],
@@ -280,8 +292,11 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
               f"{inb*100:.0f}% inside MNI bounding box, "
               f"{n_left} left-hemisphere (x<0), {len(mni_pts)-n_left} right (x>=0).")
         if inb < 0.9:
-            print("[MNI] WARNING: many contacts fell outside the MNI bounding box — "
+            print("[MNI] WARNING: many contacts fell outside the MNI bounding box - "
                   "check RAS/LPS flip and point-transform direction.")
+
+    durations["electrodes"] = round(time.perf_counter() - _t, 1)
+    durations["total"] = round(time.perf_counter() - t_start, 1)
 
     try:
         ants_version = ants.__version__
@@ -295,6 +310,7 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
         "created_at": datetime.utcnow().isoformat() + "Z",
         "n_contacts": len(rows),
         "has_ct_mni": ct_written,
+        "durations_sec": durations,
         "artifacts": sorted(
             fn for fn in os.listdir(out_dir) if not fn.startswith("_")
         ),
@@ -302,5 +318,8 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
     with open(os.path.join(out_dir, "export_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
-    print(f"[MNI] Export complete → {out_dir}")
+    # NOTE: keep log output ASCII-only. Under uvicorn on Windows stdout is cp1252,
+    # and a non-ASCII character here raises UnicodeEncodeError *after* all artifacts
+    # are written -- failing the whole export on a cosmetic log line.
+    print(f"[MNI] Export complete in {durations['total']:.1f}s -> {out_dir}")
     return manifest
