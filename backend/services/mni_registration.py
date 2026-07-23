@@ -13,6 +13,9 @@ Pipeline
    ``ct_to_mri.npy`` transform, then warped into MNI with the same MRI->MNI transforms.
 3. Electrode contacts (already stored in MRI-space world RAS) are pushed through
    the MRI->MNI transform as points and written as an MNI coordinate table.
+4. Each contact is labeled with the patient-specific brain structure it sits in
+   (or the nearest one, with a distance) -> ``electrodes_structures.csv``. This
+   step is native-space and uses the cached DKT segmentation, not MNI.
 
 Coordinate conventions
 -----------------------
@@ -296,6 +299,40 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
                   "check RAS/LPS flip and point-transform direction.")
 
     durations["electrodes"] = round(time.perf_counter() - _t, 1)
+
+    # Step 4: contact -> brain-structure labels (native space, patient-specific).
+    # Uses the DKT label volume cached by structure_extractor; if structures have
+    # never been computed for this reconstruction we generate them here (slow,
+    # ~2-3 min, but cached afterwards and reused by the viewer).
+    _t = time.perf_counter()
+    structure_summary = None
+    try:
+        from services.contact_labeling import (
+            get_label_volume_path, label_contacts, write_contact_structure_csv,
+        )
+        label_path = get_label_volume_path(recon_dir)
+        if not os.path.exists(label_path):
+            print("[MNI] Structure labels not cached - running segmentation "
+                  "(first time only, this takes a few minutes)...")
+            from services.structure_extractor import extract_all_structures
+            extract_all_structures(os.path.join(recon_dir, "mesh.json"), recon_dir, mri_path)
+
+        if os.path.exists(label_path) and len(world):
+            labels = label_contacts(label_path, world)
+            structure_summary = write_contact_structure_csv(
+                os.path.join(out_dir, "electrodes_structures.csv"), placed, labels
+            )
+            print(f"[MNI] Contact structures: {structure_summary['inside_structure']} inside a "
+                  f"structure, {structure_summary['near_structure']} near one, "
+                  f"{structure_summary['unassigned']} unassigned "
+                  f"(of {len(labels)} contacts).")
+        elif not os.path.exists(label_path):
+            print("[MNI] WARNING: no structure label volume - skipping electrodes_structures.csv")
+    except Exception as e:
+        print(f"[MNI] WARNING: contact structure labeling failed ({e}); "
+              "continuing without electrodes_structures.csv")
+    durations["structures"] = round(time.perf_counter() - _t, 1)
+
     durations["total"] = round(time.perf_counter() - t_start, 1)
 
     try:
@@ -310,6 +347,8 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
         "created_at": datetime.utcnow().isoformat() + "Z",
         "n_contacts": len(rows),
         "has_ct_mni": ct_written,
+        "has_structure_labels": structure_summary is not None,
+        "contact_structures": structure_summary,
         "durations_sec": durations,
         "artifacts": sorted(
             fn for fn in os.listdir(out_dir) if not fn.startswith("_")
