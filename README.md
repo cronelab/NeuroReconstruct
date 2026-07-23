@@ -46,13 +46,28 @@ This creates an `admin` user with password `changeme`. Change the password after
 
 ### 4. Build the standalone exe (Windows only)
 
+Run `build_demo.bat` from the project root. It builds the React frontend, bundles the
+backend with PyInstaller, and assembles a ready-to-ship `dist_demo/` folder:
+
+```bash
+build_demo.bat
+```
+
+The script must run with the `neuro-recon` conda environment available — it activates the
+env and then verifies `pyinstaller` is on PATH, exiting immediately with instructions if
+not. If `conda` has never been initialized for your shell, run it from an Anaconda Prompt
+or run `conda init cmd.exe` once.
+
+To build only the executable, without assembling the demo folder:
+
 ```bash
 cd backend
 conda activate neuro-recon
 pyinstaller neuro_recon.spec --noconfirm
 ```
 
-Output: `backend/dist/NeuroReconstruct.exe`. Copy this file plus `brain_viewer.db` and `data/` into a `dist_demo/` folder for distribution.
+Output: `backend/dist/NeuroReconstruct.exe` (~218 MB). The spec resolves its bundled DLLs
+from `sys.prefix`, so it picks up whichever conda env is active.
 
 ### 5. Database migrations (existing installs only)
 
@@ -98,12 +113,24 @@ A pre-built Windows executable is available as `dist_demo/`:
 
 ```
 dist_demo/
-├── NeuroReconstruct.exe   # Self-contained server + frontend
+├── NeuroReconstruct.exe   # Self-contained server + frontend (~218 MB)
 ├── brain_viewer.db        # Pre-populated database
 └── data/                  # Reconstruction folders
 ```
 
-Double-click `NeuroReconstruct.exe`. The app opens automatically in your browser. No Python or Node.js installation required.
+Double-click `NeuroReconstruct.exe`. The app opens automatically in your browser at
+`http://127.0.0.1:8000`. No Python or Node.js installation required.
+
+`brain_viewer.db` and `data/` must stay next to the .exe — the app writes alongside the
+executable, not into its temporary extraction directory.
+
+To run on a different port (for example alongside a dev server already using 8000), set
+`NEURO_PORT`:
+
+```bash
+set NEURO_PORT=8010
+NeuroReconstruct.exe
+```
 
 > Requires Visual C++ Redistributable (pre-installed on most Windows machines).
 
@@ -132,8 +159,8 @@ Double-click `NeuroReconstruct.exe`. The app opens automatically in your browser
 | `main.py` | FastAPI app. All endpoints: auth, reconstruction CRUD, mesh serving, MRI slice rendering (with in-memory cache), electrode management, CT mesh generation, snap-to-blob, brain structures. |
 | `database.py` | SQLAlchemy async models: `User`, `Reconstruction`, `ElectrodeShaft`, `ElectrodeContact`. SQLite via aiosqlite. |
 | `auth.py` | JWT creation/verification, bcrypt password hashing, `get_current_user` FastAPI dependency. |
-| `launcher.py` | PyInstaller entry point. Sets `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1` before any imports to ensure deterministic registration. |
-| `neuro_recon.spec` | PyInstaller spec for the standalone exe. Bundles targeted DLLs and data files. |
+| `launcher.py` | PyInstaller entry point. Sets `ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS=1` before any imports to ensure deterministic registration, and `NEURO_DATA_DIR` before importing `database.py` so the DB lands next to the .exe. Serves on `NEURO_PORT` (default 8000). |
+| `neuro_recon.spec` | PyInstaller spec for the standalone exe. Resolves bundled DLLs from `sys.prefix`, and excludes antspynet/TensorFlow (see Known Limitations). |
 
 #### Services (`backend/services/`)
 
@@ -286,7 +313,7 @@ Register users via the API: `POST /api/auth/register`
 
 - `numpy < 2.0` required in the conda environment
 - Structure segmentation runs on **CPU only** (GPU was benchmarked and gave no speedup — the pipeline is bottlenecked by CPU-bound ANTs preprocessing + mesh extraction, not GPU-able inference). First computation for a case takes a couple of minutes; results are cached to disk afterward. The per-structure mesh extraction is parallelized across CPU cores.
-- antspynet / tensorflow cannot be bundled in the PyInstaller exe — structures are borrowed from cached reconstructions in demo mode
+- antspynet / tensorflow are deliberately **excluded** from the PyInstaller exe — they accounted for roughly 310 MB of a 529 MB bundle and the frozen build never reaches them. The exe therefore cannot compute new skull strips or structure segmentations: it borrows a donor mesh and cached structures from the reconstructions shipped alongside it. Every antspynet import in `services/` is function-local and guarded, so the missing module degrades to these fallbacks rather than raising. CT-to-MRI coregistration is SimpleITK-only and runs fresh in the exe as normal.
 - Registration in the exe may differ slightly from dev due to bundled DLL numerical differences (known PyInstaller limitation)
 - SQLite is sufficient for single-lab use; migrate to Postgres before multi-site deployment
 
