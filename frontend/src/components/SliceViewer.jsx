@@ -26,7 +26,7 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
   const invAffineRef = useRef(null);   // flat 16-element array (row-major)
   const volShapeRef  = useRef(null);   // [nx, ny, nz]
 
-  // cache: Map<sliceIdx, { bitmap, worldCoord, voxelSize }>
+  // cache: Map<sliceIdx, { bitmap, planeNormal, planeOffset, voxelSize, sliceIdx }>
   const cacheRef = useRef(new Map());
   const inFlightRef = useRef(new Set());
   const queueRef = useRef([]); // pending prefetch indices
@@ -36,7 +36,7 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
   const sliceIdxRef = useRef(0);
   const sliceCountRef = useRef(1);
   const scrollDirRef = useRef(1);
-  const currentEntryRef = useRef(null); // { bitmap, worldCoord, voxelSize }
+  const currentEntryRef = useRef(null); // { bitmap, planeNormal, planeOffset, voxelSize, sliceIdx }
 
   const [renderTick, setRenderTick] = useState(0);
   const [sliceLabel, setSliceLabel] = useState({ idx: 0, count: 1 });
@@ -97,7 +97,8 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
     ctx.fillRect(0, 0, W, H);
     if (!entry?.bitmap) return;
 
-    const { bitmap, worldCoord } = entry;
+    const { bitmap, planeNormal, planeOffset } = entry;
+    const sliceSpacingMm = entry.voxelSize || 1;
     // Aspect-correct for anisotropic voxels: scale by physical mm extent, not pixel count
     const pxW = entry.pxWidthMm || 1;
     const pxH = entry.pxHeightMm || 1;
@@ -132,6 +133,14 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
       const meshCenter = meshData?.center || [0, 0, 0];
       const iA = invAffineRef.current;    // flat 16-element row-major inverse affine
       const vShape = volShapeRef.current; // [nx, ny, nz]
+      const drawnIdx = entry.sliceIdx != null ? entry.sliceIdx : sliceIdxRef.current;
+
+      // Voxel index (0..n-1) → normalised position within the drawn rect, for a
+      // display axis the backend flipped. drawImage spreads the image's n pixel
+      // *columns* evenly over the rect, so pixel j is centred at (j+0.5)/n — not
+      // at j/(n-1), which would put the outermost voxel centres on the rect's edge
+      // and stretch the overlay by n/(n-1) about the centre.
+      const flipNorm = (v, n) => (n - 0.5 - v) / n;
 
       shafts.forEach(shaft => {
         (shaft.contacts || []).forEach(c => {
@@ -142,23 +151,25 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
           const wy = c.y_mm + meshCenter[1];
           const wz = c.z_mm + meshCenter[2];
 
-          // Filter: only contacts within CONTACT_THICKNESS_MM of the current slice plane
-          if (worldCoord != null) {
-            let sliceWorld;
-            if (axis === 'sagittal') sliceWorld = wx;
-            if (axis === 'coronal')  sliceWorld = wy;
-            if (axis === 'axial')    sliceWorld = wz;
-            if (Math.abs(sliceWorld - worldCoord) > CONTACT_THICKNESS_MM) return;
-          }
-
-          // Project world → canvas using actual MRI affine
-          let canX, canY;
+          let canX, canY, dist;
           if (iA && vShape) {
             // Voxel coordinates via inverse affine  (row-major 4×4)
             const vx = iA[0]*wx + iA[1]*wy + iA[2]*wz + iA[3];
             const vy = iA[4]*wx + iA[5]*wy + iA[6]*wz + iA[7];
             const vz = iA[8]*wx + iA[9]*wy + iA[10]*wz + iA[11];
             const [nx, ny, nz] = vShape;
+
+            // Filter: only contacts near the current slice plane. Do this in voxel
+            // space — never by comparing the contact's world x/y/z against
+            // X-Slice-World-Coord, which is just the plane's centre and drifts across
+            // the plane on an oblique volume (measured: up to 26 slices out on this
+            // dataset's axial view). The voxel-index difference is exact for any
+            // affine, and is the same quantity the X-Slice-Plane-* headers express;
+            // we use the voxel form here because vx/vy/vz are needed anyway.
+            const vAxis = axis === 'sagittal' ? vx : axis === 'coronal' ? vy : vz;
+            dist = Math.abs(vAxis - drawnIdx) * sliceSpacingMm;
+            if (dist > CONTACT_THICKNESS_MM) return;
+
             // Map to normalised display coords using the same rot90+fliplr the backend applies:
             //   axial:    display[row=vy, col=vx]  img size (ny, nx)
             //   sagittal: display[row=vz, col=vy]  img size (nz, ny)
@@ -168,20 +179,23 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
             //   sagittal: display[row=nz-1-vz, col=ny-1-vy]
             //   coronal:  display[row=nz-1-vz, col=nx-1-vx]
             let normX, normY;
-            if (axis === 'axial')    { normX = 1 - vx/(nx-1); normY = 1 - vy/(ny-1); }
-            if (axis === 'sagittal') { normX = 1 - vy/(ny-1); normY = 1 - vz/(nz-1); }
-            if (axis === 'coronal')  { normX = 1 - vx/(nx-1); normY = 1 - vz/(nz-1); }
+            if (axis === 'axial')    { normX = flipNorm(vx, nx); normY = flipNorm(vy, ny); }
+            if (axis === 'sagittal') { normX = flipNorm(vy, ny); normY = flipNorm(vz, nz); }
+            if (axis === 'coronal')  { normX = flipNorm(vx, nx); normY = flipNorm(vz, nz); }
             canX = dx + normX * dw;
             canY = dy + normY * dh;
           } else {
-            // Fallback if affine not yet received
+            // No inverse affine yet, so the in-plane position is unknown — park the
+            // marker at the centre. The plane test is still exact: the plane headers
+            // give the perpendicular mm distance directly, no affine needed.
+            dist = planeNormal
+              ? Math.abs(planeNormal[0]*wx + planeNormal[1]*wy + planeNormal[2]*wz - planeOffset)
+              : 0;
+            if (dist > CONTACT_THICKNESS_MM) return;
             canX = dx + dw / 2;
             canY = dy + dh / 2;
           }
 
-          const dist = worldCoord != null
-            ? Math.abs((axis === 'sagittal' ? wx : axis === 'coronal' ? wy : wz) - worldCoord)
-            : 0;
           const alpha = Math.max(0.3, 1 - dist / CONTACT_THICKNESS_MM);
           const radius = dist < 1.5 ? 5 : 3.5;
 
@@ -264,8 +278,12 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
       }
       const count = parseInt(res.headers.get('X-Slice-Count') || '1');
       const actual = parseInt(res.headers.get('X-Slice-Index') || '0');
-      const worldCoord = parseFloat(res.headers.get('X-Slice-World-Coord') || 'NaN');
       const voxelSize = parseFloat(res.headers.get('X-Voxel-Size-Mm') || '1');
+      // Exact slice plane: |planeNormal · P - planeOffset| = mm from world point P
+      // to this slice. Unlike X-Slice-World-Coord this holds for oblique volumes.
+      const pn = res.headers.get('X-Slice-Plane-Normal');
+      const planeNormal = pn ? JSON.parse(pn) : null;
+      const planeOffset = parseFloat(res.headers.get('X-Slice-Plane-Offset') || 'NaN');
       const pxWidthMm = parseFloat(res.headers.get('X-Display-Px-Width-Mm') || '1');
       const pxHeightMm = parseFloat(res.headers.get('X-Display-Px-Height-Mm') || '1');
       sliceCountRef.current = count;
@@ -279,7 +297,7 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
 
       const blob = await res.blob();
       const bitmap = await createImageBitmap(blob);
-      const entry = { bitmap, worldCoord, voxelSize, pxWidthMm, pxHeightMm };
+      const entry = { bitmap, planeNormal, planeOffset, voxelSize, pxWidthMm, pxHeightMm, sliceIdx: actual };
       if (actual >= 0) cacheRef.current.set(actual, entry);
       onDone?.(entry, actual);
       const waiters = pendingCbRef.current.get(idx);
