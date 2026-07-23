@@ -19,8 +19,53 @@ from skimage import measure
 from skimage.filters import gaussian
 import json
 import os
+import glob
 import hashlib
 
+
+# ── Threshold-mesh cache eviction ─────────────────────────────────────────────
+# Every distinct HU window the user tries writes its own ct_threshold_*.json, and
+# a single mesh can be 100+ MB. Dragging the slider therefore accumulates GBs of
+# stale caches that are never revisited. Bound the directory with a simple LRU:
+# keep the most-recently-used files within a size and count budget, drop the rest.
+# Both budgets are overridable via env for large multi-patient deployments.
+_CT_CACHE_MAX_FILES = int(os.environ.get("NEURO_CT_CACHE_MAX_FILES", "16"))
+_CT_CACHE_MAX_MB = float(os.environ.get("NEURO_CT_CACHE_MAX_MB", "512"))
+
+
+def _prune_threshold_cache(cache_dir: str, keep_path: str = None) -> None:
+    """Evict oldest ct_threshold_*.json files until the directory is within the
+    file-count and total-size budgets. Uses mtime as the LRU clock (cache hits
+    bump mtime), and never removes ``keep_path`` (the entry just written/read)."""
+    try:
+        entries = []
+        for p in glob.glob(os.path.join(cache_dir, "ct_threshold_*.json")):
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            entries.append((p, st.st_mtime, st.st_size))
+        # Oldest first — these are evicted first.
+        entries.sort(key=lambda e: e[1])
+
+        max_bytes = int(_CT_CACHE_MAX_MB * 1024 * 1024)
+        total = sum(size for _, _, size in entries)
+        count = len(entries)
+
+        for path, _, size in entries:
+            if count <= _CT_CACHE_MAX_FILES and total <= max_bytes:
+                break
+            if path == keep_path:
+                continue  # never evict the entry we just produced
+            try:
+                os.remove(path)
+                total -= size
+                count -= 1
+            except OSError:
+                pass  # already gone / locked by a concurrent request — ignore
+    except Exception:
+        # Cache maintenance must never break the request that triggered it.
+        pass
 
 
 def _resolve_ct_path(ct_path: str) -> str:
@@ -74,7 +119,14 @@ def build_threshold_mesh(
         cache_path = os.path.join(cache_dir, f"ct_threshold_{cache_key}.json")
         if os.path.exists(cache_path):
             with open(cache_path) as f:
-                return json.load(f)
+                result = json.load(f)
+            # Mark as most-recently-used so the LRU keeps thresholds the user
+            # keeps returning to, not just the ones most recently created.
+            try:
+                os.utime(cache_path, None)
+            except OSError:
+                pass
+            return result
 
     ct_path = _resolve_ct_path(ct_path)
     img = nib.load(ct_path)
@@ -148,6 +200,8 @@ def build_threshold_mesh(
         os.makedirs(cache_dir, exist_ok=True)
         with open(cache_path, "w") as f:
             json.dump(result, f)
+        # Keep the cache bounded — evict the least-recently-used older meshes.
+        _prune_threshold_cache(cache_dir, keep_path=cache_path)
 
     return result
 

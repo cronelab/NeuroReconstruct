@@ -136,6 +136,12 @@ set NEURO_PORT=8010
 NeuroReconstruct.exe
 ```
 
+Each CT HU threshold the user tries is cached under `<recon>/ct_cache/` as a
+`ct_threshold_*.json` mesh. That cache is bounded by a least-recently-used policy
+so it can't grow without limit — by default the 16 most-recently-used meshes are
+kept, capped at 512 MB total. Override with `NEURO_CT_CACHE_MAX_FILES` and
+`NEURO_CT_CACHE_MAX_MB` for large multi-patient deployments.
+
 > Requires Visual C++ Redistributable (pre-installed on most Windows machines).
 
 ---
