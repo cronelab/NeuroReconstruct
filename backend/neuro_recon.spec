@@ -1,5 +1,6 @@
 # neuro_recon.spec  -- place in /backend, run with: pyinstaller neuro_recon.spec
 import os
+import sys
 import glob
 from PyInstaller.utils.hooks import collect_data_files
 
@@ -15,7 +16,9 @@ antspynet_datas  = collect_data_files("antspynet")
 
 frontend_build = os.path.join("..", "frontend", "build")
 
-CONDA_BIN = r"C:\Users\DanCandrea\Anaconda3\envs\neuro-recon\Library\bin"
+# Resolve the active conda env from the interpreter running PyInstaller, so the
+# build works on any machine. Requires running under the neuro-recon env.
+CONDA_BIN = os.path.join(sys.prefix, "Library", "bin")
 
 # Bundle only the native DLLs that PyInstaller misses on a clean machine.
 # Do NOT include .pyd files here — PyInstaller collects those automatically.
@@ -33,11 +36,26 @@ extra_dlls = [
     "ucrtbase.dll",
 ]
 
+if not os.path.isdir(CONDA_BIN):
+    raise SystemExit(
+        f"Cannot find the conda Library\\bin directory at:\n  {CONDA_BIN}\n"
+        "Activate the neuro-recon env before running PyInstaller "
+        "(conda activate neuro-recon)."
+    )
+
 binaries = []
+missing = []
 for dll in extra_dlls:
     full = os.path.join(CONDA_BIN, dll)
     if os.path.exists(full):
         binaries.append((full, "."))
+    else:
+        missing.append(dll)
+
+# Not fatal — DLL names vary between conda builds, and some resolve from the
+# system instead. Surface them so a clean-machine failure is traceable.
+if missing:
+    print(f"[spec] WARNING: not bundled from {CONDA_BIN}: {', '.join(missing)}")
 
 a = Analysis(
     ["launcher.py"],
