@@ -51,7 +51,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
   // CT threshold mesh state
   const [ctMeshData, setCtMeshData] = useState(null);
   const [ctMeshLoading, setCtMeshLoading] = useState(false);
-  const [currentThreshold, setCurrentThreshold] = useState(1500);  // HU floor
+  const [currentThreshold, setCurrentThreshold] = useState(2000);  // HU floor
   const [currentCeiling, setCurrentCeiling] = useState(null);       // HU ceiling (null = open top; set from data_max)
   const [undoStack, setUndoStack] = useState([]); // [{shaftId, contactNumber}]
   const [showMri, setShowMri] = useState(false);
@@ -183,7 +183,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
   // Auto-load CT mesh as soon as editor mode is active and CT is available.
   // Depends on reconstruction so it fires once reconstruction has loaded,
   // and again if the user toggles editor mode.
-  const DEFAULT_THRESHOLD = 1500;
+  const DEFAULT_THRESHOLD = 2000;
 
   // Load CT when editor mode activated OR when a locked recon with CT first loads
   useEffect(() => {
@@ -398,7 +398,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
             {reconstruction?.has_ct && (
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <input type="checkbox" checked={showCt} onChange={e => { const checked = e.target.checked; setShowCt(checked); if (checked && !ctMeshData) loadCtMesh(currentThreshold || 1500); }} style={{ accentColor: '#ffab40', width: 13, height: 13 }} />
+                  <input type="checkbox" checked={showCt} onChange={e => { const checked = e.target.checked; setShowCt(checked); if (checked && !ctMeshData) loadCtMesh(currentThreshold || 2000); }} style={{ accentColor: '#ffab40', width: 13, height: 13 }} />
                   <span style={{ fontSize: 12, color: showCt ? '#e8edf2' : '#7a8a99', fontFamily: 'IBM Plex Sans, sans-serif' }}>CT Electrodes</span>
                 </div>
                 {showCt && (
