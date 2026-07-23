@@ -13,13 +13,13 @@ async def migrate():
         for col, default in [('is_complete', '0'), ('is_locked', '0')]:
             try:
                 await conn.execute(text(f"ALTER TABLE reconstructions ADD COLUMN {col} BOOLEAN DEFAULT {default}"))
-                print(f"✓ Added column: {col}")
+                print(f"[OK] Added column: {col}")
             except Exception as e:
                 print(f"  Column '{col}' already exists (skipping): {e}")
         # Set existing nulls to 0
         await conn.execute(text("UPDATE reconstructions SET is_complete = 0 WHERE is_complete IS NULL"))
         await conn.execute(text("UPDATE reconstructions SET is_locked = 0 WHERE is_locked IS NULL"))
-        print("✓ Backfilled nulls to 0")
+        print("[OK] Backfilled nulls to 0")
     print("Migration complete.")
 
 asyncio.run(migrate())

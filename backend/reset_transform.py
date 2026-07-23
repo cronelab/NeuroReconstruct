@@ -13,11 +13,11 @@ if not recon_dir:
 
 path = os.path.join(recon_dir, "ct_to_mri.npy")
 np.save(path, np.eye(4))
-print(f"✓ Saved identity transform to {path}")
+print(f"[OK] Saved identity transform to {path}")
 
 # Also clear the CT mesh cache so it re-renders with identity
 cache_dir = os.path.join(recon_dir, "ct_cache")
 if os.path.isdir(cache_dir):
     import shutil
     shutil.rmtree(cache_dir)
-    print(f"✓ Cleared CT mesh cache at {cache_dir}")
+    print(f"[OK] Cleared CT mesh cache at {cache_dir}")

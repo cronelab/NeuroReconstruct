@@ -68,7 +68,7 @@ def get_bounds(img):
 
 mri_lo, mri_hi = get_bounds(mri)
 ct_lo,  ct_hi  = get_bounds(ct)
-print(f"  MRI bounds (LPS): {mri_lo.round(1)} → {mri_hi.round(1)}")
-print(f"  CT  bounds (LPS): {ct_lo.round(1)}  → {ct_hi.round(1)}")
+print(f"  MRI bounds (LPS): {mri_lo.round(1)} -> {mri_hi.round(1)}")
+print(f"  CT  bounds (LPS): {ct_lo.round(1)}  -> {ct_hi.round(1)}")
 overlap = np.all(mri_hi > ct_lo) and np.all(ct_hi > mri_lo)
 print(f"  Bounding boxes overlap: {overlap}")

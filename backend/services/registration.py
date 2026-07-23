@@ -131,14 +131,14 @@ def preprocess_ct(ct_path: str, out_path: str) -> str:
     img = nib.load(ct_path)
     data = img.get_fdata()
 
-    print(f"[CT PREP] CT shape={data.shape}, range={data.min():.0f}–{data.max():.0f} HU")
+    print(f"[CT PREP] CT shape={data.shape}, range={data.min():.0f}-{data.max():.0f} HU")
 
     # Everything above -200 HU is anatomy (soft tissue, bone, metal)
     body_mask = data > -200
 
     labeled, n = nd_label(body_mask)
     if n == 0:
-        print("[CT PREP] WARNING: no voxels above -200 HU — saving original CT unchanged")
+        print("[CT PREP] WARNING: no voxels above -200 HU - saving original CT unchanged")
         img.to_filename(out_path)
         return out_path
 
@@ -170,7 +170,7 @@ def preprocess_ct(ct_path: str, out_path: str) -> str:
     # Fill internal holes so sinuses/ears/skull interior don't get masked
     patient_mask = binary_fill_holes(patient_mask)
 
-    print(f"[CT PREP] Found {n} components — keeping largest "
+    print(f"[CT PREP] Found {n} components - keeping largest "
           f"({patient_mask.sum()} voxels, {100*patient_mask.mean():.1f}% of volume)")
 
     # Set everything outside the patient to -1000 HU (air)

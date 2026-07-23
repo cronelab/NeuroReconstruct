@@ -67,7 +67,9 @@ If broken: `pip install "numpy<2.0"`
 | `services/ct_electrode_extractor.py` | CT mesh generation (HU threshold + marching cubes) and `snap_to_blob_centroid()` — snaps a clicked world position to nearest bright CT blob centroid within 8mm. Applies the registration transform so CT aligns with the brain mesh. |
 | `services/electrode_service.py` | Autofill: cubic spline fit parameterized by contact number (not arc length). Interpolates between placed contacts, linear extrapolation beyond the manual range. Blob-snap applied to interpolated contacts only. |
 | `services/structure_extractor.py` | **ACTIVE — patient-specific, wired to UI.** antspynet `deep_atropos` (subcortical) + `desikan_killiany_tourville_labeling` (cortical DKT) run on the patient's own T1 — native space, no MNI atlas. Extracts ~84 structures across 6 groups as meshes aligned to the brain mesh. Cached as per-structure JSON + `structures_cortical.nii.gz`. (Superseded the old parked nilearn/Harvard-Oxford MNI152 approach.) |
-| `migrate_shaft_fields.py` / `migrate_lock_fields.py` / `migrate_deleted_at.py` / `migrate_registration_confirmed.py` | One-time, idempotent column-add migrations for existing DBs (shaft metadata, `is_complete`/`is_locked`, `deleted_at`, `registration_confirmed`). |
+| `services/contact_labeling.py` | **Export pipeline.** Labels each contact with the patient-specific brain structure it sits in, from the cached DKT volume `structures_cortical.nii.gz` (native space — no atlas). Depth contacts often sit in white matter (~43% direct hits on real data), so when the contact voxel is unlabeled it reports the **nearest catalog structure within 5 mm plus the distance** (`distance_mm=0` means inside) — raising useful coverage to ~97%. Ventricle/CSF/WM voxels are named via `NON_CATALOG_LABELS` and surfaced in `voxel_content`. Writes `electrodes_structures.csv`. |
+| `services/mni_registration.py` | **Export pipeline — step 1.** Registers the completed reconstruction into MNI152 standard space. ANTs affine+SyN (`type_of_transform="SyNRA"`) MRI→MNI; CT resampled into MRI (via `ct_to_mri.npy`) then warped to MNI; electrode contacts (MRI-space RAS) pushed through as points via `apply_transforms_to_points`. CPU-forced. Writes artifacts to `recon_dir/export/`: `MRI_mni.nii.gz`, `CT_mni.nii.gz`, transform files, `electrodes_mni.csv`/`.json`, `electrodes_structures.csv` (contact → brain structure, see `contact_labeling.py`), `export_manifest.json` (includes `durations_sec` per phase and `contact_structures` counts — SyN registration dominates; the post-registration phases total ~6 s). **Log output must stay ASCII** — uvicorn's stdout is cp1252 on Windows, and a non-ASCII log character raises `UnicodeEncodeError` *after* artifacts are written, failing the export on a cosmetic line. **Coordinate care:** RAS↔LPS flip for points (`_ras_to_lps`); points travel the *inverse* transform direction vs. images. MNI template from `ants.get_ants_data('mni')` (downloaded/cached on first run). |
+| `migrate_shaft_fields.py` / `migrate_lock_fields.py` / `migrate_deleted_at.py` / `migrate_registration_confirmed.py` / `migrate_export_status.py` | One-time, idempotent column-add migrations for existing DBs (shaft metadata, `is_complete`/`is_locked`, `deleted_at`, `registration_confirmed`, `export_status`/`exported_at`). |
 
 ### Frontend (`frontend/src/`)
 
@@ -86,7 +88,8 @@ If broken: `pip install "numpy<2.0"`
 | `components/CTArtifactMesh.jsx` | Renders CT threshold mesh as white semi-transparent surface. Handles click-to-place contacts (only when activeContactNumber != null). |
 | `components/SliceViewer.jsx` | MRI slice viewer. Client-side cache + prefetch (10 ahead, 4 behind, 6 concurrent requests). Scroll wheel + vertical scrollbar. Depth-filtered electrode dot projection (±4mm). Structure-label overlay. LocatorOverlay corner thumbnail. |
 | `components/FusionSliceViewer.jsx` | Registration-QA fusion view. MRI grayscale base + **red-tinted** CT (resampled into the MRI plane by `/fusion-slice`) with an MRI↔CT blend slider, per-axis switch, scroll nav. |
-| `components/ElectrodeEditor.jsx` | Right panel in edit mode. CT threshold slider, MRI toggle/opacity, **hierarchical brain-structure tree (Group → Side → Structure, tri-state checkboxes)**, shaft list (draggable divider), contact selector grid, autofill bar. Contains ColorPicker (50 named colors), ContactSelector, TriStateCheckbox sub-components. |
+| `components/ElectrodeEditor.jsx` | Right panel in edit mode. CT threshold slider, MRI toggle/opacity, `StructurePanel`, shaft list (draggable divider), contact selector grid, autofill bar. Contains ColorPicker (50 named colors) and ContactSelector sub-components. |
+| `components/StructurePanel.jsx` | **Shared** brain-structure visibility panel: "Show brain structures" master toggle, opacity slider, and the hierarchical **Group → Side → Structure tri-state tree** (also exports `TriStateCheckbox`). Rendered by **both** `ElectrodeEditor` (edit mode) and `ReconstructionViewer` (locked/read-only) so the two views offer identical options — previously the locked view had a separate flat All/None list with no master toggle or opacity slider. Reads/writes visibility via the store, so state survives lock/unlock switches. |
 | `components/LayerPanel.jsx` | **Dead code.** Safe to delete. |
 | `components/CTSlicePlanes.jsx` | **Dead code.** Safe to delete. |
 
@@ -100,7 +103,7 @@ users:              id, username, hashed_password, role (viewer/editor/admin), c
 reconstructions:    id, patient_id, label, share_token, created_by,
                     created_at, updated_at, mesh_path, mri_path, ct_path,
                     status, is_complete, is_locked,
-                    registration_confirmed, deleted_at
+                    registration_confirmed, export_status, exported_at, deleted_at
 
 electrode_shafts:   id, reconstruction_id, name, label,
                     electrode_type (depth/strip/grid), color, visible,
@@ -150,9 +153,28 @@ GPU acceleration for antspynet was explored 2026-07-22 and **rolled back**. Benc
 **Mesh-loop parallelization (implemented 2026-07-22):** the per-structure mesh extraction (marching cubes + smoothing + decimation, ~84 independent structures) now runs in a `ProcessPoolExecutor` (`min(cpu_count-1, 8)` workers). Workers load the cortical label volume once each via `_mesh_worker_init` (from `structures_cortical.nii.gz`) rather than pickling the array per task; `_mesh_worker_task` calls `_labels_to_mesh`. Only the CPU mesh phase (~47 s serial) is parallelized — the antspynet DKT call is unchanged. Still-open CPU lever (not built): reuse the brain extraction already done in `mesh_extractor.py` instead of re-running antspynet preprocessing.
 
 ### Registration QA — Fusion Viewer + Manual Confirmation
-CT→MRI registration accuracy previously had no check beyond "does `ct_to_mri.npy` exist". Added a Fusion view (`/fusion-slice` resamples the CT onto the MRI plane via true oblique 3D trilinear resampling; frontend overlays it red over the MRI with a blend slider) and a `registration_confirmed` flag an editor sets via "Looks correct" — auto-resets whenever registration re-runs. Not a hard gate; surfaces an "unreviewed" banner/badge. **Status: on branch `registration-qa` (PR #2), not yet merged to main.** Follow-ups not built: persisted MI metric, square spyglass lens, at-a-glance ReconCard badge.
+CT→MRI registration accuracy previously had no check beyond "does `ct_to_mri.npy` exist". Added a Fusion view (`/fusion-slice` resamples the CT onto the MRI plane via true oblique 3D trilinear resampling; frontend overlays it red over the MRI with a blend slider) and a `registration_confirmed` flag an editor sets via "Looks correct" — auto-resets whenever registration re-runs. Not a hard gate; surfaces an "unreviewed" banner/badge. **Status: merged to `main` (PR #2).** Follow-ups not built: persisted MI metric, square spyglass lens, at-a-glance ReconCard badge.
 
 ---
+
+### MNI152 Export Pipeline (step 1 — this branch `mni-registration`)
+Once a reconstruction is **marked complete**, an **"⤓ Export to MNI"** button appears in the
+Header (editor/admin only). It calls `POST /export`, which sets `export_status="exporting"` and
+runs `_export_mni_background` → `services/mni_registration.export_reconstruction_to_mni`. The
+Header polls `GET /reconstructions/{id}` every 5s and flips to **"⬇ Download MNI export"** when
+`export_status="exported"` (or a red retry button on `error`).
+
+**Staleness:** unlocking a reconstruction for editing flips `export_status` `exported → stale`
+(in `PATCH /status`, mirroring the `registration_confirmed` reset). Contacts may move during the
+edit, so the on-disk export no longer matches — the Header then shows an amber
+**"⟳ Re-export to MNI (outdated)"** instead of a Download of stale coordinates. The `exported`
+state also carries a small **⟳** button for an on-demand re-run. Re-running always overwrites
+`recon_dir/export/`. Statuses: `none | exporting | exported | stale | error`. This is the **first step** of a larger export pipeline;
+downstream steps (atlas region labeling of MNI coords, group templates, reports) will consume the
+persisted transforms + `electrodes_mni.csv`. **Accuracy checkpoint before trusting output:** verify
+`electrodes_mni.csv` coords sit inside the MNI bounding box and a left-hemisphere contact has
+`x_mni < 0` (the service logs an in-box % + L/R split; a flip means fixing the RAS/LPS handling or
+the `whichtoinvert` point-transform direction in `transform_contacts_to_mni`).
 
 ## API Endpoints (Key)
 
@@ -172,6 +194,8 @@ GET    /api/reconstructions/{id}/fusion-slice       CT resampled into MRI plane 
 POST   /api/reconstructions/{id}/prerender-slices   warm slice cache
 GET    /api/reconstructions/{id}/structures         ACTIVE - patient-specific antspynet meshes
 PATCH  /api/reconstructions/{id}/registration-confirm  set/clear registration_confirmed
+POST   /api/reconstructions/{id}/export              start MNI152 export (409 unless is_complete); bg task
+GET    /api/reconstructions/{id}/export/download     zip of recon_dir/export/ artifacts
 
 POST   /api/shafts                                  create shaft
 PATCH  /api/shafts/{id}                             update shaft fields
@@ -189,11 +213,14 @@ POST   /api/reconstructions/{id}/snap-to-blob       snap world pos to CT blob
 
 *(Update this section each session)*
 
-**Last worked on (2026-07-21):** Got the app running end-to-end and shipped several fixes/features across two PR branches off `main`:
-- `fix-bcrypt-and-mri-modality` (**PR #1**): bcrypt startup-crash fix, MRI T1/T2 modality selector, file-input layout fix, open3d dependency (fixes mesh-decimation crash on real data), hierarchical brain-structure checkbox tree.
-- `registration-qa` (**PR #2**, stacked on PR #1): fusion slice viewer + manual registration confirmation. See design section above.
+**Last worked on (2026-07-22):** Built the **MNI152 export pipeline (step 1)** on branch `mni-registration` — **PR #4** (targets `main` directly, open, not merged). See the "MNI152 Export Pipeline" design section above. Verified end-to-end on real data (`PY26N009_dev3`, 93 contacts): MRI warps into MNI152 (SyNRA), 100% of contacts inside the MNI bounding box, correct hemispheres and medial→lateral sEEG geometry (RAS/LPS + point-transform direction confirmed). Artifacts land in `recon_dir/export/`. (Note: `gh` CLI is installed but not authenticated on this box — the PR was created via the GitHub API using git's stored credential.)
 
-Neither PR is merged to `main` yet. Verified end-to-end against real patient data (`PY26N009_dev1`): mesh extraction, CT registration (valid rigid transform, MI −0.58), ~84 patient-specific structures, and the fusion overlay (CT skull concentric around MRI brain).
+**Already merged to `main`** (verified live on GitHub 2026-07-22):
+- **PR #1** `fix-bcrypt-and-mri-modality`: bcrypt startup-crash fix, MRI T1/T2 modality selector, file-input layout fix, open3d dependency (fixes mesh-decimation crash on real data), hierarchical brain-structure checkbox tree.
+- **PR #2** `registration-qa`: fusion slice viewer + manual CT–MRI registration confirmation. See design section above.
+- **PR #3** `segmentation-cpu-parallel-mesh`: parallelized per-structure mesh extraction, segmentation kept CPU-only. See design section above.
+
+So `main` already contains all of the above; **PR #4** (`mni-registration`, still open) branched from `main` and sits on top of them — no stacking/rebase needed. Prior verification (`PY26N009_dev1`): mesh extraction, CT registration (valid rigid transform, MI −0.58), ~84 patient-specific structures, and the fusion overlay (CT skull concentric around MRI brain).
 
 **Working:**
 - 3D brain + CT + electrode + **patient-specific structure** visualization
@@ -201,7 +228,7 @@ Neither PR is merged to `main` yet. Verified end-to-end against real patient dat
 - Electrode placement workflow (click CT → snap to blob → place contact)
 - Autofill (spline fit)
 - Lock/complete workflow, role-based auth
-- CT→MRI registration + fusion-view QA (on branch)
+- CT→MRI registration + fusion-view QA (merged, PR #2)
 
 **Note:** the JSX compile issue previously flagged in `ElectrodeEditor.jsx` (`{/* ── SHAFT HEADER ── */}`) is resolved — the comment has its closing brace and the file compiles.
 
@@ -209,15 +236,16 @@ Neither PR is merged to `main` yet. Verified end-to-end against real patient dat
 
 ## Next Steps
 
-1. **Merge PR #1 then PR #2** (retarget PR #2 to `main` after PR #1 merges)
+1. **Review & merge PR #4** (`mni-registration` → `main`, open) — PR #1/#2/#3 are already merged
 2. **Registration-QA follow-ups** — persist the SimpleITK MI metric (currently logged then discarded), square spyglass lens in the fusion view, at-a-glance registration badge on ReconCard
-3. **CSV/Excel export of electrode coordinates** — shaft name, contact number, x/y/z mm. High clinical value for sharing with analysis tools
-4. **Contact-to-structure labeling** — now feasible since structures are patient-specific; report which DKT/subcortical region each contact falls in
-5. **Fill the 6 missing DKT structures** — accumbens, frontal pole, temporal pole (bilateral) report "no voxels"; verify label indices vs. the antspynet DKT scheme
-6. **Test with more multi-patient data** — multiple shafts, verify autofill and slice projections across cases
-7. **Share link review mode** — read-only viewer for completed reconstructions without login (token generated, endpoint exists, UI not fully wired)
-8. **FreeSurfer surface import** — upload lh.pial/rh.pial as brain surface instead of marching cubes
-9. **AWS deployment** — behind JHU VPN IP allowlist, HTTPS, proper secret management; migrate SQLite → Postgres for multi-user
+3. **MNI export — next steps (step 1 shipped in PR #4)** — atlas region labeling of MNI coords (which standard-atlas region each contact falls in), group-template building, report generation; all consume `recon_dir/export/` transforms + `electrodes_mni.csv`
+4. **CSV/Excel export of electrode coordinates** — shaft name, contact number, x/y/z mm. High clinical value for sharing with analysis tools (native-space complement to the MNI CSV)
+5. ~~**Contact-to-structure labeling**~~ — **DONE** (PR #4): `electrodes_structures.csv` in the MNI export reports the DKT/subcortical region each contact falls in (or the nearest within 5 mm, with distance). Possible follow-up: surface it in the UI, not just the export
+6. **Fill the 6 missing DKT structures** — accumbens, frontal pole, temporal pole (bilateral) report "no voxels"; verify label indices vs. the antspynet DKT scheme
+7. **Test with more multi-patient data** — multiple shafts, verify autofill and slice projections across cases
+8. **Share link review mode** — read-only viewer for completed reconstructions without login (token generated, endpoint exists, UI not fully wired)
+9. **FreeSurfer surface import** — upload lh.pial/rh.pial as brain surface instead of marching cubes
+10. **AWS deployment** — behind JHU VPN IP allowlist, HTTPS, proper secret management; migrate SQLite → Postgres for multi-user
 
 ---
 

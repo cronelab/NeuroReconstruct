@@ -31,7 +31,7 @@ for col_name, col_type in NEW_COLUMNS:
         cur.execute(f"ALTER TABLE electrode_shafts ADD COLUMN {col_name} {col_type}")
         print(f"  + Added column: {col_name}")
     else:
-        print(f"  ✓ Already exists: {col_name}")
+        print(f"  [OK] Already exists: {col_name}")
 
 conn.commit()
 conn.close()
