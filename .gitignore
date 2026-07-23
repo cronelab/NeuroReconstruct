@@ -31,6 +31,7 @@ frontend/build/
 dist_demo/
 demo/
 demo_exclude.tmp
+NeuroReconstruct_demo.zip
 
 # Environment / secrets
 .env
