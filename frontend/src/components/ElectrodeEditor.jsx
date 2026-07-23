@@ -357,7 +357,7 @@ export default function ElectrodeEditor({
   // CT HU window: floor (lower bound) + ceiling (upper bound). Ceiling defaults
   // to the top of the range = open top (includes all bright metal), matching
   // the previous floor-only behavior.
-  const [huFloor, setHuFloor] = useState(1500);
+  const [huFloor, setHuFloor] = useState(2000);
   const [huCeiling, setHuCeiling] = useState(3100);
   const debFloor = useDebounce(huFloor, 400);
   const debCeiling = useDebounce(huCeiling, 400);
