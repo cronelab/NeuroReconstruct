@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend",
+      "runtimeExecutable": "C:\\Users\\CroneLab\\miniconda3\\envs\\neuro-recon\\python.exe",
+      "runtimeArgs": ["-m", "uvicorn", "--app-dir", "backend", "main:app", "--reload", "--port", "8000"],
+      "port": 8000
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "frontend", "start"],
+      "port": 3000
+    }
+  ]
+}
