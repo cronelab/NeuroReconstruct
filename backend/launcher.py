@@ -30,15 +30,26 @@ from main import app
 import uvicorn
 
 
+# Overridable so the packaged app can run alongside a dev server already
+# holding the default port: NEURO_PORT=8010 NeuroReconstruct.exe
+try:
+    PORT = int(os.environ.get('NEURO_PORT', '8000'))
+except ValueError:
+    print(f"  Invalid NEURO_PORT={os.environ.get('NEURO_PORT')!r}; using 8000")
+    PORT = 8000
+
+URL = f'http://127.0.0.1:{PORT}'
+
+
 def _open_browser():
     time.sleep(3)
-    webbrowser.open('http://127.0.0.1:8000')
+    webbrowser.open(URL)
 
 
 if __name__ == '__main__':
     print("=" * 55)
     print("  NeuroReconstruct")
-    print("  Starting server at http://127.0.0.1:8000 ...")
+    print(f"  Starting server at {URL} ...")
     print("  Default login:  admin / changeme")
     print("  Close this window to stop the app.")
     print("=" * 55)
@@ -49,6 +60,6 @@ if __name__ == '__main__':
     uvicorn.run(
         app,
         host="127.0.0.1",
-        port=8000,
+        port=PORT,
         log_level="warning",
     )
