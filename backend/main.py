@@ -340,8 +340,13 @@ def _get_runtime_dir():
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
-DATA_DIR = os.path.join(_get_runtime_dir(), "data")
+# NEURO_DATA_DIR overrides the data root so imaging files can live on a mounted
+# share (cloud deploys) rather than inside the deployment directory, which is
+# replaced on every deploy. database.py reads the same variable, so the DB
+# (<root>/brain_viewer.db) and the recon_* folders (<root>/data/) share a root.
+DATA_DIR = os.path.join(os.environ.get("NEURO_DATA_DIR") or _get_runtime_dir(), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+print(f"[DATA] Using data directory: {DATA_DIR}")
 
 
 def _rel(path: str) -> Optional[str]:
