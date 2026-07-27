@@ -7,6 +7,7 @@ import os
 import sys
 import uuid
 import json
+import hashlib
 import asyncio
 from typing import List, Optional
 from datetime import datetime
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from pydantic import BaseModel
 
-from database import init_db, get_db, AsyncSessionLocal, User, Reconstruction, ElectrodeShaft, ElectrodeContact
+from database import init_db, get_db, AsyncSessionLocal, engine, User, Reconstruction, ElectrodeShaft, ElectrodeContact, SeegRecording
 from auth import (
     verify_password, hash_password, create_access_token,
     get_current_user, require_editor, require_admin
@@ -397,6 +398,37 @@ async def startup():
         if result.rowcount:
             await db.commit()
             print(f"[STARTUP] Reset {result.rowcount} orphaned export(s) to 'error'.")
+
+    # Lightweight column migration: create_all does not ALTER existing tables, so
+    # add seeg_recordings.content_hash (used for upload dedup) if it's missing.
+    async with engine.begin() as conn:
+        cols = await conn.run_sync(
+            lambda c: [row[1] for row in c.exec_driver_sql("PRAGMA table_info(seeg_recordings)").fetchall()]
+        )
+        if cols and "content_hash" not in cols:
+            await conn.exec_driver_sql("ALTER TABLE seeg_recordings ADD COLUMN content_hash VARCHAR")
+            print("[STARTUP] Added seeg_recordings.content_hash column.")
+
+    # Backfill content_hash for legacy rows by hashing the stored file, so
+    # content-based upload dedup works retroactively for recordings uploaded
+    # before the column existed.
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            select(SeegRecording).where(SeegRecording.content_hash.is_(None))
+        )).scalars().all()
+        backfilled = 0
+        for r in rows:
+            ap = _abs(r.stored_path)
+            if ap and os.path.exists(ap):
+                h = hashlib.sha256()
+                with open(ap, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+                r.content_hash = h.hexdigest()
+                backfilled += 1
+        if backfilled:
+            await db.commit()
+            print(f"[STARTUP] Backfilled content_hash for {backfilled} sEEG recording(s).")
 
     # One-time migration: convert any absolute paths stored in DB to relative.
     async with AsyncSessionLocal() as db:
@@ -1118,6 +1150,250 @@ async def download_mni_export(
         buf, media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+
+
+# ── sEEG functional mapping ─────────────────────────────────────────────────
+# Upload NeurosEEGRead h5 files and render per-electrode band activity on a
+# brain surface. Fully parallel to the reconstruction pipeline: activity comes
+# from the h5, coordinates from this reconstruction (joined to channels by name).
+
+def _recon_dir_for(recon: Reconstruction) -> Optional[str]:
+    """Resolve the on-disk data dir for a reconstruction (mesh or MRI based)."""
+    for p in (recon.mesh_path, recon.mri_path):
+        ap = _abs(p) if p else None
+        if ap:
+            return os.path.dirname(ap)
+    return None
+
+
+def _replace_with_retry(src: str, dst: str, attempts: int = 8, delay: float = 0.15):
+    """
+    os.replace with a short retry.
+
+    Windows can transiently deny a move (WinError 5) when the file is briefly
+    locked by an antivirus scan or a lingering read handle. A few short retries
+    clear those without failing the request.
+    """
+    import time
+    last = None
+    for _ in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as e:
+            last = e
+            time.sleep(delay)
+    raise last
+
+
+async def _gather_native_contacts(db: AsyncSession, recon_id: int) -> list:
+    """Placed contacts with shaft name + mesh-centered mm, for the name-join."""
+    shafts_result = await db.execute(
+        select(ElectrodeShaft).where(ElectrodeShaft.reconstruction_id == recon_id)
+    )
+    contacts = []
+    for shaft in shafts_result.scalars().all():
+        c_result = await db.execute(
+            select(ElectrodeContact)
+            .where(ElectrodeContact.shaft_id == shaft.id)
+            .where(ElectrodeContact.x_mm != None)
+            .order_by(ElectrodeContact.contact_number)
+        )
+        for c in c_result.scalars().all():
+            contacts.append({
+                "shaft_name": shaft.name, "contact_number": c.contact_number,
+                "x_mm": c.x_mm, "y_mm": c.y_mm, "z_mm": c.z_mm,
+            })
+    return contacts
+
+
+@app.post("/api/reconstructions/{recon_id}/seeg")
+async def upload_seeg(
+    recon_id: int,
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload a NeurosEEGRead h5 recording and associate it with the reconstruction."""
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Reconstruction not found")
+
+    recon_dir = _recon_dir_for(recon) or os.path.join(DATA_DIR, f"recon_{uuid.uuid4().hex[:8]}")
+    seeg_dir = os.path.join(recon_dir, "seeg")
+    os.makedirs(seeg_dir, exist_ok=True)
+
+    raw = await file.read()
+    content_hash = hashlib.sha256(raw).hexdigest()
+    safe_name = os.path.basename(file.filename or "recording.h5")
+
+    # Validate against a temp file first so a bad upload is never stored; parse it,
+    # then move it into place only if it reads.
+    tmp = os.path.join(seeg_dir, f".tmp_{uuid.uuid4().hex[:8]}.h5")
+    with open(tmp, "wb") as f:
+        f.write(raw)
+    try:
+        from services.seeg_service import parse_seeg_h5
+        task = parse_seeg_h5(tmp)["attrs"].get("task")
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail=f"Not a readable NeurosEEGRead h5: {e}")
+
+    # Always store under a fresh filename and point the DB row at it -- never
+    # overwrite an existing file in place. os.replace onto a file that is briefly
+    # locked (antivirus scan, a lingering read handle) raises WinError 5 on Windows;
+    # writing a new file sidesteps that. Superseded files are garbage-collected below.
+    dest = os.path.join(seeg_dir, f"{uuid.uuid4().hex[:8]}_{safe_name}")
+    _replace_with_retry(tmp, dest)
+
+    # Dedup: an existing recording with identical content (sha256) or the same
+    # original filename is treated as the same recording -- reuse one row and drop
+    # the rest, consolidating any duplicates that piled up previously too.
+    existing = (await db.execute(
+        select(SeegRecording).where(SeegRecording.reconstruction_id == recon_id)
+    )).scalars().all()
+    matches = [r for r in existing
+               if r.content_hash == content_hash or r.filename == safe_name]
+
+    if matches:
+        keep, extras = matches[0], matches[1:]
+        for r in extras:
+            await db.delete(r)
+        keep.task = task
+        keep.filename = safe_name
+        keep.content_hash = content_hash
+        keep.uploaded_at = datetime.utcnow()
+        keep.stored_path = _rel(dest)
+        rec = keep
+    else:
+        rec = SeegRecording(
+            reconstruction_id=recon_id, task=task, filename=safe_name,
+            stored_path=_rel(dest), content_hash=content_hash,
+        )
+        db.add(rec)
+
+    await db.commit()
+    await db.refresh(rec)
+
+    # Garbage-collect files no longer referenced by any surviving row for this
+    # reconstruction (superseded duplicates + stray temp files). Best-effort: a
+    # file still locked now is retried on the next upload, so this self-heals.
+    remaining = (await db.execute(
+        select(SeegRecording).where(SeegRecording.reconstruction_id == recon_id)
+    )).scalars().all()
+    referenced = {os.path.basename(_abs(r.stored_path)) for r in remaining if r.stored_path}
+    try:
+        for fn in os.listdir(seeg_dir):
+            full = os.path.join(seeg_dir, fn)
+            if not os.path.isfile(full) or fn in referenced:
+                continue
+            if fn.startswith(".tmp_") or fn.lower().endswith((".h5", ".hdf5")):
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    return {"id": rec.id, "task": rec.task, "filename": rec.filename,
+            "replaced": bool(matches),
+            "uploaded_at": rec.uploaded_at.isoformat() if rec.uploaded_at else None}
+
+
+@app.get("/api/reconstructions/{recon_id}/seeg")
+async def list_seeg(
+    recon_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List sEEG recordings uploaded for this reconstruction."""
+    result = await db.execute(
+        select(SeegRecording)
+        .where(SeegRecording.reconstruction_id == recon_id)
+        .order_by(SeegRecording.uploaded_at.desc())
+    )
+    return [
+        {"id": r.id, "task": r.task, "filename": r.filename,
+         "uploaded_at": r.uploaded_at.isoformat() if r.uploaded_at else None}
+        for r in result.scalars().all()
+    ]
+
+
+class SeegActivityRequest(BaseModel):
+    band: str = "high_gamma"
+    mode: str = "trial"                              # 'trial' | 'scroll'
+    # Peri-stimulus window [start_ms, end_ms] relative to onset (start < 0 < end).
+    window_ms: Optional[List[float]] = None
+
+
+@app.post("/api/reconstructions/{recon_id}/seeg/{rec_id}/activity")
+async def compute_seeg_activity(
+    recon_id: int,
+    rec_id: int,
+    req: SeegActivityRequest = Body(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Compute band activity for a recording and join it to this reconstruction's
+    contacts. Returns the display matrix plus native and (if exported) MNI coords.
+    """
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Reconstruction not found")
+
+    rec_result = await db.execute(select(SeegRecording).where(SeegRecording.id == rec_id))
+    rec = rec_result.scalar_one_or_none()
+    if not rec or rec.reconstruction_id != recon_id:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    h5_path = _abs(rec.stored_path)
+    if not h5_path or not os.path.exists(h5_path):
+        raise HTTPException(status_code=404, detail="Recording file missing on disk")
+
+    from services.seeg_service import (
+        compute_band_activity, compute_continuous_traces, parse_seeg_h5,
+        join_channels_to_contacts, BANDS,
+    )
+    if req.band not in BANDS:
+        raise HTTPException(status_code=400, detail=f"band must be one of {sorted(BANDS)}")
+    if req.mode not in ("trial", "scroll"):
+        raise HTTPException(status_code=400, detail="mode must be 'trial' or 'scroll'")
+
+    # Signal processing is CPU-bound; keep the event loop responsive.
+    loop = asyncio.get_event_loop()
+    try:
+        if req.mode == "scroll":
+            activity = await loop.run_in_executor(
+                None, lambda: compute_continuous_traces(h5_path, req.band)
+            )
+        else:
+            window = tuple(req.window_ms) if req.window_ms else (-200.0, 800.0)
+            if len(window) != 2 or not (window[0] < 0 < window[1]):
+                raise HTTPException(status_code=400,
+                                    detail="window_ms must be [start, end] with start < 0 < end")
+            activity = await loop.run_in_executor(
+                None, lambda: compute_band_activity(h5_path, req.band, window)
+            )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    meta = await loop.run_in_executor(None, parse_seeg_h5, h5_path)
+    native = await _gather_native_contacts(db, recon_id)
+    join = join_channels_to_contacts(meta["channels"], native, None)
+
+    return {
+        **activity,
+        "coords_native": join["coords_native"],
+        "matched": join["matched"],
+        "unmatched_channels": join["unmatched_channels"],
+        "unmatched_contacts": join["unmatched_contacts"],
+        "attrs": meta["attrs"],
+    }
 
 
 @app.get("/api/reconstructions/{recon_id}/mri-slice")

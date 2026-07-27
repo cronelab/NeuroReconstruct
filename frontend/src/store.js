@@ -58,4 +58,40 @@ export const useAppStore = create((set, get) => ({
   setStructureVisible: (key, v) => set(s => ({ structureVisible: { ...s.structureVisible, [key]: v } })),
   setStructureVisibleMany: (keys, v) =>
     set(s => ({ structureVisible: { ...s.structureVisible, ...Object.fromEntries(keys.map(k => [k, v])) } })),
+
+  // ── sEEG functional mapping (decoupled from reconstruction/editor state) ──────
+  seegRecordings: [],            // [{ id, task, filename, uploaded_at }]
+  setSeegRecordings: (r) => set({ seegRecordings: r }),
+  seegRecordingId: null,         // currently selected recording id
+  setSeegRecordingId: (id) => set({ seegRecordingId: id }),
+  // Computed activity payload from the backend:
+  //   { channels, times, activity[frame][ch], coords_native, coords_mni,
+  //     matched, unmatched_channels, unmatched_contacts, has_mni, mode, band }
+  seegActivity: null,
+  setSeegActivity: (a) => set({ seegActivity: a, seegTimeIndex: 0 }),
+  seegBand: 'high_gamma',
+  setSeegBand: (b) => set({ seegBand: b }),
+  // Trial-averaged peri-stimulus window (ms magnitudes before/after onset).
+  seegPre: 200,
+  setSeegPre: (v) => set({ seegPre: v }),
+  seegPost: 800,
+  setSeegPost: (v) => set({ seegPost: v }),
+  seegMode: 'trial',             // 'trial' (trial-averaged) | 'scroll' (continuous)
+  setSeegMode: (m) => set({ seegMode: m }),
+  seegTraceSignal: 'z',          // 'z' (band-power z) | 'raw' (voltage)
+  setSeegTraceSignal: (s) => set({ seegTraceSignal: s }),
+  seegTraceScope: 'all',         // 'all' | 'shaft'
+  setSeegTraceScope: (s) => set({ seegTraceScope: s }),
+  seegTraceShaft: null,          // selected shaft when scope === 'shaft'
+  setSeegTraceShaft: (s) => set({ seegTraceShaft: s }),
+  seegTracePanelW: 400,          // right trace-panel width (px), user-resizable
+  setSeegTracePanelW: (w) => set({ seegTracePanelW: w }),
+  seegBrainOpacity: 0.4,         // native-brain surface opacity in the sEEG view
+  setSeegBrainOpacity: (v) => set({ seegBrainOpacity: v }),
+  seegStructureOpacity: 0.4,     // structure-overlay opacity in the sEEG view
+  setSeegStructureOpacity: (v) => set({ seegStructureOpacity: v }),
+  seegTimeIndex: 0,
+  setSeegTimeIndex: (i) => set({ seegTimeIndex: i }),
+  seegPlaying: false,
+  setSeegPlaying: (v) => set({ seegPlaying: v }),
 }));

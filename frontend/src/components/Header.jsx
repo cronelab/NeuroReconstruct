@@ -208,6 +208,31 @@ export default function Header({ onBack, onNavigate }) {
 
       <div style={s.spacer} />
 
+      {/* sEEG functional mapping — available to all roles (read-only view), but
+          only once the reconstruction is complete and locked, since it relies on
+          the finalized electrode localization. */}
+      {reconstruction && (() => {
+        const seegReady = isComplete && isLocked;
+        return (
+          <button
+            disabled={!seegReady}
+            style={{ ...s.btn,
+              background: 'transparent',
+              color: seegReady ? '#b18cff' : '#4a5568',
+              border: `1px solid ${seegReady ? '#6b4fb355' : '#2a3340'}`,
+              cursor: seegReady ? 'pointer' : 'not-allowed',
+              opacity: seegReady ? 1 : 0.6,
+            }}
+            onClick={() => { if (seegReady) onNavigate?.('/seeg'); }}
+            title={seegReady
+              ? 'Visualize sEEG electrode activity on the brain'
+              : 'Mark the reconstruction complete (locked) to enable sEEG activity mapping'}
+          >
+            ◍ sEEG Activity
+          </button>
+        );
+      })()}
+
       {/* Actions — only in viewer */}
       {reconstruction && canEdit && (<>
 

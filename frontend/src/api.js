@@ -96,4 +96,21 @@ export const uploadReconstructionFiles = (reconId, formData) =>
     timeout: 600000,
   });
 
+// ── sEEG functional mapping ─────────────────────────────────────────────────────
+export const uploadSeeg = (reconId, file) => {
+  const form = new FormData();
+  form.append('file', file);
+  return api.post(`/reconstructions/${reconId}/seeg`, form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 300000,
+  });
+};
+
+export const listSeeg = (reconId) =>
+  api.get(`/reconstructions/${reconId}/seeg`);
+
+export const computeSeegActivity = (reconId, recId, { band, mode, window_ms } = {}) =>
+  api.post(`/reconstructions/${reconId}/seeg/${recId}/activity`,
+    { band, mode, window_ms }, { timeout: 300000 });
+
 export default api;
