@@ -89,20 +89,19 @@ def test_event_activity_rise():
         out = S.compute_band_activity(p, band="high_gamma")
         assert out["channels"] == chans
         act = np.array(out["activity"])                     # (frames, channels)
-        times = np.array(out["times"])                      # ms
+        times = np.array(out["times"])                      # ms, post-stimulus only
         assert act.shape[0] == len(times)
         assert act.shape[1] == len(chans)
-        # Post-onset (0..400 ms) high-gamma should exceed baseline (<0 ms) in active chans.
-        pre = act[times < 0].mean(axis=0)
+        # Output is post-stimulus only (t >= 0); the baseline is not returned.
+        assert times.min() >= 0
+        # Active channels show a strong positive baseline-z in the burst (0..400 ms);
+        # since z is normalized to the pre-onset baseline, that means z well above 0.
         post = act[(times > 20) & (times < 400)].mean(axis=0)
         for ch in active:
-            i = chans.index(ch)
-            assert post[i] - pre[i] > 1.0, f"{ch}: post-pre z={post[i]-pre[i]:.2f} not > 1"
-        # An inactive channel should show a much smaller rise.
-        i_inactive = chans.index("LAH1")
-        rise_inactive = post[i_inactive] - pre[i_inactive]
-        rise_active = post[chans.index("LAH2")] - pre[chans.index("LAH2")]
-        assert rise_active > rise_inactive + 1.0
+            assert post[chans.index(ch)] > 2.0, f"{ch}: post z={post[chans.index(ch)]:.2f} not > 2"
+        # An inactive channel stays near baseline (small |z|) and well below active.
+        assert post[chans.index("LAH1")] < 1.5
+        assert post[chans.index("LAH2")] > post[chans.index("LAH1")] + 1.0
     print("ok test_event_activity_rise")
 
 
@@ -129,7 +128,8 @@ def test_window_param():
         make_fake_h5(p, chans, active=["LAH2"], n_trials=15, duration_s=40)
         out = S.compute_band_activity(p, band="high_gamma", window_ms=(-100.0, 500.0))
         t = np.array(out["times"])
-        assert t.min() >= -100.5 and t.min() < -95, t.min()
+        # Displayed time course is post-stimulus only: 0 .. end.
+        assert 0 <= t.min() < 5, t.min()
         assert 495 < t.max() <= 500.5, t.max()
         assert np.array(out["activity"]).shape[0] == len(t)
     print("ok test_window_param")

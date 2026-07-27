@@ -197,16 +197,19 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
 
     Epochs each channel around every ``/trials`` onset over the peri-stimulus
     ``window_ms`` [start, end] (start < 0 < end, relative to onset), z-scores each
-    epoch to its pre-onset baseline, and averages across trials.
+    epoch to its pre-onset baseline, averages across trials, and returns the
+    POST-stimulus portion [0, end] ms (the pre-onset samples only feed the baseline).
 
     band:        key in BANDS.
-    window_ms:   peri-stimulus window in ms [start, end], start < 0 < end.
+    window_ms:   peri-stimulus window in ms [start, end], start < 0 < end. The
+                 pre-onset part [start, 0] is the baseline; the post-onset part
+                 [0, end] is the displayed activation time course.
     baseline_ms: baseline window in ms [start, end]; defaults to the entire
                  pre-stimulus interval [window_ms[0], 0].
 
     Returns:
       channels: [name, ...]              (mappable channels, order matches columns)
-      times:    [t_ms, ...]              peri-stimulus time in ms
+      times:    [t_ms, ...]              post-stimulus time in ms (>= 0)
       activity: [[v, ...], ...]          shape (n_frames, n_channels), baseline z
       band, n_trials
     """
@@ -275,10 +278,16 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
     # JSON-serializable -- map them to 0 (neutral / baseline).
     avg = np.nan_to_num(avg, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Decimate peri-stimulus time if very long.
-    if n_pst > max_frames:
-        step = int(np.ceil(n_pst / max_frames))
-        sel = np.arange(0, n_pst, step)
+    # The pre-onset samples exist only to build the baseline; the displayed z-score
+    # time course runs over the POST-stimulus window [0, end] ms.
+    post_mask = pst_times_ms >= 0
+    avg = avg[post_mask]
+    pst_times_ms = pst_times_ms[post_mask]
+
+    # Decimate the post-stimulus time axis if very long.
+    n_out = len(pst_times_ms)
+    if n_out > max_frames:
+        sel = np.arange(0, n_out, int(np.ceil(n_out / max_frames)))
         avg = avg[sel]
         pst_times_ms = pst_times_ms[sel]
 

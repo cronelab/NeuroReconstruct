@@ -1139,6 +1139,26 @@ def _recon_dir_for(recon: Reconstruction) -> Optional[str]:
     return None
 
 
+def _replace_with_retry(src: str, dst: str, attempts: int = 8, delay: float = 0.15):
+    """
+    os.replace with a short retry.
+
+    Windows can transiently deny a move (WinError 5) when the file is briefly
+    locked by an antivirus scan or a lingering read handle. A few short retries
+    clear those without failing the request.
+    """
+    import time
+    last = None
+    for _ in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as e:
+            last = e
+            time.sleep(delay)
+    raise last
+
+
 async def _gather_native_contacts(db: AsyncSession, recon_id: int) -> list:
     """Placed contacts with shaft name + mesh-centered mm, for the name-join."""
     shafts_result = await db.execute(
@@ -1181,8 +1201,8 @@ async def upload_seeg(
     content_hash = hashlib.sha256(raw).hexdigest()
     safe_name = os.path.basename(file.filename or "recording.h5")
 
-    # Validate against a temp file first so a bad upload never clobbers an existing
-    # recording; only move it into place once it parses.
+    # Validate against a temp file first so a bad upload is never stored; parse it,
+    # then move it into place only if it reads.
     tmp = os.path.join(seeg_dir, f".tmp_{uuid.uuid4().hex[:8]}.h5")
     with open(tmp, "wb") as f:
         f.write(raw)
@@ -1190,13 +1210,22 @@ async def upload_seeg(
         from services.seeg_service import parse_seeg_h5
         task = parse_seeg_h5(tmp)["attrs"].get("task")
     except Exception as e:
-        os.remove(tmp)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         raise HTTPException(status_code=400, detail=f"Not a readable NeurosEEGRead h5: {e}")
 
-    # Dedup: replace an existing recording with identical content, or one uploaded
-    # under the same original filename (treated as a new version of the same file),
-    # instead of accumulating duplicates. If several already piled up (from before
-    # dedup), keep one and delete the rest so a re-upload also cleans up the mess.
+    # Always store under a fresh filename and point the DB row at it -- never
+    # overwrite an existing file in place. os.replace onto a file that is briefly
+    # locked (antivirus scan, a lingering read handle) raises WinError 5 on Windows;
+    # writing a new file sidesteps that. Superseded files are garbage-collected below.
+    dest = os.path.join(seeg_dir, f"{uuid.uuid4().hex[:8]}_{safe_name}")
+    _replace_with_retry(tmp, dest)
+
+    # Dedup: an existing recording with identical content (sha256) or the same
+    # original filename is treated as the same recording -- reuse one row and drop
+    # the rest, consolidating any duplicates that piled up previously too.
     existing = (await db.execute(
         select(SeegRecording).where(SeegRecording.reconstruction_id == recon_id)
     )).scalars().all()
@@ -1206,25 +1235,14 @@ async def upload_seeg(
     if matches:
         keep, extras = matches[0], matches[1:]
         for r in extras:
-            ap = _abs(r.stored_path)
-            if ap and os.path.exists(ap):
-                try:
-                    os.remove(ap)
-                except OSError:
-                    pass
             await db.delete(r)
-        dest = _abs(keep.stored_path)
-        os.replace(tmp, dest)                       # atomic overwrite (same dir)
         keep.task = task
         keep.filename = safe_name
         keep.content_hash = content_hash
         keep.uploaded_at = datetime.utcnow()
+        keep.stored_path = _rel(dest)
         rec = keep
-        match = True
     else:
-        match = False
-        dest = os.path.join(seeg_dir, f"{uuid.uuid4().hex[:8]}_{safe_name}")
-        os.replace(tmp, dest)
         rec = SeegRecording(
             reconstruction_id=recon_id, task=task, filename=safe_name,
             stored_path=_rel(dest), content_hash=content_hash,
@@ -1233,8 +1251,29 @@ async def upload_seeg(
 
     await db.commit()
     await db.refresh(rec)
+
+    # Garbage-collect files no longer referenced by any surviving row for this
+    # reconstruction (superseded duplicates + stray temp files). Best-effort: a
+    # file still locked now is retried on the next upload, so this self-heals.
+    remaining = (await db.execute(
+        select(SeegRecording).where(SeegRecording.reconstruction_id == recon_id)
+    )).scalars().all()
+    referenced = {os.path.basename(_abs(r.stored_path)) for r in remaining if r.stored_path}
+    try:
+        for fn in os.listdir(seeg_dir):
+            full = os.path.join(seeg_dir, fn)
+            if not os.path.isfile(full) or fn in referenced:
+                continue
+            if fn.startswith(".tmp_") or fn.lower().endswith((".h5", ".hdf5")):
+                try:
+                    os.remove(full)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
     return {"id": rec.id, "task": rec.task, "filename": rec.filename,
-            "replaced": bool(match),
+            "replaced": bool(matches),
             "uploaded_at": rec.uploaded_at.isoformat() if rec.uploaded_at else None}
 
 

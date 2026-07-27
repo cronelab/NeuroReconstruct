@@ -227,7 +227,7 @@ export default function SeegViewer({ reconId, onBack }) {
                 cursor: windowDirty ? 'pointer' : 'default' }}>Apply</button>
           </div>
           <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 5 }}>
-            relative to stimulus onset · baseline = pre-onset window
+            −pre = baseline (pre-onset) · +post = activation shown (post-onset)
           </div>
         </div>
 
