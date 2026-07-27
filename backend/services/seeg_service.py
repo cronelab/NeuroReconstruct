@@ -188,6 +188,32 @@ def _band_envelope(sig: np.ndarray, fs: float, band: tuple) -> np.ndarray:
     return env.astype(np.float32)
 
 
+def _load_mappable_signal(path: str):
+    """
+    Load the mappable-channel signal block from an h5.
+
+    Returns (meta, fs, names, groups, sig) where sig is (n_samples, n_channels)
+    float32 volts in the mappable-channel order. sig has 0 columns if none map.
+    """
+    import h5py
+
+    meta = parse_seeg_h5(path)
+    fs = meta["rate_hz"]
+    cols = [c["col"] for c in meta["channels"]]
+    names = [c["name"] for c in meta["channels"]]
+    groups = [c["group"] for c in meta["channels"]]
+    if not cols:
+        return meta, fs, names, groups, np.zeros((meta["n_samples"], 0), dtype=np.float32)
+
+    with h5py.File(path, "r") as h5:
+        # h5py fancy-indexing needs sorted, unique columns; restore order after.
+        data = h5["ieeg"][meta["group_name"]]["data"]
+        order = np.argsort(cols)
+        sig_sorted = data[:, list(np.array(cols)[order])].astype(np.float32)
+        sig = sig_sorted[:, np.argsort(order)]
+    return meta, fs, names, groups, sig
+
+
 def compute_band_activity(path: str, band: str = DEFAULT_BAND,
                           window_ms: tuple = DEFAULT_WINDOW_MS,
                           baseline_ms: tuple = None,
@@ -209,41 +235,27 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
 
     Returns:
       channels: [name, ...]              (mappable channels, order matches columns)
+      groups:   [shaft, ...]             per-channel shaft name
       times:    [t_ms, ...]              post-stimulus time in ms (>= 0)
       activity: [[v, ...], ...]          shape (n_frames, n_channels), baseline z
-      band, n_trials
+      raw:      [[uV, ...], ...]         trial-averaged, baseline-corrected ERP (uV)
+      mode ('trial'), time_unit ('ms'), band, n_trials
     """
-    import h5py
-
     if band not in BANDS:
         raise ValueError(f"unknown band {band!r}; options: {sorted(BANDS)}")
     if baseline_ms is None:
         baseline_ms = (window_ms[0], 0.0)
-    meta = parse_seeg_h5(path)
-    fs = meta["rate_hz"]
-    cols = [c["col"] for c in meta["channels"]]
-    names = [c["name"] for c in meta["channels"]]
-    if not cols:
-        return {"channels": [], "times": [], "activity": [],
-                "band": band, "n_trials": len(meta["trials"])}
-
-    with h5py.File(path, "r") as h5:
-        # Load only the mappable columns (h5py fancy-indexing needs sorted, unique).
-        data = h5["ieeg"][meta["group_name"]]["data"]
-        order = np.argsort(cols)
-        sorted_cols = list(np.array(cols)[order])
-        sig_sorted = data[:, sorted_cols].astype(np.float32)
-        # Restore requested channel order.
-        inv = np.argsort(order)
-        sig = sig_sorted[:, inv]
+    meta, fs, names, groups, sig = _load_mappable_signal(path)
+    if sig.shape[1] == 0:
+        return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
+                "mode": "trial", "time_unit": "ms", "band": band, "n_trials": 0}
 
     env = _band_envelope(sig, fs, BANDS[band])
 
     # ── Trial-averaged: epoch around trial onsets ─────────────────────────────
-    trials = meta["trials"]
-    onsets = np.array([t["start_time"] for t in trials], dtype=np.float64)
+    onsets = np.array([t["start_time"] for t in meta["trials"]], dtype=np.float64)
     if len(onsets) == 0:
-        raise ValueError("no trials in h5 -- event-related mapping needs /trials onsets")
+        raise ValueError("no trials in h5 -- trial-averaged mapping needs /trials onsets")
 
     w0, w1 = window_ms[0] / 1000.0, window_ms[1] / 1000.0     # seconds
     pre = int(round(-w0 * fs)) if w0 < 0 else 0
@@ -253,9 +265,10 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
 
     n_ch = env.shape[1]
     n_samp = env.shape[0]
-    acc = np.zeros((n_pst, n_ch), dtype=np.float64)
+    acc = np.zeros((n_pst, n_ch), dtype=np.float64)          # z-score envelope
+    acc_raw = np.zeros((n_pst, n_ch), dtype=np.float64)      # baseline-corrected ERP
     used = 0
-    b0 = int(round(baseline_ms[0] / 1000.0 * fs)) + pre   # index into epoch
+    b0 = int(round(baseline_ms[0] / 1000.0 * fs)) + pre      # index into epoch
     b1 = int(round(baseline_ms[1] / 1000.0 * fs)) + pre
     b0, b1 = max(0, b0), max(1, min(n_pst, b1))
 
@@ -266,36 +279,71 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
             continue  # epoch runs off the segment edge
         epoch = env[s:e]                                    # (n_pst, n_ch)
         base = epoch[b0:b1]
-        mu = base.mean(axis=0)
-        sd = base.std(axis=0) + 1e-9
-        acc += (epoch - mu) / sd
+        acc += (epoch - base.mean(axis=0)) / (base.std(axis=0) + 1e-9)
+        raw_epoch = sig[s:e]
+        acc_raw += raw_epoch - raw_epoch[b0:b1].mean(axis=0)  # baseline-corrected
         used += 1
 
     if used == 0:
         raise ValueError("all trial epochs fell outside the segment -- check onsets")
-    avg = acc / used                                        # trial-averaged z
     # Degenerate channels (flat / all-zero signal) can yield NaN/Inf, which is not
     # JSON-serializable -- map them to 0 (neutral / baseline).
-    avg = np.nan_to_num(avg, nan=0.0, posinf=0.0, neginf=0.0)
+    avg = np.nan_to_num(acc / used, nan=0.0, posinf=0.0, neginf=0.0)
+    avg_raw = np.nan_to_num(acc_raw / used, nan=0.0, posinf=0.0, neginf=0.0) * 1e6  # uV
 
-    # The pre-onset samples exist only to build the baseline; the displayed z-score
-    # time course runs over the POST-stimulus window [0, end] ms.
+    # The pre-onset samples exist only to build the baseline; the displayed time
+    # course runs over the POST-stimulus window [0, end] ms.
     post_mask = pst_times_ms >= 0
-    avg = avg[post_mask]
-    pst_times_ms = pst_times_ms[post_mask]
+    avg, avg_raw, pst_times_ms = avg[post_mask], avg_raw[post_mask], pst_times_ms[post_mask]
 
     # Decimate the post-stimulus time axis if very long.
     n_out = len(pst_times_ms)
     if n_out > max_frames:
         sel = np.arange(0, n_out, int(np.ceil(n_out / max_frames)))
-        avg = avg[sel]
-        pst_times_ms = pst_times_ms[sel]
+        avg, avg_raw, pst_times_ms = avg[sel], avg_raw[sel], pst_times_ms[sel]
 
     return {
         "channels": names,
+        "groups": groups,
         "times": [round(float(t), 2) for t in pst_times_ms],
         "activity": np.round(avg, 3).tolist(),
-        "band": band, "n_trials": used,
+        "raw": np.round(avg_raw, 2).tolist(),
+        "mode": "trial", "time_unit": "ms", "band": band, "n_trials": used,
+    }
+
+
+def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
+                              max_frames: int = 2500) -> dict:
+    """
+    Continuous (scrollable) traces over the whole recording.
+
+    Returns per-channel band-power z-score (normalized to the whole-recording
+    envelope mean/SD) and raw voltage, both decimated to <= max_frames.
+
+    Returns the same shape as compute_band_activity with mode='scroll',
+    time_unit='s', and n_trials=0.
+    """
+    if band not in BANDS:
+        raise ValueError(f"unknown band {band!r}; options: {sorted(BANDS)}")
+    meta, fs, names, groups, sig = _load_mappable_signal(path)
+    if sig.shape[1] == 0:
+        return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
+                "mode": "scroll", "time_unit": "s", "band": band, "n_trials": 0}
+
+    env = _band_envelope(sig, fs, BANDS[band])
+    z = np.nan_to_num((env - env.mean(axis=0)) / (env.std(axis=0) + 1e-9),
+                      nan=0.0, posinf=0.0, neginf=0.0)
+
+    n = sig.shape[0]
+    idx = np.arange(0, n, int(np.ceil(n / max_frames))) if n > max_frames else np.arange(n)
+    times_s = idx / fs
+    return {
+        "channels": names,
+        "groups": groups,
+        "times": [round(float(t), 4) for t in times_s],
+        "activity": np.round(z[idx], 3).tolist(),
+        "raw": np.round(sig[idx] * 1e6, 2).tolist(),   # uV
+        "mode": "scroll", "time_unit": "s", "band": band, "n_trials": 0,
     }
 
 

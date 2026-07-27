@@ -4,6 +4,7 @@ import {
   listSeeg, uploadSeeg, computeSeegActivity, getMesh, getReconstruction, getStructures,
 } from '../api';
 import SeegViewer3D, { activityColor } from './SeegViewer3D';
+import SeegTracePanel from './SeegTracePanel';
 
 const BANDS = [
   ['delta', 'Delta 1–4'], ['theta', 'Theta 4–8'], ['alpha', 'Alpha 8–13'],
@@ -44,6 +45,9 @@ export default function SeegViewer({ reconId, onBack }) {
     seegRecordings, setSeegRecordings, seegRecordingId, setSeegRecordingId,
     seegActivity, setSeegActivity, seegBand, setSeegBand,
     seegPre, setSeegPre, seegPost, setSeegPost,
+    seegMode, setSeegMode,
+    seegTraceSignal, setSeegTraceSignal, seegTraceScope, setSeegTraceScope,
+    seegTraceShaft, setSeegTraceShaft, seegTracePanelW, setSeegTracePanelW,
     seegTimeIndex, setSeegTimeIndex, seegPlaying, setSeegPlaying,
   } = useAppStore();
 
@@ -86,11 +90,12 @@ export default function SeegViewer({ reconId, onBack }) {
     setComputing(true);
     setError(null);
     setSeegPlaying(false);
-    computeSeegActivity(reconId, seegRecordingId, { band: seegBand, window_ms: [-seegPre, seegPost] })
+    computeSeegActivity(reconId, seegRecordingId,
+      { band: seegBand, mode: seegMode, window_ms: [-seegPre, seegPost] })
       .then((r) => setSeegActivity(r.data))
       .catch((e) => { setError(e?.response?.data?.detail || 'Could not compute activity'); setSeegActivity(null); })
       .finally(() => setComputing(false));
-  }, [reconId, seegRecordingId, seegBand, seegPre, seegPost]);
+  }, [reconId, seegRecordingId, seegBand, seegMode, seegPre, seegPost]);
 
   // ── Playback ──────────────────────────────────────────────────────────────────
   const nFrames = seegActivity?.times?.length || 0;
@@ -144,8 +149,6 @@ export default function SeegViewer({ reconId, onBack }) {
     }
   };
 
-  const timeLabel = seegActivity ? `${seegActivity.times[seegTimeIndex]} ms` : '';
-
   const matchedN = seegActivity?.matched?.length || 0;
   const unmatchedN = seegActivity?.unmatched_channels?.length || 0;
 
@@ -189,13 +192,19 @@ export default function SeegViewer({ reconId, onBack }) {
           </div>
         </div>
 
-        {/* Trial-averaged mapping — peri-stimulus window */}
+        {/* Mapping mode */}
         <div>
           <div style={label}>Mapping mode</div>
-          <div style={{ fontSize: 11, color: '#c8d4e0', fontFamily: 'IBM Plex Mono, monospace', marginBottom: 12 }}>
-            Trial-averaged
-            <span style={{ color: '#4a5568', marginLeft: 8 }}>· stimulus-locked, averaged across trials</span>
+          <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+            <div onClick={() => setSeegMode('trial')} style={{ ...seg(seegMode === 'trial'), flex: 1, textAlign: 'center' }}>Trial-averaged</div>
+            <div onClick={() => setSeegMode('scroll')} style={{ ...seg(seegMode === 'scroll'), flex: 1, textAlign: 'center' }}>Scrollable</div>
           </div>
+
+          {seegMode === 'scroll' ? (
+            <div style={{ fontSize: 10, color: '#7a8a99' }}>
+              Continuous recording · band-power z-score over the whole session.
+            </div>
+          ) : (<>
           <div style={label}>Peri-stimulus window (ms)</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -222,6 +231,7 @@ export default function SeegViewer({ reconId, onBack }) {
           <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 5 }}>
             −pre = baseline (pre-onset) · +post = activation shown (post-onset)
           </div>
+          </>)}
         </div>
 
         <ColorBar domain={domain} />
@@ -257,7 +267,7 @@ export default function SeegViewer({ reconId, onBack }) {
               </div>
             )}
             <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 4 }}>
-              {seegActivity.n_trials} trials averaged
+              {seegActivity.mode === 'scroll' ? 'continuous recording' : `${seegActivity.n_trials} trials averaged`}
             </div>
           </div>
         )}
@@ -270,45 +280,41 @@ export default function SeegViewer({ reconId, onBack }) {
         )}
       </div>
 
-      {/* ── Viewer + scrubber ── */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-        <div style={{ flex: 1, position: 'relative' }}>
-          <SeegViewer3D
-            meshData={surfaceMesh}
-            contacts={contacts}
-            domain={domain}
-            structuresData={structuresData}
-            showStructures={showStructures}
-            hoveredChannel={hoveredChannel}
-            onHoverContact={setHoveredChannel}
-            loading={computing || !surfaceMesh}
-            loadingMessage={computing ? 'Computing band activity…' : 'Loading surface…'}
-          />
-          {seegActivity && (
-            <div style={{ position: 'absolute', top: 12, left: 12, fontSize: 10, color: '#7a8a99',
-              fontFamily: 'IBM Plex Mono, monospace', background: '#0d1015aa', padding: '4px 8px', borderRadius: 3 }}>
-              Native brain · {seegActivity.band}
-            </div>
-          )}
-        </div>
-
-        {/* Time scrubber */}
-        {seegActivity && nFrames > 0 && (
-          <div style={{ height: 56, background: '#0d1015', borderTop: '1px solid #1e2530',
-            display: 'flex', alignItems: 'center', gap: 14, padding: '0 18px' }}>
-            <button onClick={() => setSeegPlaying(!seegPlaying)}
-              style={{ ...seg(seegPlaying), padding: '6px 12px' }}>
-              {seegPlaying ? '❚❚ Pause' : '▶ Play'}
-            </button>
-            <input type="range" min={0} max={nFrames - 1} value={seegTimeIndex}
-              onChange={(e) => { setSeegPlaying(false); setSeegTimeIndex(Number(e.target.value)); }}
-              style={{ flex: 1, accentColor: '#00d4ff' }} />
-            <span style={{ minWidth: 78, textAlign: 'right', fontSize: 12, color: '#e8edf2',
-              fontFamily: 'IBM Plex Mono, monospace' }}>{timeLabel}</span>
-            <span style={{ fontSize: 10, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace' }}>peri-stimulus</span>
+      {/* ── Brain (center) ── */}
+      <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
+        <SeegViewer3D
+          meshData={surfaceMesh}
+          contacts={contacts}
+          domain={domain}
+          structuresData={structuresData}
+          showStructures={showStructures}
+          hoveredChannel={hoveredChannel}
+          onHoverContact={setHoveredChannel}
+          loading={computing || !surfaceMesh}
+          loadingMessage={computing ? 'Computing band activity…' : 'Loading surface…'}
+        />
+        {seegActivity && (
+          <div style={{ position: 'absolute', top: 12, left: 12, fontSize: 10, color: '#7a8a99',
+            fontFamily: 'IBM Plex Mono, monospace', background: '#0d1015aa', padding: '4px 8px', borderRadius: 3 }}>
+            Native brain · {seegActivity.band}
           </div>
         )}
       </div>
+
+      {/* ── Trace panel (right) — stacked traces with synced time cursor ── */}
+      {seegActivity && nFrames > 0 && (
+        <SeegTracePanel
+          data={seegActivity}
+          signal={seegTraceSignal} setSignal={setSeegTraceSignal}
+          scope={seegTraceScope} setScope={setSeegTraceScope}
+          shaft={seegTraceShaft} setShaft={setSeegTraceShaft}
+          domain={domain}
+          timeIndex={seegTimeIndex} setTimeIndex={setSeegTimeIndex}
+          hoveredChannel={hoveredChannel} setHoveredChannel={setHoveredChannel}
+          width={seegTracePanelW} setWidth={setSeegTracePanelW}
+          playing={seegPlaying} setPlaying={setSeegPlaying}
+        />
+      )}
     </div>
   );
 }

@@ -1298,6 +1298,7 @@ async def list_seeg(
 
 class SeegActivityRequest(BaseModel):
     band: str = "high_gamma"
+    mode: str = "trial"                              # 'trial' | 'scroll'
     # Peri-stimulus window [start_ms, end_ms] relative to onset (start < 0 < end).
     window_ms: Optional[List[float]] = None
 
@@ -1328,39 +1329,42 @@ async def compute_seeg_activity(
         raise HTTPException(status_code=404, detail="Recording file missing on disk")
 
     from services.seeg_service import (
-        compute_band_activity, parse_seeg_h5, join_channels_to_contacts, load_mni_rows, BANDS,
+        compute_band_activity, compute_continuous_traces, parse_seeg_h5,
+        join_channels_to_contacts, BANDS,
     )
     if req.band not in BANDS:
         raise HTTPException(status_code=400, detail=f"band must be one of {sorted(BANDS)}")
-
-    window = tuple(req.window_ms) if req.window_ms else (-200.0, 800.0)
-    if len(window) != 2 or not (window[0] < 0 < window[1]):
-        raise HTTPException(status_code=400,
-                            detail="window_ms must be [start, end] with start < 0 < end")
+    if req.mode not in ("trial", "scroll"):
+        raise HTTPException(status_code=400, detail="mode must be 'trial' or 'scroll'")
 
     # Signal processing is CPU-bound; keep the event loop responsive.
     loop = asyncio.get_event_loop()
     try:
-        activity = await loop.run_in_executor(
-            None, lambda: compute_band_activity(h5_path, req.band, window)
-        )
+        if req.mode == "scroll":
+            activity = await loop.run_in_executor(
+                None, lambda: compute_continuous_traces(h5_path, req.band)
+            )
+        else:
+            window = tuple(req.window_ms) if req.window_ms else (-200.0, 800.0)
+            if len(window) != 2 or not (window[0] < 0 < window[1]):
+                raise HTTPException(status_code=400,
+                                    detail="window_ms must be [start, end] with start < 0 < end")
+            activity = await loop.run_in_executor(
+                None, lambda: compute_band_activity(h5_path, req.band, window)
+            )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
     meta = await loop.run_in_executor(None, parse_seeg_h5, h5_path)
     native = await _gather_native_contacts(db, recon_id)
-    recon_dir = _recon_dir_for(recon)
-    mni_rows = load_mni_rows(recon_dir) if recon_dir else None
-    join = join_channels_to_contacts(meta["channels"], native, mni_rows)
+    join = join_channels_to_contacts(meta["channels"], native, None)
 
     return {
         **activity,
         "coords_native": join["coords_native"],
-        "coords_mni": join["coords_mni"],
         "matched": join["matched"],
         "unmatched_channels": join["unmatched_channels"],
         "unmatched_contacts": join["unmatched_contacts"],
-        "has_mni": bool(join["coords_mni"]),
         "attrs": meta["attrs"],
     }
 

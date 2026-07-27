@@ -76,6 +76,16 @@ export const useAppStore = create((set, get) => ({
   setSeegPre: (v) => set({ seegPre: v }),
   seegPost: 800,
   setSeegPost: (v) => set({ seegPost: v }),
+  seegMode: 'trial',             // 'trial' (trial-averaged) | 'scroll' (continuous)
+  setSeegMode: (m) => set({ seegMode: m }),
+  seegTraceSignal: 'z',          // 'z' (band-power z) | 'raw' (voltage)
+  setSeegTraceSignal: (s) => set({ seegTraceSignal: s }),
+  seegTraceScope: 'all',         // 'all' | 'shaft'
+  setSeegTraceScope: (s) => set({ seegTraceScope: s }),
+  seegTraceShaft: null,          // selected shaft when scope === 'shaft'
+  setSeegTraceShaft: (s) => set({ seegTraceShaft: s }),
+  seegTracePanelW: 400,          // right trace-panel width (px), user-resizable
+  setSeegTracePanelW: (w) => set({ seegTracePanelW: w }),
   seegTimeIndex: 0,
   setSeegTimeIndex: (i) => set({ seegTimeIndex: i }),
   seegPlaying: false,

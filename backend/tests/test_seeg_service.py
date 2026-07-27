@@ -88,10 +88,14 @@ def test_event_activity_rise():
         make_fake_h5(p, chans, active=active, n_trials=20, duration_s=60)
         out = S.compute_band_activity(p, band="high_gamma")
         assert out["channels"] == chans
+        assert out["mode"] == "trial" and out["time_unit"] == "ms"
+        assert out["groups"] == ["LAH", "LAH", "LAH", "LPH"]
         act = np.array(out["activity"])                     # (frames, channels)
+        raw = np.array(out["raw"])                          # (frames, channels) uV ERP
         times = np.array(out["times"])                      # ms, post-stimulus only
         assert act.shape[0] == len(times)
         assert act.shape[1] == len(chans)
+        assert raw.shape == act.shape and np.isfinite(raw).all()
         # Output is post-stimulus only (t >= 0); the baseline is not returned.
         assert times.min() >= 0
         # Active channels show a strong positive baseline-z in the burst (0..400 ms);
@@ -120,6 +124,23 @@ def test_degenerate_channel_finite():
     print("ok test_degenerate_channel_finite")
 
 
+def test_continuous_traces():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "f.h5")
+        chans = ["LAH1", "LAH2", "LPH1"]
+        make_fake_h5(p, chans, active=["LAH2"], n_trials=15, duration_s=30)
+        out = S.compute_continuous_traces(p, band="high_gamma")
+        assert out["mode"] == "scroll" and out["time_unit"] == "s"
+        assert out["channels"] == chans
+        act = np.array(out["activity"]); raw = np.array(out["raw"])
+        t = np.array(out["times"])
+        assert act.shape == raw.shape == (len(t), len(chans))
+        assert np.isfinite(act).all() and np.isfinite(raw).all()
+        assert t.min() >= 0 and t.max() <= 30.0
+        assert act.shape[0] <= 2500
+    print("ok test_continuous_traces")
+
+
 def test_window_param():
     # The peri-stimulus window controls the time axis span.
     with tempfile.TemporaryDirectory() as d:
@@ -141,6 +162,7 @@ if __name__ == "__main__":
     test_group_disambiguation()
     test_name_join()
     test_degenerate_channel_finite()
+    test_continuous_traces()
     test_window_param()
     test_event_activity_rise()
     print("\nALL PASSED")
