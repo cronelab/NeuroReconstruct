@@ -86,6 +86,10 @@ export const useAppStore = create((set, get) => ({
   setSeegTraceShaft: (s) => set({ seegTraceShaft: s }),
   seegTracePanelW: 400,          // right trace-panel width (px), user-resizable
   setSeegTracePanelW: (w) => set({ seegTracePanelW: w }),
+  seegBrainOpacity: 0.4,         // native-brain surface opacity in the sEEG view
+  setSeegBrainOpacity: (v) => set({ seegBrainOpacity: v }),
+  seegStructureOpacity: 0.4,     // structure-overlay opacity in the sEEG view
+  setSeegStructureOpacity: (v) => set({ seegStructureOpacity: v }),
   seegTimeIndex: 0,
   setSeegTimeIndex: (i) => set({ seegTimeIndex: i }),
   seegPlaying: false,

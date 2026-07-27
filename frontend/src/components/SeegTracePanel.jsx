@@ -1,12 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
-
-// Stable-ish color per shaft, from a small categorical palette keyed by shaft name.
-const PALETTE = ['#4dd0e1', '#ffb74d', '#ba68c8', '#81c784', '#f06292', '#7986cb',
-  '#a1887f', '#4db6ac', '#dce775', '#ff8a65', '#90a4ae', '#e57373'];
-function shaftColor(group, shaftsList) {
-  const i = Math.max(0, shaftsList.indexOf(group));
-  return PALETTE[i % PALETTE.length];
-}
+import { shaftColorOf as shaftColor } from '../seegColors';
 
 const seg = (active) => ({
   padding: '3px 9px', fontSize: 10, fontFamily: 'IBM Plex Mono, monospace', cursor: 'pointer',
@@ -27,7 +20,7 @@ const GUTTER = 68;
 export default function SeegTracePanel({
   data, signal, setSignal, scope, setScope, shaft, setShaft,
   domain, timeIndex, setTimeIndex, hoveredChannel, setHoveredChannel,
-  width: panelW, setWidth: setPanelW, playing, setPlaying,
+  width: panelW, setWidth: setPanelW, playing, setPlaying, shaftColors,
 }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
@@ -112,7 +105,7 @@ export default function SeegTracePanel({
       ctx.fillStyle = hot ? '#e8edf2' : '#8a97a6';
       ctx.fillText(r.name, 6, yc);
       // trace
-      ctx.strokeStyle = shaftColor(r.group, shafts); ctx.lineWidth = hot ? 1.6 : 1;
+      ctx.strokeStyle = shaftColor(r.group, shaftColors); ctx.lineWidth = hot ? 1.6 : 1;
       ctx.globalAlpha = hot ? 1 : 0.85;
       ctx.beginPath();
       let started = false;
@@ -125,7 +118,7 @@ export default function SeegTracePanel({
       ctx.stroke();
       ctx.globalAlpha = 1;
     });
-  }, [data, rows, signal, domain, hoveredChannel, width, canvasH, nT, isRaw, rawScale, shafts]);
+  }, [data, rows, signal, domain, hoveredChannel, width, canvasH, nT, isRaw, rawScale, shaftColors]);
 
   // ── Cursor + interaction ───────────────────────────────────────────────────
   const plotW = width - GUTTER;
@@ -166,6 +159,22 @@ export default function SeegTracePanel({
   const tUnit = data.time_unit || 'ms';
   const tVal = data.times[timeIndex];
 
+  // Editable current-time field: type a timestamp and jump to the nearest frame.
+  const [editingTime, setEditingTime] = useState(false);
+  const [timeDraft, setTimeDraft] = useState('');
+  const commitTime = () => {
+    const v = parseFloat(timeDraft);
+    if (!isNaN(v) && nT > 0) {
+      let best = 0, bd = Infinity;
+      for (let i = 0; i < nT; i++) {
+        const d = Math.abs(data.times[i] - v);
+        if (d < bd) { bd = d; best = i; }
+      }
+      setPlaying(false); setTimeIndex(best);
+    }
+    setEditingTime(false);
+  };
+
   return (
     <div style={{ width: panelW, flexShrink: 0, height: '100%', background: '#0d1015',
       borderLeft: '1px solid #1e2530', display: 'flex', flexDirection: 'column', position: 'relative' }}>
@@ -197,8 +206,18 @@ export default function SeegTracePanel({
           </select>
         )}
         <div style={{ flex: 1 }} />
-        <span style={{ fontSize: 11, color: '#e8edf2', fontFamily: 'IBM Plex Mono, monospace' }}>
-          {tVal}{tUnit === 'ms' ? ' ms' : ' s'}
+        <input
+          value={editingTime ? timeDraft : `${tVal}`}
+          onFocus={() => { setEditingTime(true); setTimeDraft(String(tVal)); }}
+          onChange={(e) => setTimeDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') { commitTime(); e.currentTarget.blur(); } }}
+          onBlur={commitTime}
+          title="Type a time and press Enter to jump to it"
+          style={{ width: 60, padding: '3px 6px', background: '#111418', color: '#e8edf2',
+            border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, textAlign: 'right',
+            fontFamily: 'IBM Plex Mono, monospace' }} />
+        <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace' }}>
+          {tUnit === 'ms' ? 'ms' : 's'}
         </span>
         <span style={{ fontSize: 10, color: '#7a8a99' }}>{rows.length} ch</span>
       </div>

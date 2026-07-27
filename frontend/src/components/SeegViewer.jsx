@@ -5,6 +5,8 @@ import {
 } from '../api';
 import SeegViewer3D, { activityColor } from './SeegViewer3D';
 import SeegTracePanel from './SeegTracePanel';
+import StructurePanel from './StructurePanel';
+import { buildShaftColorMap } from '../seegColors';
 
 const BANDS = [
   ['delta', 'Delta 1–4'], ['theta', 'Theta 4–8'], ['alpha', 'Alpha 8–13'],
@@ -12,7 +14,7 @@ const BANDS = [
 ];
 
 const panel = {
-  width: 320, flexShrink: 0, background: '#0d1015', borderRight: '1px solid #1e2530',
+  width: 380, flexShrink: 0, background: '#0d1015', borderRight: '1px solid #1e2530',
   padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 16,
   fontFamily: 'IBM Plex Sans, sans-serif', color: '#c8d4e0',
 };
@@ -48,12 +50,15 @@ export default function SeegViewer({ reconId, onBack }) {
     seegMode, setSeegMode,
     seegTraceSignal, setSeegTraceSignal, seegTraceScope, setSeegTraceScope,
     seegTraceShaft, setSeegTraceShaft, seegTracePanelW, setSeegTracePanelW,
+    seegBrainOpacity, setSeegBrainOpacity, seegStructureOpacity, setSeegStructureOpacity,
     seegTimeIndex, setSeegTimeIndex, seegPlaying, setSeegPlaying,
+    // Structures live in the global store so the shared StructurePanel (master
+    // toggle + hierarchical tri-state + opacity) drives both this view and the
+    // main reconstruction viewer consistently.
+    structuresData, setStructuresData, structureVisible,
   } = useAppStore();
 
   const [nativeMesh, setNativeMesh] = useState(null);
-  const [structuresData, setStructuresData] = useState(null);
-  const [showStructures, setShowStructures] = useState(false);
   const [hoveredChannel, setHoveredChannel] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [computing, setComputing] = useState(false);
@@ -81,8 +86,14 @@ export default function SeegViewer({ reconId, onBack }) {
       if (r.data.length && !seegRecordingId) setSeegRecordingId(r.data[0].id);
     }).catch(() => {});
     getMesh(reconId).then((r) => setNativeMesh(r.data)).catch(() => setNativeMesh(null));
-    getStructures(reconId).then((r) => setStructuresData(r.data || null)).catch(() => setStructuresData(null));
   }, [reconId]);
+
+  // Structures load on demand via the StructurePanel's "Load" button (matches the
+  // main viewer); reuses whatever is already cached in the store.
+  const handleLoadStructures = async () => {
+    const r = await getStructures(reconId);
+    setStructuresData(r.data || {});
+  };
 
   // ── Compute activity whenever recording / band / window changes ───────────────
   useEffect(() => {
@@ -108,6 +119,11 @@ export default function SeegViewer({ reconId, onBack }) {
     return () => clearInterval(id);
   }, [seegPlaying, nFrames]);
 
+  // Shaft colors come from the reconstruction's own shafts, so a shaft is the same
+  // color here as in the reconstruction / electrode-editor viewers.
+  const shaftColors = useMemo(
+    () => buildShaftColorMap(reconstruction?.electrode_shafts), [reconstruction]);
+
   // ── Domain (color-scale half-range): robust max of |activity| ─────────────────
   const domain = useMemo(() => {
     if (!seegActivity?.activity?.length) return 6;
@@ -126,7 +142,7 @@ export default function SeegViewer({ reconId, onBack }) {
     seegActivity.channels.forEach((name, i) => {
       const c = coordsMap[name];
       if (!c) return;
-      out.push({ name, value: frame[i] ?? 0, pos: [c[0], c[1], c[2]] });
+      out.push({ name, group: seegActivity.groups?.[i] || '', value: frame[i] ?? 0, pos: [c[0], c[1], c[2]] });
     });
     return out;
   }, [seegActivity, surfaceMesh, seegTimeIndex]);
@@ -185,11 +201,11 @@ export default function SeegViewer({ reconId, onBack }) {
         {/* Band */}
         <div>
           <div style={label}>Frequency band</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            {BANDS.map(([key, txt]) => (
-              <div key={key} onClick={() => setSeegBand(key)} style={seg(seegBand === key)}>{txt}</div>
-            ))}
-          </div>
+          <select value={seegBand} onChange={(e) => setSeegBand(e.target.value)}
+            style={{ width: '100%', padding: '6px 8px', background: '#111418', color: '#c8d4e0',
+              border: '1px solid #2a3340', borderRadius: 4, fontSize: 12, fontFamily: 'IBM Plex Mono, monospace' }}>
+            {BANDS.map(([key, txt]) => <option key={key} value={key}>{txt}</option>)}
+          </select>
         </div>
 
         {/* Mapping mode */}
@@ -197,7 +213,7 @@ export default function SeegViewer({ reconId, onBack }) {
           <div style={label}>Mapping mode</div>
           <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
             <div onClick={() => setSeegMode('trial')} style={{ ...seg(seegMode === 'trial'), flex: 1, textAlign: 'center' }}>Trial-averaged</div>
-            <div onClick={() => setSeegMode('scroll')} style={{ ...seg(seegMode === 'scroll'), flex: 1, textAlign: 'center' }}>Scrollable</div>
+            <div onClick={() => setSeegMode('scroll')} style={{ ...seg(seegMode === 'scroll'), flex: 1, textAlign: 'center' }}>Continuous</div>
           </div>
 
           {seegMode === 'scroll' ? (
@@ -236,20 +252,29 @@ export default function SeegViewer({ reconId, onBack }) {
 
         <ColorBar domain={domain} />
 
-        {/* Brain structures overlay */}
+        {/* Brain surface opacity */}
         <div>
-          <div style={label}>Brain structures</div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <div onClick={() => setShowStructures(false)}
-              style={{ ...seg(!showStructures), flex: 1, textAlign: 'center' }}>Off</div>
-            <div onClick={() => structuresData && setShowStructures(true)}
-              style={{ ...seg(showStructures), flex: 1, textAlign: 'center',
-                opacity: structuresData ? 1 : 0.4, cursor: structuresData ? 'pointer' : 'not-allowed' }}
-              title={structuresData ? '' : 'No computed structures for this reconstruction'}>On</div>
+          <div style={label}>Brain surface opacity</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <input type="range" min={0} max={1} step={0.05} value={seegBrainOpacity}
+              onChange={(e) => setSeegBrainOpacity(parseFloat(e.target.value))}
+              style={{ flex: 1, accentColor: '#00d4ff' }} />
+            <span style={{ fontSize: 11, fontFamily: 'IBM Plex Mono, monospace', color: '#7a8a99', width: 34, textAlign: 'right' }}>
+              {Math.round(seegBrainOpacity * 100)}%
+            </span>
           </div>
-          <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 6 }}>
-            Hover a contact to name the structure it sits in.
-          </div>
+        </div>
+
+        {/* Brain structures — master toggle, opacity, hierarchical tri-state tree
+            (shared with the reconstruction viewer). Hover a contact to name its
+            structure. */}
+        <div style={{ margin: '0 -16px', borderTop: '1px solid #1e2530' }}>
+          <StructurePanel
+            onLoadStructures={handleLoadStructures}
+            structureOpacity={seegStructureOpacity}
+            setStructureOpacity={setSeegStructureOpacity}
+            maxHeight={320}
+          />
         </div>
 
         {/* Coverage */}
@@ -286,8 +311,11 @@ export default function SeegViewer({ reconId, onBack }) {
           meshData={surfaceMesh}
           contacts={contacts}
           domain={domain}
+          brainOpacity={seegBrainOpacity}
           structuresData={structuresData}
-          showStructures={showStructures}
+          structureVisible={structureVisible}
+          structureOpacity={seegStructureOpacity}
+          shaftColors={shaftColors}
           hoveredChannel={hoveredChannel}
           onHoverContact={setHoveredChannel}
           loading={computing || !surfaceMesh}
@@ -313,6 +341,7 @@ export default function SeegViewer({ reconId, onBack }) {
           hoveredChannel={hoveredChannel} setHoveredChannel={setHoveredChannel}
           width={seegTracePanelW} setWidth={setSeegTracePanelW}
           playing={seegPlaying} setPlaying={setSeegPlaying}
+          shaftColors={shaftColors}
         />
       )}
     </div>

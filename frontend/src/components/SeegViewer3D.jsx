@@ -1,13 +1,14 @@
 import React, { useMemo, useEffect, useState, useCallback } from 'react';
 import { Canvas, useThree } from '@react-three/fiber';
-import { OrbitControls, Html, PerspectiveCamera } from '@react-three/drei';
+import { OrbitControls, Html, PerspectiveCamera, Billboard } from '@react-three/drei';
 import * as THREE from 'three';
 import { buildStructureMeshes, structureAtPoint } from '../anatomy';
+import { shaftColorOf } from '../seegColors';
 
-// ── Diverging color scale (blue → grey → red), modeled on webfm's dotColorScale ──
+// ── Diverging color scale (blue → white → red), modeled on webfm's dotColorScale ──
 // Domain is symmetric [-domain, +domain] in baseline-z units; values clamp.
 const NEG = [0x33, 0x77, 0xff];   // blue  (suppression)
-const MID = [0x60, 0x66, 0x70];   // grey  (baseline)
+const MID = [0xff, 0xff, 0xff];   // white (baseline / zero z)
 const POS = [0xff, 0x44, 0x33];   // red   (activation)
 
 function lerp(a, b, t) { return a + (b - a) * t; }
@@ -57,52 +58,41 @@ function StructureMesh({ meshData, color, opacity }) {
   );
 }
 
+// ── Highlight ring (billboard so it always faces the camera) — mirrors Viewer3D ──
+function ContactRing({ position, radius, color }) {
+  return (
+    <group position={position}>
+      <Billboard>
+        <mesh>
+          <ringGeometry args={[radius * 1.7, radius * 2.5, 48]} />
+          <meshBasicMaterial color={color} transparent opacity={0.92} side={THREE.DoubleSide} />
+        </mesh>
+      </Billboard>
+    </group>
+  );
+}
+
 // ── Activity-driven contact sphere ────────────────────────────────────────────────
-function ActivityContact({ position, value, label, domain, baseRadius, regionOf, highlighted, onHover, onUnhover }) {
-  const [hovered, setHovered] = useState(false);
-  const [region, setRegion] = useState(null);
+// The hover tooltip + ring are rendered once by the parent (electrode-centric hover,
+// matching Viewer3D); this just reports enter/leave and glows when active.
+function ActivityContact({ position, value, label, group, domain, baseRadius, hiliteColor, regionOf, active, onEnter, onLeave }) {
   const color = activityColor(value, domain);
   // Radius grows with activation magnitude, mirroring webfm's |value|-scaling.
   const radius = baseRadius * (0.7 + Math.min(1.6, Math.abs(value || 0) / domain));
   const enter = (e) => {
     e.stopPropagation();
-    setHovered(true);
     document.body.style.cursor = 'pointer';
-    setRegion(regionOf ? regionOf(position) : null);
-    onHover?.(label);
+    onEnter?.({ name: label, group, pos: position, radius, value,
+      color: hiliteColor, region: regionOf ? regionOf(position) : null });
   };
-  const leave = () => { setHovered(false); document.body.style.cursor = 'default'; onUnhover?.(); };
-  const show = hovered || highlighted;
+  const leave = () => { document.body.style.cursor = 'default'; onLeave?.(); };
   return (
     <group position={position}>
       <mesh onPointerOver={enter} onPointerOut={leave}>
         <sphereGeometry args={[radius, 16, 16]} />
-        <meshPhysicalMaterial color={color} emissive={show ? color : '#000'}
-          emissiveIntensity={show ? 0.75 : 0.3} roughness={0.25} metalness={0.5} />
+        <meshPhysicalMaterial color={color} emissive={active ? hiliteColor : '#000'}
+          emissiveIntensity={active ? 0.7 : 0.2} roughness={0.25} metalness={0.5} />
       </mesh>
-      {show && (
-        <Html distanceFactor={80} center style={{ pointerEvents: 'none' }}>
-          <div style={{
-            background: 'rgba(10,12,16,0.96)', border: `1px solid ${color}`,
-            borderRadius: 4, padding: '3px 8px',
-            fontFamily: 'IBM Plex Mono, monospace', fontSize: 11, color: '#e8edf2',
-            whiteSpace: 'nowrap', boxShadow: `0 0 8px ${color}66`,
-          }}>
-            {label}
-            <span style={{ color: '#7a8a99', marginLeft: 6 }}>
-              {value >= 0 ? '+' : ''}{(value || 0).toFixed(2)}z
-            </span>
-            {region && (
-              <div style={{ color: region.color || '#9fb3c8', fontSize: 10, marginTop: 2 }}>
-                {region.label}
-                {!region.inside && region.dist != null && (
-                  <span style={{ color: '#7a8a99' }}> · {region.dist.toFixed(1)} mm</span>
-                )}
-              </div>
-            )}
-          </div>
-        </Html>
-      )}
     </group>
   );
 }
@@ -152,16 +142,17 @@ function LoadingOverlay({ message }) {
  *   meshData        native surface {vertices, faces, bounds}
  *   contacts        [{ name, pos:[x,y,z], value }]  — value at the current time index
  *   domain          color-scale half-range in baseline-z units
- *   structuresData  { key: {label, color, vertices, faces, group} } or null
- *   showStructures  render the structure overlay meshes
+ *   structuresData   { key: {label, color, vertices, faces, group} } or null
+ *   structureVisible { key: bool } — per-structure visibility (undefined = shown)
  *   structureOpacity
- *   hoveredChannel  channel name to highlight (from the trace viewer), or null
- *   onHoverContact  (name|null) => void  — report the hovered contact to the parent
+ *   brainOpacity     native-brain surface opacity
+ *   hoveredChannel   channel name to highlight (from the trace viewer), or null
+ *   onHoverContact   (name|null) => void  — report the hovered contact to the parent
  */
 export default function SeegViewer3D({
-  meshData, contacts = [], domain = 6, brainOpacity = 0.35,
-  structuresData = null, showStructures = false, structureOpacity = 0.4,
-  hoveredChannel = null, onHoverContact, loading, loadingMessage,
+  meshData, contacts = [], domain = 6, brainOpacity = 0.4,
+  structuresData = null, structureVisible = {}, structureOpacity = 0.4,
+  shaftColors = {}, hoveredChannel = null, onHoverContact, loading, loadingMessage,
 }) {
   const baseRadius = 1.8;
 
@@ -171,6 +162,26 @@ export default function SeegViewer3D({
     if (!structuresData) return null;
     return structureAtPoint(new THREE.Vector3(pos[0], pos[1], pos[2]), structuresData, structMeshes);
   }, [structuresData, structMeshes]);
+
+  // Directly-hovered contact (from pointer). Reported up for the trace cross-highlight.
+  const [hovered, setHovered] = useState(null);   // { name, pos, radius, color, region, value }
+  const handleEnter = useCallback((info) => { setHovered(info); onHoverContact?.(info.name); }, [onHoverContact]);
+  const handleLeave = useCallback(() => { setHovered(null); onHoverContact?.(null); }, [onHoverContact]);
+
+  // Effective highlight: the directly-hovered contact, else the one the trace panel
+  // is hovering (hoveredChannel) — so hover works both ways, like Viewer3D.
+  const effHover = useMemo(() => {
+    if (hovered) return hovered;
+    if (hoveredChannel) {
+      const c = contacts.find((x) => x.name === hoveredChannel);
+      if (c) return {
+        name: c.name, pos: c.pos, value: c.value,
+        radius: baseRadius * (0.7 + Math.min(1.6, Math.abs(c.value || 0) / domain)),
+        color: shaftColorOf(c.group, shaftColors), region: regionOf(c.pos),
+      };
+    }
+    return null;
+  }, [hovered, hoveredChannel, contacts, domain, shaftColors, regionOf]);
 
   return (
     <div style={{ width: '100%', height: '100%', background: '#0a0c10', position: 'relative' }}>
@@ -183,22 +194,57 @@ export default function SeegViewer3D({
 
         {meshData && !loading && <BrainSurface meshData={meshData} opacity={brainOpacity} />}
 
-        {showStructures && structuresData && Object.entries(structuresData).map(([key, s]) => (
-          s.vertices ? <StructureMesh key={key} meshData={s} color={s.color || '#6a7a8a'} opacity={structureOpacity} /> : null
+        {structuresData && Object.entries(structuresData).map(([key, s]) => (
+          s.vertices && structureVisible?.[key] !== false
+            ? <StructureMesh key={key} meshData={s} color={s.color || '#6a7a8a'} opacity={structureOpacity} />
+            : null
         ))}
 
         {!loading && contacts.map((c) => (
-          <ActivityContact key={c.name} position={c.pos} value={c.value} label={c.name}
+          <ActivityContact key={c.name} position={c.pos} value={c.value} label={c.name} group={c.group}
             domain={domain} baseRadius={baseRadius} regionOf={regionOf}
-            highlighted={hoveredChannel === c.name}
-            onHover={onHoverContact} onUnhover={() => onHoverContact?.(null)} />
+            hiliteColor={shaftColorOf(c.group, shaftColors)}
+            active={effHover?.name === c.name}
+            onEnter={handleEnter} onLeave={handleLeave} />
         ))}
+
+        {/* Electrode-centric highlight ring (shaft color), matching Viewer3D. */}
+        {effHover && <ContactRing position={effHover.pos} radius={effHover.radius} color={effHover.color} />}
 
         <OrbitControls enablePan enableZoom enableRotate
           zoomSpeed={1.2} panSpeed={0.8} rotateSpeed={0.6}
           mouseButtons={{ LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN }}
         />
       </Canvas>
+
+      {/* Electrode-centric hover tooltip — fixed top-right, matches Viewer3D. */}
+      {effHover && (
+        <div style={{
+          position: 'absolute', top: 16, right: 16, pointerEvents: 'none',
+          background: 'rgba(10,12,16,0.92)', border: `1px solid ${effHover.color}`,
+          borderRadius: 4, padding: '8px 14px', maxWidth: 280,
+          fontFamily: 'IBM Plex Mono, monospace', boxShadow: `0 0 12px ${effHover.color}44`,
+        }}>
+          <div style={{ color: effHover.color, fontSize: 15, fontWeight: 600 }}>
+            {effHover.name}
+            <span style={{ color: '#9fb3c8', fontWeight: 400, marginLeft: 8 }}>
+              {effHover.value >= 0 ? '+' : ''}{(effHover.value || 0).toFixed(2)} z
+            </span>
+          </div>
+          {effHover.region ? (
+            effHover.region.inside ? (
+              <div style={{ color: effHover.region.color, fontSize: 13, marginTop: 3 }}>{effHover.region.label}</div>
+            ) : (
+              <div style={{ marginTop: 3 }}>
+                <div style={{ color: effHover.region.color, fontSize: 13 }}>{effHover.region.label}</div>
+                <span style={{ color: '#7a8a99', fontSize: 12 }}>nearest · {effHover.region.dist.toFixed(1)} mm</span>
+              </div>
+            )
+          ) : (
+            <span style={{ color: '#7a8a99', fontSize: 13 }}>unlabelled</span>
+          )}
+        </div>
+      )}
 
       <div style={{
         position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)',
