@@ -42,7 +42,8 @@ export default function SeegViewer({ reconId, onBack }) {
   const {
     reconstruction, setReconstruction,
     seegRecordings, setSeegRecordings, seegRecordingId, setSeegRecordingId,
-    seegActivity, setSeegActivity, seegBand, setSeegBand, seegMode, setSeegMode,
+    seegActivity, setSeegActivity, seegBand, setSeegBand,
+    seegPre, setSeegPre, seegPost, setSeegPost,
     seegSurface, setSeegSurface, seegTemplateMesh, setSeegTemplateMesh,
     seegTimeIndex, setSeegTimeIndex, seegPlaying, setSeegPlaying,
   } = useAppStore();
@@ -52,6 +53,18 @@ export default function SeegViewer({ reconId, onBack }) {
   const [computing, setComputing] = useState(false);
   const [error, setError] = useState(null);
   const fileRef = useRef(null);
+
+  // Draft window inputs — applied to the store (which triggers recompute) only on
+  // commit, so typing doesn't fire a recompute on every keystroke.
+  const [preDraft, setPreDraft] = useState(seegPre);
+  const [postDraft, setPostDraft] = useState(seegPost);
+  useEffect(() => { setPreDraft(seegPre); setPostDraft(seegPost); }, [seegPre, seegPost]);
+  const windowDirty = preDraft !== seegPre || postDraft !== seegPost;
+  const applyWindow = () => {
+    const pre = Math.max(10, Math.min(2000, Math.round(Number(preDraft) || 0)));
+    const post = Math.max(50, Math.min(4000, Math.round(Number(postDraft) || 0)));
+    setSeegPre(pre); setSeegPost(post);
+  };
 
   // ── Initial load: reconstruction, recordings, surfaces ────────────────────────
   useEffect(() => {
@@ -67,17 +80,17 @@ export default function SeegViewer({ reconId, onBack }) {
     }
   }, [reconId]);
 
-  // ── Compute activity whenever recording / band / mode changes ─────────────────
+  // ── Compute activity whenever recording / band / window changes ───────────────
   useEffect(() => {
     if (!reconId || !seegRecordingId) return;
     setComputing(true);
     setError(null);
     setSeegPlaying(false);
-    computeSeegActivity(reconId, seegRecordingId, { band: seegBand, mode: seegMode })
+    computeSeegActivity(reconId, seegRecordingId, { band: seegBand, window_ms: [-seegPre, seegPost] })
       .then((r) => setSeegActivity(r.data))
       .catch((e) => { setError(e?.response?.data?.detail || 'Could not compute activity'); setSeegActivity(null); })
       .finally(() => setComputing(false));
-  }, [reconId, seegRecordingId, seegBand, seegMode]);
+  }, [reconId, seegRecordingId, seegBand, seegPre, seegPost]);
 
   // If MNI coords aren't available for this recording, force native surface.
   const hasMni = seegActivity?.has_mni;
@@ -138,11 +151,7 @@ export default function SeegViewer({ reconId, onBack }) {
     }
   };
 
-  const timeLabel = seegActivity
-    ? (seegActivity.mode === 'event'
-        ? `${seegActivity.times[seegTimeIndex]} ms`
-        : `${seegActivity.times[seegTimeIndex]} s`)
-    : '';
+  const timeLabel = seegActivity ? `${seegActivity.times[seegTimeIndex]} ms` : '';
 
   const matchedN = seegActivity?.matched?.length || 0;
   const unmatchedN = seegActivity?.unmatched_channels?.length || 0;
@@ -187,12 +196,38 @@ export default function SeegViewer({ reconId, onBack }) {
           </div>
         </div>
 
-        {/* Mode */}
+        {/* Trial-averaged mapping — peri-stimulus window */}
         <div>
-          <div style={label}>Time model</div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <div onClick={() => setSeegMode('event')} style={{ ...seg(seegMode === 'event'), flex: 1, textAlign: 'center' }}>Event-related</div>
-            <div onClick={() => setSeegMode('continuous')} style={{ ...seg(seegMode === 'continuous'), flex: 1, textAlign: 'center' }}>Continuous</div>
+          <div style={label}>Mapping mode</div>
+          <div style={{ fontSize: 11, color: '#c8d4e0', fontFamily: 'IBM Plex Mono, monospace', marginBottom: 12 }}>
+            Trial-averaged
+            <span style={{ color: '#4a5568', marginLeft: 8 }}>· stimulus-locked, averaged across trials</span>
+          </div>
+          <div style={label}>Peri-stimulus window (ms)</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <span style={{ fontSize: 10, color: '#7a8a99' }}>−</span>
+              <input type="number" min={10} max={2000} step={50} value={preDraft}
+                onChange={(e) => setPreDraft(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && applyWindow()}
+                style={{ width: 56, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
+                  border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }} />
+            </div>
+            <span style={{ fontSize: 10, color: '#4a5568' }}>to</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <span style={{ fontSize: 10, color: '#7a8a99' }}>+</span>
+              <input type="number" min={50} max={4000} step={50} value={postDraft}
+                onChange={(e) => setPostDraft(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && applyWindow()}
+                style={{ width: 56, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
+                  border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }} />
+            </div>
+            <button onClick={applyWindow} disabled={!windowDirty}
+              style={{ ...seg(windowDirty), padding: '4px 10px', opacity: windowDirty ? 1 : 0.4,
+                cursor: windowDirty ? 'pointer' : 'default' }}>Apply</button>
+          </div>
+          <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 5 }}>
+            relative to stimulus onset · baseline = pre-onset window
           </div>
         </div>
 
@@ -230,7 +265,7 @@ export default function SeegViewer({ reconId, onBack }) {
               </div>
             )}
             <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 4 }}>
-              {seegActivity.mode === 'event' ? `${seegActivity.n_trials} trials averaged` : 'continuous segment'}
+              {seegActivity.n_trials} trials averaged
             </div>
           </div>
         )}
@@ -274,9 +309,7 @@ export default function SeegViewer({ reconId, onBack }) {
               style={{ flex: 1, accentColor: '#00d4ff' }} />
             <span style={{ minWidth: 78, textAlign: 'right', fontSize: 12, color: '#e8edf2',
               fontFamily: 'IBM Plex Mono, monospace' }}>{timeLabel}</span>
-            {seegActivity.mode === 'event' && (
-              <span style={{ fontSize: 10, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace' }}>peri-stimulus</span>
-            )}
+            <span style={{ fontSize: 10, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace' }}>peri-stimulus</span>
           </div>
         )}
       </div>

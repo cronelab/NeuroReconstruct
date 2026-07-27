@@ -86,7 +86,7 @@ def test_event_activity_rise():
         chans = ["LAH1", "LAH2", "LAH3", "LPH1"]
         active = ["LAH2", "LAH3"]
         make_fake_h5(p, chans, active=active, n_trials=20, duration_s=60)
-        out = S.compute_band_activity(p, band="high_gamma", mode="event")
+        out = S.compute_band_activity(p, band="high_gamma")
         assert out["channels"] == chans
         act = np.array(out["activity"])                     # (frames, channels)
         times = np.array(out["times"])                      # ms
@@ -115,24 +115,24 @@ def test_degenerate_channel_finite():
         make_fake_h5(p, chans, active=["LAH2"], n_trials=15, duration_s=40)
         with h5py.File(p, "r+") as h5:
             h5["ieeg/rate_2000hz/data"][:, 0] = 0.0   # zero out LAH1
-        for mode in ("event", "continuous"):
-            out = S.compute_band_activity(p, band="high_gamma", mode=mode)
-            act = np.array(out["activity"])
-            assert np.isfinite(act).all(), f"{mode}: non-finite values leaked through"
+        out = S.compute_band_activity(p, band="high_gamma")
+        act = np.array(out["activity"])
+        assert np.isfinite(act).all(), "non-finite values leaked through"
     print("ok test_degenerate_channel_finite")
 
 
-def test_continuous_shape():
+def test_window_param():
+    # The peri-stimulus window controls the time axis span.
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "f.h5")
         chans = ["LAH1", "LAH2"]
-        make_fake_h5(p, chans, active=["LAH2"], n_trials=10, duration_s=30)
-        out = S.compute_band_activity(p, band="beta", mode="continuous")
-        act = np.array(out["activity"])
-        assert act.shape[1] == 2
-        assert act.shape[0] == len(out["times"])
-        assert act.shape[0] <= S.MAX_OUTPUT_FRAMES
-    print("ok test_continuous_shape")
+        make_fake_h5(p, chans, active=["LAH2"], n_trials=15, duration_s=40)
+        out = S.compute_band_activity(p, band="high_gamma", window_ms=(-100.0, 500.0))
+        t = np.array(out["times"])
+        assert t.min() >= -100.5 and t.min() < -95, t.min()
+        assert 495 < t.max() <= 500.5, t.max()
+        assert np.array(out["activity"]).shape[0] == len(t)
+    print("ok test_window_param")
 
 
 if __name__ == "__main__":
@@ -141,6 +141,6 @@ if __name__ == "__main__":
     test_group_disambiguation()
     test_name_join()
     test_degenerate_channel_finite()
-    test_continuous_shape()
+    test_window_param()
     test_event_activity_rise()
     print("\nALL PASSED")

@@ -43,8 +43,7 @@ BANDS = {
 }
 
 DEFAULT_BAND = "high_gamma"
-DEFAULT_WINDOW_MS = (-200.0, 800.0)   # peri-stimulus window for event-related mode
-DEFAULT_BASELINE_MS = (-200.0, 0.0)   # baseline window (relative to stimulus onset)
+DEFAULT_WINDOW_MS = (-200.0, 800.0)   # peri-stimulus window (relative to onset)
 MAX_OUTPUT_FRAMES = 1500              # cap frames sent to the client per request
 
 
@@ -189,52 +188,41 @@ def _band_envelope(sig: np.ndarray, fs: float, band: tuple) -> np.ndarray:
     return env.astype(np.float32)
 
 
-def _decimate_frames(env: np.ndarray, fs: float, max_frames: int):
-    """
-    Downsample an envelope (n_samples, n_channels) along time to <= max_frames.
-    Returns (frames (F, C), times_s (F,)).
-    """
-    n = env.shape[0]
-    if n <= max_frames:
-        idx = np.arange(n)
-    else:
-        step = int(np.ceil(n / max_frames))
-        idx = np.arange(0, n, step)
-    times = idx / fs
-    return env[idx], times.astype(np.float32)
-
-
-def compute_band_activity(path: str, band: str = DEFAULT_BAND, mode: str = "event",
+def compute_band_activity(path: str, band: str = DEFAULT_BAND,
                           window_ms: tuple = DEFAULT_WINDOW_MS,
-                          baseline_ms: tuple = DEFAULT_BASELINE_MS,
+                          baseline_ms: tuple = None,
                           max_frames: int = MAX_OUTPUT_FRAMES) -> dict:
     """
-    Compute the display activity matrix for one h5 recording.
+    Compute the event-related display activity matrix for one h5 recording.
 
-    band:  key in BANDS.
-    mode:  'continuous' -> baseline-normalized envelope over the whole segment,
-                           decimated to <= max_frames.
-           'event'      -> epoch each channel around every trial onset, z-score to
-                           its pre-onset baseline, average across trials, over the
-                           peri-stimulus window.
+    Epochs each channel around every ``/trials`` onset over the peri-stimulus
+    ``window_ms`` [start, end] (start < 0 < end, relative to onset), z-scores each
+    epoch to its pre-onset baseline, and averages across trials.
+
+    band:        key in BANDS.
+    window_ms:   peri-stimulus window in ms [start, end], start < 0 < end.
+    baseline_ms: baseline window in ms [start, end]; defaults to the entire
+                 pre-stimulus interval [window_ms[0], 0].
 
     Returns:
       channels: [name, ...]              (mappable channels, order matches columns)
-      times:    [t, ...]                 seconds (continuous) or ms (event)
+      times:    [t_ms, ...]              peri-stimulus time in ms
       activity: [[v, ...], ...]          shape (n_frames, n_channels), baseline z
-      mode, band, n_trials
+      band, n_trials
     """
     import h5py
 
     if band not in BANDS:
         raise ValueError(f"unknown band {band!r}; options: {sorted(BANDS)}")
+    if baseline_ms is None:
+        baseline_ms = (window_ms[0], 0.0)
     meta = parse_seeg_h5(path)
     fs = meta["rate_hz"]
     cols = [c["col"] for c in meta["channels"]]
     names = [c["name"] for c in meta["channels"]]
     if not cols:
         return {"channels": [], "times": [], "activity": [],
-                "mode": mode, "band": band, "n_trials": len(meta["trials"])}
+                "band": band, "n_trials": len(meta["trials"])}
 
     with h5py.File(path, "r") as h5:
         # Load only the mappable columns (h5py fancy-indexing needs sorted, unique).
@@ -248,30 +236,11 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND, mode: str = "even
 
     env = _band_envelope(sig, fs, BANDS[band])
 
-    if mode == "continuous":
-        frames, times = _decimate_frames(env, fs, max_frames)
-        # Baseline-normalize each channel to its own first-second stats so the
-        # diverging color map is centered and comparable across channels.
-        base_n = max(int(fs), 1)
-        base = env[:base_n]
-        mu = base.mean(axis=0)
-        sd = base.std(axis=0) + 1e-9
-        z = (frames - mu) / sd
-        # Degenerate channels (flat / all-zero signal) can yield NaN/Inf, which is
-        # not JSON-serializable -- map them to 0 (neutral / baseline).
-        z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
-        return {
-            "channels": names,
-            "times": [round(float(t), 4) for t in times],
-            "activity": np.round(z, 3).tolist(),
-            "mode": "continuous", "band": band, "n_trials": len(meta["trials"]),
-        }
-
-    # ── Event-related: epoch around trial onsets ──────────────────────────────
+    # ── Trial-averaged: epoch around trial onsets ─────────────────────────────
     trials = meta["trials"]
     onsets = np.array([t["start_time"] for t in trials], dtype=np.float64)
     if len(onsets) == 0:
-        raise ValueError("no trials in h5 -- event-related mode needs /trials onsets")
+        raise ValueError("no trials in h5 -- event-related mapping needs /trials onsets")
 
     w0, w1 = window_ms[0] / 1000.0, window_ms[1] / 1000.0     # seconds
     pre = int(round(-w0 * fs)) if w0 < 0 else 0
@@ -317,7 +286,7 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND, mode: str = "even
         "channels": names,
         "times": [round(float(t), 2) for t in pst_times_ms],
         "activity": np.round(avg, 3).tolist(),
-        "mode": "event", "band": band, "n_trials": used,
+        "band": band, "n_trials": used,
     }
 
 

@@ -71,8 +71,11 @@ export const useAppStore = create((set, get) => ({
   setSeegActivity: (a) => set({ seegActivity: a, seegTimeIndex: 0 }),
   seegBand: 'high_gamma',
   setSeegBand: (b) => set({ seegBand: b }),
-  seegMode: 'event',             // 'event' | 'continuous'
-  setSeegMode: (m) => set({ seegMode: m }),
+  // Trial-averaged peri-stimulus window (ms magnitudes before/after onset).
+  seegPre: 200,
+  setSeegPre: (v) => set({ seegPre: v }),
+  seegPost: 800,
+  setSeegPost: (v) => set({ seegPost: v }),
   seegSurface: 'mni',            // 'mni' | 'native'
   setSeegSurface: (s) => set({ seegSurface: s }),
   seegTemplateMesh: null,        // cached MNI152 template surface

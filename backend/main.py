@@ -1259,7 +1259,7 @@ async def list_seeg(
 
 class SeegActivityRequest(BaseModel):
     band: str = "high_gamma"
-    mode: str = "event"                 # 'event' | 'continuous'
+    # Peri-stimulus window [start_ms, end_ms] relative to onset (start < 0 < end).
     window_ms: Optional[List[float]] = None
 
 
@@ -1293,16 +1293,17 @@ async def compute_seeg_activity(
     )
     if req.band not in BANDS:
         raise HTTPException(status_code=400, detail=f"band must be one of {sorted(BANDS)}")
-    if req.mode not in ("event", "continuous"):
-        raise HTTPException(status_code=400, detail="mode must be 'event' or 'continuous'")
 
     window = tuple(req.window_ms) if req.window_ms else (-200.0, 800.0)
+    if len(window) != 2 or not (window[0] < 0 < window[1]):
+        raise HTTPException(status_code=400,
+                            detail="window_ms must be [start, end] with start < 0 < end")
 
     # Signal processing is CPU-bound; keep the event loop responsive.
     loop = asyncio.get_event_loop()
     try:
         activity = await loop.run_in_executor(
-            None, lambda: compute_band_activity(h5_path, req.band, req.mode, window)
+            None, lambda: compute_band_activity(h5_path, req.band, window)
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
