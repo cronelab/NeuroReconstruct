@@ -113,6 +113,4 @@ export const computeSeegActivity = (reconId, recId, { band, window_ms } = {}) =>
   api.post(`/reconstructions/${reconId}/seeg/${recId}/activity`,
     { band, window_ms }, { timeout: 300000 });
 
-export const getMniTemplateMesh = () => api.get('/seeg/mni-template-mesh');
-
 export default api;

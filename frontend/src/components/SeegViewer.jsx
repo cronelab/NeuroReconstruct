@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { useAppStore } from '../store';
 import {
-  listSeeg, uploadSeeg, computeSeegActivity, getMniTemplateMesh, getMesh, getReconstruction,
+  listSeeg, uploadSeeg, computeSeegActivity, getMesh, getReconstruction, getStructures,
 } from '../api';
 import SeegViewer3D, { activityColor } from './SeegViewer3D';
 
@@ -44,11 +44,13 @@ export default function SeegViewer({ reconId, onBack }) {
     seegRecordings, setSeegRecordings, seegRecordingId, setSeegRecordingId,
     seegActivity, setSeegActivity, seegBand, setSeegBand,
     seegPre, setSeegPre, seegPost, setSeegPost,
-    seegSurface, setSeegSurface, seegTemplateMesh, setSeegTemplateMesh,
     seegTimeIndex, setSeegTimeIndex, seegPlaying, setSeegPlaying,
   } = useAppStore();
 
   const [nativeMesh, setNativeMesh] = useState(null);
+  const [structuresData, setStructuresData] = useState(null);
+  const [showStructures, setShowStructures] = useState(false);
+  const [hoveredChannel, setHoveredChannel] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [computing, setComputing] = useState(false);
   const [error, setError] = useState(null);
@@ -75,9 +77,7 @@ export default function SeegViewer({ reconId, onBack }) {
       if (r.data.length && !seegRecordingId) setSeegRecordingId(r.data[0].id);
     }).catch(() => {});
     getMesh(reconId).then((r) => setNativeMesh(r.data)).catch(() => setNativeMesh(null));
-    if (!seegTemplateMesh) {
-      getMniTemplateMesh().then((r) => setSeegTemplateMesh(r.data)).catch(() => {});
-    }
+    getStructures(reconId).then((r) => setStructuresData(r.data || null)).catch(() => setStructuresData(null));
   }, [reconId]);
 
   // ── Compute activity whenever recording / band / window changes ───────────────
@@ -91,12 +91,6 @@ export default function SeegViewer({ reconId, onBack }) {
       .catch((e) => { setError(e?.response?.data?.detail || 'Could not compute activity'); setSeegActivity(null); })
       .finally(() => setComputing(false));
   }, [reconId, seegRecordingId, seegBand, seegPre, seegPost]);
-
-  // If MNI coords aren't available for this recording, force native surface.
-  const hasMni = seegActivity?.has_mni;
-  useEffect(() => {
-    if (seegSurface === 'mni' && seegActivity && !hasMni) setSeegSurface('native');
-  }, [hasMni, seegActivity]);
 
   // ── Playback ──────────────────────────────────────────────────────────────────
   const nFrames = seegActivity?.times?.length || 0;
@@ -117,21 +111,20 @@ export default function SeegViewer({ reconId, onBack }) {
     return Math.max(3, Math.min(15, Math.round(m)));
   }, [seegActivity]);
 
-  // ── Resolve contacts for the current surface + time index ─────────────────────
-  const surfaceMesh = seegSurface === 'mni' ? seegTemplateMesh : nativeMesh;
+  // ── Resolve contacts (native brain space) at the current time index ───────────
+  const surfaceMesh = nativeMesh;
   const contacts = useMemo(() => {
     if (!seegActivity || !surfaceMesh) return [];
     const frame = seegActivity.activity[seegTimeIndex] || [];
-    const coordsMap = seegSurface === 'mni' ? seegActivity.coords_mni : seegActivity.coords_native;
-    const center = seegSurface === 'mni' ? (seegTemplateMesh?.center || [0, 0, 0]) : [0, 0, 0];
+    const coordsMap = seegActivity.coords_native;
     const out = [];
     seegActivity.channels.forEach((name, i) => {
       const c = coordsMap[name];
       if (!c) return;
-      out.push({ name, value: frame[i] ?? 0, pos: [c[0] - center[0], c[1] - center[1], c[2] - center[2]] });
+      out.push({ name, value: frame[i] ?? 0, pos: [c[0], c[1], c[2]] });
     });
     return out;
-  }, [seegActivity, surfaceMesh, seegSurface, seegTimeIndex, seegTemplateMesh]);
+  }, [seegActivity, surfaceMesh, seegTimeIndex]);
 
   const handleUpload = async (e) => {
     const file = e.target.files?.[0];
@@ -231,24 +224,23 @@ export default function SeegViewer({ reconId, onBack }) {
           </div>
         </div>
 
-        {/* Surface */}
-        <div>
-          <div style={label}>Brain surface</div>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <div onClick={() => hasMni && setSeegSurface('mni')}
-              style={{ ...seg(seegSurface === 'mni'), flex: 1, textAlign: 'center', opacity: hasMni ? 1 : 0.4, cursor: hasMni ? 'pointer' : 'not-allowed' }}
-              title={hasMni ? '' : 'Run "Export to MNI" on this reconstruction first'}>MNI152</div>
-            <div onClick={() => setSeegSurface('native')}
-              style={{ ...seg(seegSurface === 'native'), flex: 1, textAlign: 'center' }}>Native</div>
-          </div>
-          {!hasMni && seegActivity && (
-            <div style={{ fontSize: 10, color: '#ffab40', marginTop: 6 }}>
-              No MNI coordinates — run “Export to MNI” in the reconstruction viewer to enable the atlas surface.
-            </div>
-          )}
-        </div>
-
         <ColorBar domain={domain} />
+
+        {/* Brain structures overlay */}
+        <div>
+          <div style={label}>Brain structures</div>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <div onClick={() => setShowStructures(false)}
+              style={{ ...seg(!showStructures), flex: 1, textAlign: 'center' }}>Off</div>
+            <div onClick={() => structuresData && setShowStructures(true)}
+              style={{ ...seg(showStructures), flex: 1, textAlign: 'center',
+                opacity: structuresData ? 1 : 0.4, cursor: structuresData ? 'pointer' : 'not-allowed' }}
+              title={structuresData ? '' : 'No computed structures for this reconstruction'}>On</div>
+          </div>
+          <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 6 }}>
+            Hover a contact to name the structure it sits in.
+          </div>
+        </div>
 
         {/* Coverage */}
         {seegActivity && (
@@ -285,13 +277,17 @@ export default function SeegViewer({ reconId, onBack }) {
             meshData={surfaceMesh}
             contacts={contacts}
             domain={domain}
+            structuresData={structuresData}
+            showStructures={showStructures}
+            hoveredChannel={hoveredChannel}
+            onHoverContact={setHoveredChannel}
             loading={computing || !surfaceMesh}
             loadingMessage={computing ? 'Computing band activity…' : 'Loading surface…'}
           />
-          {seegActivity && seegSurface === 'mni' && (
+          {seegActivity && (
             <div style={{ position: 'absolute', top: 12, left: 12, fontSize: 10, color: '#7a8a99',
               fontFamily: 'IBM Plex Mono, monospace', background: '#0d1015aa', padding: '4px 8px', borderRadius: 3 }}>
-              MNI152 template · {seegActivity.band}
+              Native brain · {seegActivity.band}
             </div>
           )}
         </div>

@@ -76,10 +76,6 @@ export const useAppStore = create((set, get) => ({
   setSeegPre: (v) => set({ seegPre: v }),
   seegPost: 800,
   setSeegPost: (v) => set({ seegPost: v }),
-  seegSurface: 'mni',            // 'mni' | 'native'
-  setSeegSurface: (s) => set({ seegSurface: s }),
-  seegTemplateMesh: null,        // cached MNI152 template surface
-  setSeegTemplateMesh: (m) => set({ seegTemplateMesh: m }),
   seegTimeIndex: 0,
   setSeegTimeIndex: (i) => set({ seegTimeIndex: i }),
   seegPlaying: false,
