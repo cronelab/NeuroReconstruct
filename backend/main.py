@@ -7,6 +7,7 @@ import os
 import sys
 import uuid
 import json
+import hashlib
 import asyncio
 from typing import List, Optional
 from datetime import datetime
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from pydantic import BaseModel
 
-from database import init_db, get_db, AsyncSessionLocal, User, Reconstruction, ElectrodeShaft, ElectrodeContact, SeegRecording
+from database import init_db, get_db, AsyncSessionLocal, engine, User, Reconstruction, ElectrodeShaft, ElectrodeContact, SeegRecording
 from auth import (
     verify_password, hash_password, create_access_token,
     get_current_user, require_editor, require_admin
@@ -369,6 +370,38 @@ def _abs(path: str) -> Optional[str]:
 @app.on_event("startup")
 async def startup():
     await init_db()
+
+    # Lightweight column migration: create_all does not ALTER existing tables, so
+    # add seeg_recordings.content_hash (used for upload dedup) if it's missing.
+    from sqlalchemy import text
+    async with engine.begin() as conn:
+        cols = await conn.run_sync(
+            lambda c: [row[1] for row in c.exec_driver_sql("PRAGMA table_info(seeg_recordings)").fetchall()]
+        )
+        if cols and "content_hash" not in cols:
+            await conn.exec_driver_sql("ALTER TABLE seeg_recordings ADD COLUMN content_hash VARCHAR")
+            print("[STARTUP] Added seeg_recordings.content_hash column.")
+
+    # Backfill content_hash for legacy rows by hashing the stored file, so
+    # content-based upload dedup works retroactively for recordings uploaded
+    # before the column existed.
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(
+            select(SeegRecording).where(SeegRecording.content_hash.is_(None))
+        )).scalars().all()
+        backfilled = 0
+        for r in rows:
+            ap = _abs(r.stored_path)
+            if ap and os.path.exists(ap):
+                h = hashlib.sha256()
+                with open(ap, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+                r.content_hash = h.hexdigest()
+                backfilled += 1
+        if backfilled:
+            await db.commit()
+            print(f"[STARTUP] Backfilled content_hash for {backfilled} sEEG recording(s).")
 
     # One-time migration: convert any absolute paths stored in DB to relative.
     async with AsyncSessionLocal() as db:
@@ -1144,28 +1177,64 @@ async def upload_seeg(
     seeg_dir = os.path.join(recon_dir, "seeg")
     os.makedirs(seeg_dir, exist_ok=True)
 
+    raw = await file.read()
+    content_hash = hashlib.sha256(raw).hexdigest()
     safe_name = os.path.basename(file.filename or "recording.h5")
-    stored = os.path.join(seeg_dir, f"{uuid.uuid4().hex[:8]}_{safe_name}")
-    with open(stored, "wb") as f:
-        f.write(await file.read())
 
-    # Read the task attr for a friendly label; tolerate a bad file with a 400.
-    task = None
+    # Validate against a temp file first so a bad upload never clobbers an existing
+    # recording; only move it into place once it parses.
+    tmp = os.path.join(seeg_dir, f".tmp_{uuid.uuid4().hex[:8]}.h5")
+    with open(tmp, "wb") as f:
+        f.write(raw)
     try:
         from services.seeg_service import parse_seeg_h5
-        task = parse_seeg_h5(stored)["attrs"].get("task")
+        task = parse_seeg_h5(tmp)["attrs"].get("task")
     except Exception as e:
-        os.remove(stored)
+        os.remove(tmp)
         raise HTTPException(status_code=400, detail=f"Not a readable NeurosEEGRead h5: {e}")
 
-    rec = SeegRecording(
-        reconstruction_id=recon_id, task=task,
-        filename=safe_name, stored_path=_rel(stored),
-    )
-    db.add(rec)
+    # Dedup: replace an existing recording with identical content, or one uploaded
+    # under the same original filename (treated as a new version of the same file),
+    # instead of accumulating duplicates. If several already piled up (from before
+    # dedup), keep one and delete the rest so a re-upload also cleans up the mess.
+    existing = (await db.execute(
+        select(SeegRecording).where(SeegRecording.reconstruction_id == recon_id)
+    )).scalars().all()
+    matches = [r for r in existing
+               if r.content_hash == content_hash or r.filename == safe_name]
+
+    if matches:
+        keep, extras = matches[0], matches[1:]
+        for r in extras:
+            ap = _abs(r.stored_path)
+            if ap and os.path.exists(ap):
+                try:
+                    os.remove(ap)
+                except OSError:
+                    pass
+            await db.delete(r)
+        dest = _abs(keep.stored_path)
+        os.replace(tmp, dest)                       # atomic overwrite (same dir)
+        keep.task = task
+        keep.filename = safe_name
+        keep.content_hash = content_hash
+        keep.uploaded_at = datetime.utcnow()
+        rec = keep
+        match = True
+    else:
+        match = False
+        dest = os.path.join(seeg_dir, f"{uuid.uuid4().hex[:8]}_{safe_name}")
+        os.replace(tmp, dest)
+        rec = SeegRecording(
+            reconstruction_id=recon_id, task=task, filename=safe_name,
+            stored_path=_rel(dest), content_hash=content_hash,
+        )
+        db.add(rec)
+
     await db.commit()
     await db.refresh(rec)
     return {"id": rec.id, "task": rec.task, "filename": rec.filename,
+            "replaced": bool(match),
             "uploaded_at": rec.uploaded_at.isoformat() if rec.uploaded_at else None}
 
 

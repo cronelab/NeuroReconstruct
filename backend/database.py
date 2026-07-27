@@ -100,6 +100,7 @@ class SeegRecording(Base):
     task = Column(String, nullable=True)          # task key from the h5 (e.g. "word_repetition")
     filename = Column(String, nullable=False)     # original upload filename
     stored_path = Column(String, nullable=False)  # path relative to DATA_DIR
+    content_hash = Column(String, nullable=True)  # sha256 of the file, for upload dedup
     uploaded_at = Column(DateTime, default=datetime.utcnow)
 
 

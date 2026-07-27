@@ -106,6 +106,22 @@ def test_event_activity_rise():
     print("ok test_event_activity_rise")
 
 
+def test_degenerate_channel_finite():
+    # A flat / all-zero channel must not produce NaN/Inf (would break JSON output).
+    import h5py
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "f.h5")
+        chans = ["LAH1", "LAH2", "LAH3"]
+        make_fake_h5(p, chans, active=["LAH2"], n_trials=15, duration_s=40)
+        with h5py.File(p, "r+") as h5:
+            h5["ieeg/rate_2000hz/data"][:, 0] = 0.0   # zero out LAH1
+        for mode in ("event", "continuous"):
+            out = S.compute_band_activity(p, band="high_gamma", mode=mode)
+            act = np.array(out["activity"])
+            assert np.isfinite(act).all(), f"{mode}: non-finite values leaked through"
+    print("ok test_degenerate_channel_finite")
+
+
 def test_continuous_shape():
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "f.h5")
@@ -124,6 +140,7 @@ if __name__ == "__main__":
     test_split_channel_name()
     test_group_disambiguation()
     test_name_join()
+    test_degenerate_channel_finite()
     test_continuous_shape()
     test_event_activity_rise()
     print("\nALL PASSED")

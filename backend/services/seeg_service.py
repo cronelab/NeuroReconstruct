@@ -257,6 +257,9 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND, mode: str = "even
         mu = base.mean(axis=0)
         sd = base.std(axis=0) + 1e-9
         z = (frames - mu) / sd
+        # Degenerate channels (flat / all-zero signal) can yield NaN/Inf, which is
+        # not JSON-serializable -- map them to 0 (neutral / baseline).
+        z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
         return {
             "channels": names,
             "times": [round(float(t), 4) for t in times],
@@ -299,6 +302,9 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND, mode: str = "even
     if used == 0:
         raise ValueError("all trial epochs fell outside the segment -- check onsets")
     avg = acc / used                                        # trial-averaged z
+    # Degenerate channels (flat / all-zero signal) can yield NaN/Inf, which is not
+    # JSON-serializable -- map them to 0 (neutral / baseline).
+    avg = np.nan_to_num(avg, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Decimate peri-stimulus time if very long.
     if n_pst > max_frames:
