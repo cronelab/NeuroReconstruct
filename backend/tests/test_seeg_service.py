@@ -1,0 +1,129 @@
+"""
+Tests for services.seeg_service. Self-contained: run directly with
+
+    python backend/tests/test_seeg_service.py
+
+(No pytest dependency in the neuro-recon env.) Uses the synthetic h5 generator.
+"""
+
+import os
+import sys
+import tempfile
+
+import numpy as np
+
+_BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _BACKEND)
+sys.path.insert(0, os.path.join(_BACKEND, "scripts"))
+
+from services import seeg_service as S           # noqa: E402
+from make_fake_seeg_h5 import make_fake_h5        # noqa: E402
+
+
+def test_parse():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "f.h5")
+        chans = ["LAH1", "LAH2", "LPH1"]
+        make_fake_h5(p, chans, active=["LAH2"], n_trials=10, duration_s=30)
+        meta = S.parse_seeg_h5(p)
+        assert meta["rate_hz"] == 2000.0, meta["rate_hz"]
+        assert [c["name"] for c in meta["channels"]] == chans
+        assert [c["group"] for c in meta["channels"]] == ["LAH", "LAH", "LPH"]
+        assert len(meta["trials"]) == 10
+        assert meta["attrs"]["task"] == "word_repetition"
+    print("ok test_parse")
+
+
+def test_name_join():
+    # Channel 'LAH1' should match shaft 'LAH' / 'lah' / "L'AH" / 'L-A-H' etc.
+    channels = [{"name": "LAH1", "group": "LAH"}, {"name": "LAH2", "group": "LAH"},
+                {"name": "RX9", "group": "RX"}]
+    native = [
+        {"shaft_name": "lah", "contact_number": 1, "x_mm": 1.0, "y_mm": 2.0, "z_mm": 3.0},
+        {"shaft_name": "L-A-H", "contact_number": 2, "x_mm": 4.0, "y_mm": 5.0, "z_mm": 6.0},
+        {"shaft_name": "ZZ", "contact_number": 7, "x_mm": 0.0, "y_mm": 0.0, "z_mm": 0.0},
+    ]
+    mni = [{"shaft_name": "LAH", "contact_number": 1, "x_mni": -20.0, "y_mni": -10.0, "z_mni": -15.0}]
+    j = S.join_channels_to_contacts(channels, native, mni)
+    assert j["coords_native"]["LAH1"] == [1.0, 2.0, 3.0]
+    assert j["coords_native"]["LAH2"] == [4.0, 5.0, 6.0]     # separator/case normalized
+    assert j["coords_mni"]["LAH1"] == [-20.0, -10.0, -15.0]
+    assert "RX9" in j["unmatched_channels"]                  # no contact for RX9
+    assert "ZZ7" in j["unmatched_contacts"]                  # no channel for ZZ7
+    assert set(j["matched"]) == {"LAH1", "LAH2"}
+    print("ok test_name_join")
+
+
+def test_group_disambiguation():
+    # Shaft 'E1' contact 1 -> channel 'E11'. With the group provided, it must
+    # resolve to ('e1', 1), NOT ('e', 11).
+    assert S._group_and_number("E11", "E1") == ("e1", 1)
+    assert S._group_and_number("E110", "E1") == ("e1", 10)
+    # Join must map channel E11 (group E1) to shaft E1 contact 1, and NOT collide
+    # with a hypothetical shaft E contact 11.
+    channels = [{"name": "E11", "group": "E1"}, {"name": "E12", "group": "E1"}]
+    native = [
+        {"shaft_name": "E1", "contact_number": 1, "x_mm": 1.0, "y_mm": 1.0, "z_mm": 1.0},
+        {"shaft_name": "E1", "contact_number": 2, "x_mm": 2.0, "y_mm": 2.0, "z_mm": 2.0},
+    ]
+    j = S.join_channels_to_contacts(channels, native, None)
+    assert j["coords_native"]["E11"] == [1.0, 1.0, 1.0]
+    assert j["coords_native"]["E12"] == [2.0, 2.0, 2.0]
+    assert not j["unmatched_channels"]
+    print("ok test_group_disambiguation")
+
+
+def test_split_channel_name():
+    assert S._split_channel_name("LAH1") == ("lah", 1)
+    assert S._split_channel_name("L'AH12") == ("lah", 12)
+    assert S._split_channel_name("EKG") == (None, None)
+    print("ok test_split_channel_name")
+
+
+def test_event_activity_rise():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "f.h5")
+        chans = ["LAH1", "LAH2", "LAH3", "LPH1"]
+        active = ["LAH2", "LAH3"]
+        make_fake_h5(p, chans, active=active, n_trials=20, duration_s=60)
+        out = S.compute_band_activity(p, band="high_gamma", mode="event")
+        assert out["channels"] == chans
+        act = np.array(out["activity"])                     # (frames, channels)
+        times = np.array(out["times"])                      # ms
+        assert act.shape[0] == len(times)
+        assert act.shape[1] == len(chans)
+        # Post-onset (0..400 ms) high-gamma should exceed baseline (<0 ms) in active chans.
+        pre = act[times < 0].mean(axis=0)
+        post = act[(times > 20) & (times < 400)].mean(axis=0)
+        for ch in active:
+            i = chans.index(ch)
+            assert post[i] - pre[i] > 1.0, f"{ch}: post-pre z={post[i]-pre[i]:.2f} not > 1"
+        # An inactive channel should show a much smaller rise.
+        i_inactive = chans.index("LAH1")
+        rise_inactive = post[i_inactive] - pre[i_inactive]
+        rise_active = post[chans.index("LAH2")] - pre[chans.index("LAH2")]
+        assert rise_active > rise_inactive + 1.0
+    print("ok test_event_activity_rise")
+
+
+def test_continuous_shape():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "f.h5")
+        chans = ["LAH1", "LAH2"]
+        make_fake_h5(p, chans, active=["LAH2"], n_trials=10, duration_s=30)
+        out = S.compute_band_activity(p, band="beta", mode="continuous")
+        act = np.array(out["activity"])
+        assert act.shape[1] == 2
+        assert act.shape[0] == len(out["times"])
+        assert act.shape[0] <= S.MAX_OUTPUT_FRAMES
+    print("ok test_continuous_shape")
+
+
+if __name__ == "__main__":
+    test_parse()
+    test_split_channel_name()
+    test_group_disambiguation()
+    test_name_join()
+    test_continuous_shape()
+    test_event_activity_rise()
+    print("\nALL PASSED")

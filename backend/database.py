@@ -86,6 +86,23 @@ class ElectrodeContact(Base):
     shaft = relationship("ElectrodeShaft", back_populates="contacts")
 
 
+class SeegRecording(Base):
+    """
+    An uploaded NeurosEEGRead HDF5 file, associated with a reconstruction.
+
+    Fully parallel to the reconstruction pipeline: the file supplies named-channel
+    activity, and the reconstruction supplies the electrode coordinates that the
+    channels are joined to by name. Adding this table does not touch existing ones.
+    """
+    __tablename__ = "seeg_recordings"
+    id = Column(Integer, primary_key=True)
+    reconstruction_id = Column(Integer, ForeignKey("reconstructions.id"))
+    task = Column(String, nullable=True)          # task key from the h5 (e.g. "word_repetition")
+    filename = Column(String, nullable=False)     # original upload filename
+    stored_path = Column(String, nullable=False)  # path relative to DATA_DIR
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

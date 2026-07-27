@@ -208,6 +208,17 @@ export default function Header({ onBack, onNavigate }) {
 
       <div style={s.spacer} />
 
+      {/* sEEG functional mapping — available to all roles (read-only view) */}
+      {reconstruction && (
+        <button
+          style={{ ...s.btn, background: 'transparent', color: '#b18cff', border: '1px solid #6b4fb355' }}
+          onClick={() => onNavigate?.('/seeg')}
+          title="Visualize sEEG electrode activity on the brain / MNI152 atlas"
+        >
+          ◍ sEEG Activity
+        </button>
+      )}
+
       {/* Actions — only in viewer */}
       {reconstruction && canEdit && (<>
 

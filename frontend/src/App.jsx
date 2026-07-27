@@ -7,10 +7,11 @@ import Header from './components/Header';
 import ReconstructionList from './components/ReconstructionList';
 import ReconstructionViewer from './components/ReconstructionViewer';
 import DeletedList from './components/DeletedList';
+import SeegViewer from './components/SeegViewer';
 
 export default function App() {
   const { user, setUser, token, logout, setReconstruction, setMeshData } = useAppStore();
-  const [page, setPage] = useState('list'); // 'list' | 'viewer' | 'login' | 'deleted'
+  const [page, setPage] = useState('list'); // 'list' | 'viewer' | 'login' | 'deleted' | 'seeg'
   const [selectedReconId, setSelectedReconId] = useState(null);
   const [shareToken, setShareToken] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -41,6 +42,7 @@ export default function App() {
 
   const navigateTo = (path) => {
     if (path === '/login') setPage('login');
+    if (path === '/seeg') setPage('seeg');
     if (path === '/list') { setPage('list'); setSelectedReconId(null); setReconstruction(null); setMeshData(null); }
   };
 
@@ -106,6 +108,9 @@ export default function App() {
         )}
         {page === 'viewer' && (
           <ReconstructionViewer reconId={selectedReconId} shareToken={shareToken} />
+        )}
+        {page === 'seeg' && (
+          <SeegViewer reconId={selectedReconId} onBack={() => setPage('viewer')} />
         )}
         {page === 'deleted' && (
           <DeletedList onBack={() => setPage('list')} />

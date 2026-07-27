@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from pydantic import BaseModel
 
-from database import init_db, get_db, AsyncSessionLocal, User, Reconstruction, ElectrodeShaft, ElectrodeContact
+from database import init_db, get_db, AsyncSessionLocal, User, Reconstruction, ElectrodeShaft, ElectrodeContact, SeegRecording
 from auth import (
     verify_password, hash_password, create_access_token,
     get_current_user, require_editor, require_admin
@@ -1090,6 +1090,187 @@ async def download_mni_export(
         buf, media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+
+
+# ── sEEG functional mapping ─────────────────────────────────────────────────
+# Upload NeurosEEGRead h5 files and render per-electrode band activity on a
+# brain surface. Fully parallel to the reconstruction pipeline: activity comes
+# from the h5, coordinates from this reconstruction (joined to channels by name).
+
+def _recon_dir_for(recon: Reconstruction) -> Optional[str]:
+    """Resolve the on-disk data dir for a reconstruction (mesh or MRI based)."""
+    for p in (recon.mesh_path, recon.mri_path):
+        ap = _abs(p) if p else None
+        if ap:
+            return os.path.dirname(ap)
+    return None
+
+
+async def _gather_native_contacts(db: AsyncSession, recon_id: int) -> list:
+    """Placed contacts with shaft name + mesh-centered mm, for the name-join."""
+    shafts_result = await db.execute(
+        select(ElectrodeShaft).where(ElectrodeShaft.reconstruction_id == recon_id)
+    )
+    contacts = []
+    for shaft in shafts_result.scalars().all():
+        c_result = await db.execute(
+            select(ElectrodeContact)
+            .where(ElectrodeContact.shaft_id == shaft.id)
+            .where(ElectrodeContact.x_mm != None)
+            .order_by(ElectrodeContact.contact_number)
+        )
+        for c in c_result.scalars().all():
+            contacts.append({
+                "shaft_name": shaft.name, "contact_number": c.contact_number,
+                "x_mm": c.x_mm, "y_mm": c.y_mm, "z_mm": c.z_mm,
+            })
+    return contacts
+
+
+@app.post("/api/reconstructions/{recon_id}/seeg")
+async def upload_seeg(
+    recon_id: int,
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload a NeurosEEGRead h5 recording and associate it with the reconstruction."""
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Reconstruction not found")
+
+    recon_dir = _recon_dir_for(recon) or os.path.join(DATA_DIR, f"recon_{uuid.uuid4().hex[:8]}")
+    seeg_dir = os.path.join(recon_dir, "seeg")
+    os.makedirs(seeg_dir, exist_ok=True)
+
+    safe_name = os.path.basename(file.filename or "recording.h5")
+    stored = os.path.join(seeg_dir, f"{uuid.uuid4().hex[:8]}_{safe_name}")
+    with open(stored, "wb") as f:
+        f.write(await file.read())
+
+    # Read the task attr for a friendly label; tolerate a bad file with a 400.
+    task = None
+    try:
+        from services.seeg_service import parse_seeg_h5
+        task = parse_seeg_h5(stored)["attrs"].get("task")
+    except Exception as e:
+        os.remove(stored)
+        raise HTTPException(status_code=400, detail=f"Not a readable NeurosEEGRead h5: {e}")
+
+    rec = SeegRecording(
+        reconstruction_id=recon_id, task=task,
+        filename=safe_name, stored_path=_rel(stored),
+    )
+    db.add(rec)
+    await db.commit()
+    await db.refresh(rec)
+    return {"id": rec.id, "task": rec.task, "filename": rec.filename,
+            "uploaded_at": rec.uploaded_at.isoformat() if rec.uploaded_at else None}
+
+
+@app.get("/api/reconstructions/{recon_id}/seeg")
+async def list_seeg(
+    recon_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List sEEG recordings uploaded for this reconstruction."""
+    result = await db.execute(
+        select(SeegRecording)
+        .where(SeegRecording.reconstruction_id == recon_id)
+        .order_by(SeegRecording.uploaded_at.desc())
+    )
+    return [
+        {"id": r.id, "task": r.task, "filename": r.filename,
+         "uploaded_at": r.uploaded_at.isoformat() if r.uploaded_at else None}
+        for r in result.scalars().all()
+    ]
+
+
+class SeegActivityRequest(BaseModel):
+    band: str = "high_gamma"
+    mode: str = "event"                 # 'event' | 'continuous'
+    window_ms: Optional[List[float]] = None
+
+
+@app.post("/api/reconstructions/{recon_id}/seeg/{rec_id}/activity")
+async def compute_seeg_activity(
+    recon_id: int,
+    rec_id: int,
+    req: SeegActivityRequest = Body(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Compute band activity for a recording and join it to this reconstruction's
+    contacts. Returns the display matrix plus native and (if exported) MNI coords.
+    """
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Reconstruction not found")
+
+    rec_result = await db.execute(select(SeegRecording).where(SeegRecording.id == rec_id))
+    rec = rec_result.scalar_one_or_none()
+    if not rec or rec.reconstruction_id != recon_id:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    h5_path = _abs(rec.stored_path)
+    if not h5_path or not os.path.exists(h5_path):
+        raise HTTPException(status_code=404, detail="Recording file missing on disk")
+
+    from services.seeg_service import (
+        compute_band_activity, parse_seeg_h5, join_channels_to_contacts, load_mni_rows, BANDS,
+    )
+    if req.band not in BANDS:
+        raise HTTPException(status_code=400, detail=f"band must be one of {sorted(BANDS)}")
+    if req.mode not in ("event", "continuous"):
+        raise HTTPException(status_code=400, detail="mode must be 'event' or 'continuous'")
+
+    window = tuple(req.window_ms) if req.window_ms else (-200.0, 800.0)
+
+    # Signal processing is CPU-bound; keep the event loop responsive.
+    loop = asyncio.get_event_loop()
+    try:
+        activity = await loop.run_in_executor(
+            None, lambda: compute_band_activity(h5_path, req.band, req.mode, window)
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    meta = await loop.run_in_executor(None, parse_seeg_h5, h5_path)
+    native = await _gather_native_contacts(db, recon_id)
+    recon_dir = _recon_dir_for(recon)
+    mni_rows = load_mni_rows(recon_dir) if recon_dir else None
+    join = join_channels_to_contacts(meta["channels"], native, mni_rows)
+
+    return {
+        **activity,
+        "coords_native": join["coords_native"],
+        "coords_mni": join["coords_mni"],
+        "matched": join["matched"],
+        "unmatched_channels": join["unmatched_channels"],
+        "unmatched_contacts": join["unmatched_contacts"],
+        "has_mni": bool(join["coords_mni"]),
+        "attrs": meta["attrs"],
+    }
+
+
+@app.get("/api/seeg/mni-template-mesh")
+async def get_mni_template_mesh(current_user: User = Depends(get_current_user)):
+    """
+    Serve the shared MNI152 template brain surface (vertices/faces/center).
+    Precomputed and committed as data/mni152_brain_mesh.json so the frozen build
+    needs no ANTs/skimage at runtime. See scripts/build_mni_template_mesh.py.
+    """
+    path = os.path.join(DATA_DIR, "mni152_brain_mesh.json")
+    if not os.path.exists(path):
+        raise HTTPException(
+            status_code=404,
+            detail="MNI template mesh not built -- run scripts/build_mni_template_mesh.py",
+        )
+    with open(path) as f:
+        return JSONResponse(json.load(f))
 
 
 @app.get("/api/reconstructions/{recon_id}/mri-slice")

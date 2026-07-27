@@ -58,4 +58,27 @@ export const useAppStore = create((set, get) => ({
   setStructureVisible: (key, v) => set(s => ({ structureVisible: { ...s.structureVisible, [key]: v } })),
   setStructureVisibleMany: (keys, v) =>
     set(s => ({ structureVisible: { ...s.structureVisible, ...Object.fromEntries(keys.map(k => [k, v])) } })),
+
+  // ── sEEG functional mapping (decoupled from reconstruction/editor state) ──────
+  seegRecordings: [],            // [{ id, task, filename, uploaded_at }]
+  setSeegRecordings: (r) => set({ seegRecordings: r }),
+  seegRecordingId: null,         // currently selected recording id
+  setSeegRecordingId: (id) => set({ seegRecordingId: id }),
+  // Computed activity payload from the backend:
+  //   { channels, times, activity[frame][ch], coords_native, coords_mni,
+  //     matched, unmatched_channels, unmatched_contacts, has_mni, mode, band }
+  seegActivity: null,
+  setSeegActivity: (a) => set({ seegActivity: a, seegTimeIndex: 0 }),
+  seegBand: 'high_gamma',
+  setSeegBand: (b) => set({ seegBand: b }),
+  seegMode: 'event',             // 'event' | 'continuous'
+  setSeegMode: (m) => set({ seegMode: m }),
+  seegSurface: 'mni',            // 'mni' | 'native'
+  setSeegSurface: (s) => set({ seegSurface: s }),
+  seegTemplateMesh: null,        // cached MNI152 template surface
+  setSeegTemplateMesh: (m) => set({ seegTemplateMesh: m }),
+  seegTimeIndex: 0,
+  setSeegTimeIndex: (i) => set({ seegTimeIndex: i }),
+  seegPlaying: false,
+  setSeegPlaying: (v) => set({ seegPlaying: v }),
 }));
