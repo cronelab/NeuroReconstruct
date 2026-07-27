@@ -34,22 +34,30 @@ export default function SeegTracePanel({
   const scrollRef = useRef(null);
   const [width, setWidth] = useState(800);
 
+  // Only channels mapped to a placed contact are shown (unmatched channels have
+  // no location on the brain, so a trace for them can't be correlated).
+  const mappedSet = useMemo(() => new Set(data.matched || []), [data.matched]);
+
   const shafts = useMemo(() => {
     const s = [];
-    (data.groups || []).forEach((g) => { if (g && !s.includes(g)) s.push(g); });
+    data.channels.forEach((name, ci) => {
+      const g = data.groups?.[ci];
+      if (g && mappedSet.has(name) && !s.includes(g)) s.push(g);
+    });
     return s;
-  }, [data.groups]);
+  }, [data.channels, data.groups, mappedSet]);
 
   // Rows to draw: channel index (ci) into the data columns, filtered by scope.
   const rows = useMemo(() => {
     const out = [];
     data.channels.forEach((name, ci) => {
+      if (!mappedSet.has(name)) return;                 // mapped channels only
       const group = data.groups?.[ci] || '';
       if (scope === 'shaft' && shaft && group !== shaft) return;
       out.push({ name, group, ci });
     });
     return out;
-  }, [data.channels, data.groups, scope, shaft]);
+  }, [data.channels, data.groups, mappedSet, scope, shaft]);
 
   const nT = data.times.length;
   const isRaw = signal === 'raw';
