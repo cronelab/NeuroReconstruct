@@ -28,6 +28,11 @@ extra_dlls = [
     "libssl-3-x64.dll",
     "libbz2.dll",
     "ffi-8.dll",
+    # _ctypes.pyd / pyexpat.pyd link against the *unversioned* names, which
+    # PyInstaller's dependency scan does not resolve -- bundle them explicitly
+    # or the frozen exe dies at startup ("DLL load failed importing _ctypes").
+    "ffi.dll",
+    "libexpat.dll",
     "liblzma.dll",
     "zlib.dll",
     "vcruntime140.dll",
@@ -98,6 +103,8 @@ a = Analysis(
         "matplotlib.backends.backend_agg",
         # ants only -- antspynet would pull in the whole TensorFlow stack.
         "ants","ants.plotting",
+        # h5py -- required at runtime by the sEEG functional-mapping feature.
+        "h5py","h5py.defs","h5py.utils","h5py._proxy","h5py.h5ac",
     ],
     hookspath=[],
     runtime_hooks=[],
@@ -110,7 +117,7 @@ a = Analysis(
     # coregistration is SimpleITK-only and is unaffected; plain `ants` is
     # still bundled for the MNI export path.
     excludes=["IPython","jupyter","PyQt5","PyQt6","tkinter","nilearn","sklearn",
-              "tensorflow","keras","antspynet","tensorboard","h5py"],
+              "tensorflow","keras","antspynet","tensorboard"],
     cipher=block_cipher,
     noarchive=False,
 )
