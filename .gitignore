@@ -21,9 +21,7 @@ backend/dist/
 backend/brain_viewer.db
 
 # Reconstruction data (large NIfTI files, patient data)
-backend/data/*
-# ...but keep the shared, subject-independent MNI152 template surface (no patient data)
-!backend/data/mni152_brain_mesh.json
+backend/data/
 
 # Node / React
 frontend/node_modules/

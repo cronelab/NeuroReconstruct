@@ -1369,23 +1369,6 @@ async def compute_seeg_activity(
     }
 
 
-@app.get("/api/seeg/mni-template-mesh")
-async def get_mni_template_mesh(current_user: User = Depends(get_current_user)):
-    """
-    Serve the shared MNI152 template brain surface (vertices/faces/center).
-    Precomputed and committed as data/mni152_brain_mesh.json so the frozen build
-    needs no ANTs/skimage at runtime. See scripts/build_mni_template_mesh.py.
-    """
-    path = os.path.join(DATA_DIR, "mni152_brain_mesh.json")
-    if not os.path.exists(path):
-        raise HTTPException(
-            status_code=404,
-            detail="MNI template mesh not built -- run scripts/build_mni_template_mesh.py",
-        )
-    with open(path) as f:
-        return JSONResponse(json.load(f))
-
-
 @app.get("/api/reconstructions/{recon_id}/mri-slice")
 async def get_mri_slice(
     recon_id: int,
