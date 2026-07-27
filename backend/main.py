@@ -340,8 +340,13 @@ def _get_runtime_dir():
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
-DATA_DIR = os.path.join(_get_runtime_dir(), "data")
+# NEURO_DATA_DIR overrides the data root so imaging files can live on a mounted
+# share (cloud deploys) rather than inside the deployment directory, which is
+# replaced on every deploy. database.py reads the same variable, so the DB
+# (<root>/brain_viewer.db) and the recon_* folders (<root>/data/) share a root.
+DATA_DIR = os.path.join(os.environ.get("NEURO_DATA_DIR") or _get_runtime_dir(), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
+print(f"[DATA] Using data directory: {DATA_DIR}")
 
 
 def _rel(path: str) -> Optional[str]:
@@ -369,6 +374,29 @@ def _abs(path: str) -> Optional[str]:
 @app.on_event("startup")
 async def startup():
     await init_db()
+
+    # Reap orphaned exports. _export_mni_background runs in-process, so a row
+    # still marked "exporting" at startup belongs to a worker that died mid-run
+    # (crash, restart, cloud instance recycle) -- nothing will ever finish it or
+    # move it off that status, and start_mni_export refuses to re-run while it
+    # sits there. Mark it "error" so the user can retry.
+    #
+    # exported_at is cleared to match the failure path in _export_mni_background:
+    # an interrupted re-export may have partially overwritten a previous good
+    # export, so the old timestamp no longer describes what is on disk.
+    #
+    # NOTE: this assumes a single app instance. If the app is ever scaled out,
+    # a starting instance would reap exports still running on its peers; that
+    # redesign should move exports to a queue + worker with a heartbeat.
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            update(Reconstruction)
+            .where(Reconstruction.export_status == "exporting")
+            .values(export_status="error", exported_at=None)
+        )
+        if result.rowcount:
+            await db.commit()
+            print(f"[STARTUP] Reset {result.rowcount} orphaned export(s) to 'error'.")
 
     # One-time migration: convert any absolute paths stored in DB to relative.
     async with AsyncSessionLocal() as db:
