@@ -188,6 +188,48 @@ def _band_envelope(sig: np.ndarray, fs: float, band: tuple) -> np.ndarray:
     return env.astype(np.float32)
 
 
+# Band-power envelope cache. The filtfilt+Hilbert envelope is the dominant cost and
+# depends only on (h5 file, band) -- not on the peri-stimulus window or trial/scroll
+# mode -- so it is cached on disk next to the recording and reused across requests.
+ENV_CACHE_DIRNAME = ".envcache"
+
+
+def _env_cache_path(h5_path: str, band: str) -> str:
+    return os.path.join(os.path.dirname(h5_path), ENV_CACHE_DIRNAME,
+                        f"{os.path.basename(h5_path)}.{band}.npz")
+
+
+def _load_or_compute_envelope(h5_path: str, band: str, sig: np.ndarray, fs: float) -> np.ndarray:
+    """
+    Band envelope for ``sig``, cached on disk keyed by (h5 file, band).
+
+    The cache stores the source file's size + mtime; a changed/replaced file
+    (different size, mtime, or channel count) misses and is recomputed. Cache
+    read/write failures degrade silently to a fresh computation.
+    """
+    cache = _env_cache_path(h5_path, band)
+    try:
+        st = os.stat(h5_path)
+        if os.path.exists(cache):
+            with np.load(cache, allow_pickle=False) as d:
+                if (int(d["src_size"]) == st.st_size
+                        and abs(float(d["src_mtime"]) - st.st_mtime) < 1e-3
+                        and tuple(d["shape"]) == sig.shape):
+                    return d["env"]
+    except Exception as e:
+        print(f"[SEEG] env cache read miss ({band}): {e}")
+
+    env = _band_envelope(sig, fs, BANDS[band])
+    try:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        st = os.stat(h5_path)
+        np.savez(cache, env=env, shape=np.array(sig.shape, dtype=np.int64),
+                 src_size=np.int64(st.st_size), src_mtime=np.float64(st.st_mtime))
+    except Exception as e:
+        print(f"[SEEG] env cache write failed ({band}): {e}")
+    return env
+
+
 def _load_mappable_signal(path: str):
     """
     Load the mappable-channel signal block from an h5.
@@ -250,7 +292,7 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
         return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
                 "mode": "trial", "time_unit": "ms", "band": band, "n_trials": 0}
 
-    env = _band_envelope(sig, fs, BANDS[band])
+    env = _load_or_compute_envelope(path, band, sig, fs)
 
     # ── Trial-averaged: epoch around trial onsets ─────────────────────────────
     onsets = np.array([t["start_time"] for t in meta["trials"]], dtype=np.float64)
@@ -330,7 +372,7 @@ def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
         return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
                 "mode": "scroll", "time_unit": "s", "band": band, "n_trials": 0}
 
-    env = _band_envelope(sig, fs, BANDS[band])
+    env = _load_or_compute_envelope(path, band, sig, fs)
     z = np.nan_to_num((env - env.mean(axis=0)) / (env.std(axis=0) + 1e-9),
                       nan=0.0, posinf=0.0, neginf=0.0)
 

@@ -141,6 +141,26 @@ def test_continuous_traces():
     print("ok test_continuous_traces")
 
 
+def test_env_cache():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "f.h5")
+        chans = ["LAH1", "LAH2", "LAH3"]
+        make_fake_h5(p, chans, active=["LAH2"], n_trials=15, duration_s=30)
+        cache = S._env_cache_path(p, "high_gamma")
+        assert not os.path.exists(cache)
+        out1 = S.compute_band_activity(p, band="high_gamma")     # miss -> writes cache
+        assert os.path.exists(cache), "envelope cache not written"
+        mt = os.path.getmtime(cache)
+        out2 = S.compute_band_activity(p, band="high_gamma")     # hit -> same result
+        assert out1["activity"] == out2["activity"]
+        # A different mode for the SAME (file, band) reuses the cache, not rewrites it.
+        S.compute_continuous_traces(p, band="high_gamma")
+        assert os.path.getmtime(cache) == mt, "cache was rewritten instead of reused"
+        # A different band uses a separate cache entry.
+        assert S._env_cache_path(p, "beta") != cache
+    print("ok test_env_cache")
+
+
 def test_window_param():
     # The peri-stimulus window controls the time axis span.
     with tempfile.TemporaryDirectory() as d:
@@ -163,6 +183,7 @@ if __name__ == "__main__":
     test_name_join()
     test_degenerate_channel_finite()
     test_continuous_traces()
+    test_env_cache()
     test_window_param()
     test_event_activity_rise()
     print("\nALL PASSED")

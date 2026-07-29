@@ -53,6 +53,7 @@ copy "%~dp0backend\dist\NeuroReconstruct.exe" "%DIST%\"
 :: xcopy's /exclude parsing.
 cd /d "%~dp0"
 > demo_exclude.tmp echo \ct_cache\
+>> demo_exclude.tmp echo \.envcache\
 >> demo_exclude.tmp echo mri_to_mni_warp.nii.gz
 >> demo_exclude.tmp echo mni_to_mri_invwarp.nii.gz
 if exist "%~dp0backend\data" xcopy /e /i /q /exclude:demo_exclude.tmp "%~dp0backend\data" "%DIST%\data\"

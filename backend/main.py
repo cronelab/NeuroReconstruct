@@ -1299,6 +1299,19 @@ async def upload_seeg(
     except OSError:
         pass
 
+    # Drop band-envelope caches (<h5>.<band>.npz) whose source recording is gone.
+    env_cache = os.path.join(seeg_dir, ".envcache")
+    if os.path.isdir(env_cache):
+        try:
+            for fn in os.listdir(env_cache):
+                if not any(fn.startswith(h5 + ".") for h5 in referenced):
+                    try:
+                        os.remove(os.path.join(env_cache, fn))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
     return {"id": rec.id, "task": rec.task, "filename": rec.filename,
             "replaced": bool(matches),
             "uploaded_at": rec.uploaded_at.isoformat() if rec.uploaded_at else None}
