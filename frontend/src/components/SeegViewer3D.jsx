@@ -72,17 +72,22 @@ function ContactRing({ position, radius, color }) {
   );
 }
 
+// Neutral color/size for contacts outside the brain when "ignore outside" is on.
+const INERT_COLOR = '#5f6b76';
+
 // ── Activity-driven contact sphere ────────────────────────────────────────────────
 // The hover tooltip + ring are rendered once by the parent (electrode-centric hover,
 // matching Viewer3D); this just reports enter/leave and glows when active.
-function ActivityContact({ position, value, label, group, domain, baseRadius, hiliteColor, regionOf, active, onEnter, onLeave }) {
-  const color = activityColor(value, domain);
+// `inert` contacts (outside the brain) keep their position but ignore the z-score:
+// fixed neutral color and fixed radius, no color/size driven by activation.
+function ActivityContact({ position, value, label, group, domain, baseRadius, hiliteColor, regionOf, active, inert, onEnter, onLeave }) {
+  const color = inert ? INERT_COLOR : activityColor(value, domain);
   // Radius grows with activation magnitude, mirroring webfm's |value|-scaling.
-  const radius = baseRadius * (0.7 + Math.min(1.6, Math.abs(value || 0) / domain));
+  const radius = inert ? baseRadius : baseRadius * (0.7 + Math.min(1.6, Math.abs(value || 0) / domain));
   const enter = (e) => {
     e.stopPropagation();
     document.body.style.cursor = 'pointer';
-    onEnter?.({ name: label, group, pos: position, radius, value,
+    onEnter?.({ name: label, group, pos: position, radius, value, inert,
       color: hiliteColor, region: regionOf ? regionOf(position) : null });
   };
   const leave = () => { document.body.style.cursor = 'default'; onLeave?.(); };
@@ -90,8 +95,9 @@ function ActivityContact({ position, value, label, group, domain, baseRadius, hi
     <group position={position}>
       <mesh onPointerOver={enter} onPointerOut={leave}>
         <sphereGeometry args={[radius, 16, 16]} />
-        <meshPhysicalMaterial color={color} emissive={active ? hiliteColor : '#000'}
-          emissiveIntensity={active ? 0.7 : 0.2} roughness={0.25} metalness={0.5} />
+        <meshPhysicalMaterial color={color} opacity={inert ? 0.75 : 1} transparent={inert}
+          emissive={active ? hiliteColor : '#000'}
+          emissiveIntensity={active ? 0.7 : (inert ? 0.05 : 0.2)} roughness={0.25} metalness={0.5} />
       </mesh>
     </group>
   );
@@ -175,8 +181,8 @@ export default function SeegViewer3D({
     if (hoveredChannel) {
       const c = contacts.find((x) => x.name === hoveredChannel);
       if (c) return {
-        name: c.name, pos: c.pos, value: c.value,
-        radius: baseRadius * (0.7 + Math.min(1.6, Math.abs(c.value || 0) / domain)),
+        name: c.name, pos: c.pos, value: c.value, inert: c.inside === false,
+        radius: (c.inside === false ? baseRadius : baseRadius * (0.7 + Math.min(1.6, Math.abs(c.value || 0) / domain))),
         color: shaftColorOf(c.group, shaftColors), region: regionOf(c.pos),
       };
     }
@@ -204,7 +210,7 @@ export default function SeegViewer3D({
           <ActivityContact key={c.name} position={c.pos} value={c.value} label={c.name} group={c.group}
             domain={domain} baseRadius={baseRadius} regionOf={regionOf}
             hiliteColor={shaftColorOf(c.group, shaftColors)}
-            active={effHover?.name === c.name}
+            active={effHover?.name === c.name} inert={c.inside === false}
             onEnter={handleEnter} onLeave={handleLeave} />
         ))}
 
@@ -231,6 +237,9 @@ export default function SeegViewer3D({
               {effHover.value >= 0 ? '+' : ''}{(effHover.value || 0).toFixed(2)} z
             </span>
           </div>
+          {effHover.inert && (
+            <div style={{ color: '#c8975a', fontSize: 12, marginTop: 3 }}>outside brain · not scored</div>
+          )}
           {effHover.region ? (
             effHover.region.inside ? (
               <div style={{ color: effHover.region.color, fontSize: 13, marginTop: 3 }}>{effHover.region.label}</div>

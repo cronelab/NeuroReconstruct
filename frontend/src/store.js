@@ -88,6 +88,8 @@ export const useAppStore = create((set, get) => ({
   setSeegTracePanelW: (w) => set({ seegTracePanelW: w }),
   seegBrainOpacity: 0.4,         // native-brain surface opacity in the sEEG view
   setSeegBrainOpacity: (v) => set({ seegBrainOpacity: v }),
+  seegIgnoreOutside: false,      // render contacts outside the brain mesh inert
+  setSeegIgnoreOutside: (v) => set({ seegIgnoreOutside: v }),
   seegStructureOpacity: 0.4,     // structure-overlay opacity in the sEEG view
   setSeegStructureOpacity: (v) => set({ seegStructureOpacity: v }),
   seegTimeIndex: 0,

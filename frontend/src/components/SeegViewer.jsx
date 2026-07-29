@@ -3,10 +3,12 @@ import { useAppStore } from '../store';
 import {
   listSeeg, uploadSeeg, computeSeegActivity, getMesh, getReconstruction, getStructures,
 } from '../api';
+import * as THREE from 'three';
 import SeegViewer3D, { activityColor } from './SeegViewer3D';
 import SeegTracePanel from './SeegTracePanel';
 import StructurePanel from './StructurePanel';
 import { buildShaftColorMap } from '../seegColors';
+import { isInsideMesh } from '../anatomy';
 
 const BANDS = [
   ['delta', 'Delta 1–4'], ['theta', 'Theta 4–8'], ['alpha', 'Alpha 8–13'],
@@ -51,6 +53,7 @@ export default function SeegViewer({ reconId, onBack }) {
     seegTraceSignal, setSeegTraceSignal, seegTraceScope, setSeegTraceScope,
     seegTraceShaft, setSeegTraceShaft, seegTracePanelW, setSeegTracePanelW,
     seegBrainOpacity, setSeegBrainOpacity, seegStructureOpacity, setSeegStructureOpacity,
+    seegIgnoreOutside, setSeegIgnoreOutside,
     seegTimeIndex, setSeegTimeIndex, seegPlaying, setSeegPlaying,
     // Structures live in the global store so the shared StructurePanel (master
     // toggle + hierarchical tri-state + opacity) drives both this view and the
@@ -124,22 +127,54 @@ export default function SeegViewer({ reconId, onBack }) {
   const shaftColors = useMemo(
     () => buildShaftColorMap(reconstruction?.electrode_shafts), [reconstruction]);
 
+  const surfaceMesh = nativeMesh;
+
+  // Raycastable native-brain mesh for the inside/outside contact test. DoubleSide
+  // so isInsideMesh's ray-crossing count is correct (matches anatomy.js).
+  const brainRaycastMesh = useMemo(() => {
+    if (!nativeMesh?.vertices) return null;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(nativeMesh.vertices), 3));
+    g.setIndex(new THREE.BufferAttribute(new Uint32Array(nativeMesh.faces), 1));
+    g.computeVertexNormals(); g.computeBoundingBox(); g.computeBoundingSphere();
+    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }));
+    m.updateMatrixWorld(true);
+    return m;
+  }, [nativeMesh]);
+
+  // Which mapped contacts lie inside the brain surface. Only computed when the
+  // "ignore outside" option is on (the raycast is otherwise unnecessary).
+  const insideByName = useMemo(() => {
+    const map = {};
+    if (!seegIgnoreOutside || !brainRaycastMesh || !seegActivity?.coords_native) return map;
+    for (const [name, c] of Object.entries(seegActivity.coords_native)) {
+      map[name] = isInsideMesh(new THREE.Vector3(c[0], c[1], c[2]), brainRaycastMesh);
+    }
+    return map;
+  }, [seegIgnoreOutside, brainRaycastMesh, seegActivity?.coords_native]);
+
   // ── Domain (color-scale half-range): 95th percentile of |activity| ────────────
   // A robust upper bound: using the raw max lets a single extreme contact compress
   // the color range for everyone else, so use the 95th percentile of |z| instead.
+  // Contacts outside the brain are excluded when "ignore outside" is on.
   const domain = useMemo(() => {
     const act = seegActivity?.activity;
     if (!act?.length) return 6;
+    const chans = seegActivity.channels;
     const vals = [];
-    for (const row of act) for (const v of row) vals.push(Math.abs(v));
+    for (const row of act) {
+      for (let i = 0; i < row.length; i++) {
+        if (seegIgnoreOutside && insideByName[chans[i]] === false) continue;
+        vals.push(Math.abs(row[i]));
+      }
+    }
     if (!vals.length) return 6;
     vals.sort((a, b) => a - b);
     const p95 = vals[Math.floor(0.95 * (vals.length - 1))];
     return Math.max(3, Math.min(15, Math.round(p95)));
-  }, [seegActivity]);
+  }, [seegActivity, seegIgnoreOutside, insideByName]);
 
   // ── Resolve contacts (native brain space) at the current time index ───────────
-  const surfaceMesh = nativeMesh;
   const contacts = useMemo(() => {
     if (!seegActivity || !surfaceMesh) return [];
     const frame = seegActivity.activity[seegTimeIndex] || [];
@@ -148,10 +183,13 @@ export default function SeegViewer({ reconId, onBack }) {
     seegActivity.channels.forEach((name, i) => {
       const c = coordsMap[name];
       if (!c) return;
-      out.push({ name, group: seegActivity.groups?.[i] || '', value: frame[i] ?? 0, pos: [c[0], c[1], c[2]] });
+      // inside=true unless the "ignore outside" test classified it as outside.
+      const inside = !(seegIgnoreOutside && insideByName[name] === false);
+      out.push({ name, group: seegActivity.groups?.[i] || '', value: frame[i] ?? 0,
+        pos: [c[0], c[1], c[2]], inside });
     });
     return out;
-  }, [seegActivity, surfaceMesh, seegTimeIndex]);
+  }, [seegActivity, surfaceMesh, seegTimeIndex, seegIgnoreOutside, insideByName]);
 
   const handleUpload = async (e) => {
     const file = e.target.files?.[0];
@@ -269,6 +307,17 @@ export default function SeegViewer({ reconId, onBack }) {
               {Math.round(seegBrainOpacity * 100)}%
             </span>
           </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, cursor: 'pointer' }}>
+            <input type="checkbox" checked={seegIgnoreOutside}
+              onChange={(e) => setSeegIgnoreOutside(e.target.checked)}
+              style={{ accentColor: '#00d4ff', width: 14, height: 14 }} />
+            <span style={{ fontSize: 12, color: '#c8d4e0' }}>Ignore contacts outside brain</span>
+          </label>
+          {seegIgnoreOutside && (
+            <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 4 }}>
+              Outside contacts stay in place but aren’t colored/scaled by z or used for the color limit.
+            </div>
+          )}
         </div>
 
         {/* Brain structures — master toggle, opacity, hierarchical tri-state tree
