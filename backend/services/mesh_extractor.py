@@ -136,6 +136,22 @@ def extract_brain_mesh(nifti_path: str, output_path: str,
     brain_mask = binary_fill_holes(brain_mask)
     brain_mask = binary_closing(brain_mask, ball(1))
 
+    # ── Keep only the largest connected component ──────────────────────────────
+    # antspynet occasionally leaves a small false-positive island at the anterior
+    # skull base (nasal/sphenoid region) that is disconnected from the brain and
+    # would otherwise mesh as a floating blob near the nose. The morphological
+    # path already selects the largest component during erosion; apply the same
+    # guard here so both paths are protected.
+    labeled, n_components = nd_label(brain_mask)
+    if n_components > 1:
+        comp_sizes = np.bincount(labeled.ravel())
+        comp_sizes[0] = 0
+        largest = comp_sizes.argmax()
+        dropped = int(brain_mask.sum() - comp_sizes[largest])
+        brain_mask = labeled == largest
+        print(f"[MESH] Largest-component filter: kept {int(comp_sizes[largest])} voxels, "
+              f"dropped {n_components - 1} island(s) totaling {dropped} voxels")
+
     # ── Smooth before marching cubes ──────────────────────────────────────────
     # antspynet mask is already clean — no smoothing needed (would blur sulci).
     # Morphological mask is a blob — refine it by thresholding on actual MRI
