@@ -10,6 +10,20 @@ const seg = (active) => ({
 const ROW_H = 22;
 const GUTTER = 68;
 
+// Numeric contact index within a shaft, for natural ordering (E1, E2, ... E10 —
+// not E1, E10, E2). Strips the shaft prefix (handles digit-ending shafts like
+// "E1" -> "E13" = contact 3) and separators, then reads the leading number.
+function contactNum(name, group) {
+  const n = String(name).replace(/[\s'\-_]/g, '').toLowerCase();
+  const g = String(group || '').replace(/[\s'\-_]/g, '').toLowerCase();
+  if (g && n.startsWith(g)) {
+    const m = n.slice(g.length).match(/^(\d+)/);
+    if (m) return parseInt(m[1], 10);
+  }
+  const t = n.match(/(\d+)$/);
+  return t ? parseInt(t[1], 10) : 0;
+}
+
 /**
  * Stacked sEEG trace panel (canvas), correlated with the brain view.
  *
@@ -40,7 +54,8 @@ export default function SeegTracePanel({
     return s;
   }, [data.channels, data.groups, mappedSet]);
 
-  // Rows to draw: channel index (ci) into the data columns, filtered by scope.
+  // Rows to draw: channel index (ci) into the data columns, filtered by scope and
+  // ordered naturally — by shaft (first-appearance order) then numeric contact.
   const rows = useMemo(() => {
     const out = [];
     data.channels.forEach((name, ci) => {
@@ -49,8 +64,13 @@ export default function SeegTracePanel({
       if (scope === 'shaft' && shaft && group !== shaft) return;
       out.push({ name, group, ci });
     });
+    out.sort((a, b) => {
+      const ga = shafts.indexOf(a.group), gb = shafts.indexOf(b.group);
+      if (ga !== gb) return ga - gb;
+      return contactNum(a.name, a.group) - contactNum(b.name, b.group);
+    });
     return out;
-  }, [data.channels, data.groups, mappedSet, scope, shaft]);
+  }, [data.channels, data.groups, mappedSet, scope, shaft, shafts]);
 
   const nT = data.times.length;
   const isRaw = signal === 'raw';
