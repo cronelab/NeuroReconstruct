@@ -124,12 +124,18 @@ export default function SeegViewer({ reconId, onBack }) {
   const shaftColors = useMemo(
     () => buildShaftColorMap(reconstruction?.electrode_shafts), [reconstruction]);
 
-  // ── Domain (color-scale half-range): robust max of |activity| ─────────────────
+  // ── Domain (color-scale half-range): 95th percentile of |activity| ────────────
+  // A robust upper bound: using the raw max lets a single extreme contact compress
+  // the color range for everyone else, so use the 95th percentile of |z| instead.
   const domain = useMemo(() => {
-    if (!seegActivity?.activity?.length) return 6;
-    let m = 0;
-    for (const row of seegActivity.activity) for (const v of row) m = Math.max(m, Math.abs(v));
-    return Math.max(3, Math.min(15, Math.round(m)));
+    const act = seegActivity?.activity;
+    if (!act?.length) return 6;
+    const vals = [];
+    for (const row of act) for (const v of row) vals.push(Math.abs(v));
+    if (!vals.length) return 6;
+    vals.sort((a, b) => a - b);
+    const p95 = vals[Math.floor(0.95 * (vals.length - 1))];
+    return Math.max(3, Math.min(15, Math.round(p95)));
   }, [seegActivity]);
 
   // ── Resolve contacts (native brain space) at the current time index ───────────
