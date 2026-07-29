@@ -74,17 +74,21 @@ export default function SeegTracePanel({
 
   const nT = data.times.length;
   const isRaw = signal === 'raw';
+  // The two-phase fetch fills raw voltages (phase 2) after the activation map
+  // (phase 1); until then data.raw is empty. Guard so voltage mode doesn't index
+  // into a missing array.
+  const rawReady = !isRaw || (Array.isArray(data.raw) && data.raw.length === nT);
 
   // Common gain for raw voltage: 98th percentile of |uV| across shown rows.
   const rawScale = useMemo(() => {
-    if (!isRaw) return 1;
+    if (!isRaw || !rawReady) return 1;
     let m = 1e-6;
     const step = Math.max(1, Math.floor(nT / 400));
     for (const r of rows) for (let k = 0; k < nT; k += step) {
       const v = Math.abs(data.raw[k][r.ci]); if (v > m) m = v;
     }
     return m;
-  }, [isRaw, rows, data.raw, nT]);
+  }, [isRaw, rawReady, rows, data.raw, nT]);
 
   // ── Track width ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -124,21 +128,28 @@ export default function SeegTracePanel({
       // label
       ctx.fillStyle = hot ? '#e8edf2' : '#8a97a6';
       ctx.fillText(r.name, 6, yc);
-      // trace
-      ctx.strokeStyle = shaftColor(r.group, shaftColors); ctx.lineWidth = hot ? 1.6 : 1;
-      ctx.globalAlpha = hot ? 1 : 0.85;
-      ctx.beginPath();
-      let started = false;
-      for (let k = 0; k < nT; k += step) {
-        const v = isRaw ? data.raw[k][r.ci] : data.activity[k][r.ci];
-        const x = GUTTER + (nT > 1 ? (k / (nT - 1)) * plotW : 0);
-        const y = yc - Math.max(-1, Math.min(1, v / amp)) * (ROW_H * 0.46);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      // trace (voltage traces are skipped until phase 2 fills data.raw)
+      if (!(isRaw && !rawReady)) {
+        ctx.strokeStyle = shaftColor(r.group, shaftColors); ctx.lineWidth = hot ? 1.6 : 1;
+        ctx.globalAlpha = hot ? 1 : 0.85;
+        ctx.beginPath();
+        let started = false;
+        for (let k = 0; k < nT; k += step) {
+          const v = isRaw ? data.raw[k][r.ci] : data.activity[k][r.ci];
+          const x = GUTTER + (nT > 1 ? (k / (nT - 1)) * plotW : 0);
+          const y = yc - Math.max(-1, Math.min(1, v / amp)) * (ROW_H * 0.46);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.globalAlpha = 1;
       }
-      ctx.stroke();
-      ctx.globalAlpha = 1;
     });
-  }, [data, rows, signal, domain, hoveredChannel, width, canvasH, nT, isRaw, rawScale, shaftColors]);
+
+    if (isRaw && !rawReady) {
+      ctx.fillStyle = '#7a8a99'; ctx.font = '11px IBM Plex Sans, sans-serif';
+      ctx.fillText('Loading voltages…', GUTTER + 8, 12);
+    }
+  }, [data, rows, signal, domain, hoveredChannel, width, canvasH, nT, isRaw, rawReady, rawScale, shaftColors]);
 
   // ── Cursor + interaction ───────────────────────────────────────────────────
   const plotW = width - GUTTER;

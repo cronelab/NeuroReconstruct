@@ -1341,6 +1341,8 @@ class SeegActivityRequest(BaseModel):
     mode: str = "trial"                              # 'trial' | 'scroll'
     # Peri-stimulus window [start_ms, end_ms] relative to onset (start < 0 < end).
     window_ms: Optional[List[float]] = None
+    # False = activation map only (skip the slow raw-voltage read; ``raw`` empty).
+    include_raw: bool = True
 
 
 @app.post("/api/reconstructions/{recon_id}/seeg/{rec_id}/activity")
@@ -1369,29 +1371,29 @@ async def compute_seeg_activity(
         raise HTTPException(status_code=404, detail="Recording file missing on disk")
 
     from services.seeg_service import (
-        compute_band_activity, compute_continuous_traces, parse_seeg_h5,
-        join_channels_to_contacts, BANDS,
+        compute_activity, parse_seeg_h5, join_channels_to_contacts,
+        BANDS, DEFAULT_WINDOW_MS,
     )
     if req.band not in BANDS:
         raise HTTPException(status_code=400, detail=f"band must be one of {sorted(BANDS)}")
     if req.mode not in ("trial", "scroll"):
         raise HTTPException(status_code=400, detail="mode must be 'trial' or 'scroll'")
 
+    window = None
+    if req.mode == "trial":
+        window = tuple(req.window_ms) if req.window_ms else DEFAULT_WINDOW_MS
+        if len(window) != 2 or not (window[0] < 0 < window[1]):
+            raise HTTPException(status_code=400,
+                                detail="window_ms must be [start, end] with start < 0 < end")
+
     # Signal processing is CPU-bound; keep the event loop responsive.
     loop = asyncio.get_event_loop()
     try:
-        if req.mode == "scroll":
-            activity = await loop.run_in_executor(
-                None, lambda: compute_continuous_traces(h5_path, req.band)
-            )
-        else:
-            window = tuple(req.window_ms) if req.window_ms else (-200.0, 800.0)
-            if len(window) != 2 or not (window[0] < 0 < window[1]):
-                raise HTTPException(status_code=400,
-                                    detail="window_ms must be [start, end] with start < 0 < end")
-            activity = await loop.run_in_executor(
-                None, lambda: compute_band_activity(h5_path, req.band, window)
-            )
+        activity = await loop.run_in_executor(
+            None, lambda: compute_activity(
+                h5_path, mode=req.mode, band=req.band, window_ms=window,
+                include_raw=req.include_raw)
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 

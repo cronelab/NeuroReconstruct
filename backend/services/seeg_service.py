@@ -26,8 +26,20 @@ new dependency. Log output stays ASCII (uvicorn stdout is cp1252 on Windows).
 import os
 import re
 import json
+import time
+from collections import OrderedDict
 
 import numpy as np
+
+# Stage-timing / diagnostic logging is gated behind an env flag so normal runs stay
+# quiet. Set SEEG_DEBUG=1 (or true/yes/on) to print [SEEG] timings to stdout.
+_DEBUG = os.environ.get("SEEG_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dbg(msg: str):
+    if _DEBUG:
+        print(msg)
+
 
 # Channel types we map onto the brain. Micro-wire and EKG are excluded.
 MAPPABLE_TYPES = {"seeg", "scalp_eeg"}
@@ -43,7 +55,7 @@ BANDS = {
 }
 
 DEFAULT_BAND = "high_gamma"
-DEFAULT_WINDOW_MS = (-200.0, 800.0)   # peri-stimulus window (relative to onset)
+DEFAULT_WINDOW_MS = (-500.0, 2000.0)  # peri-stimulus window (relative to onset)
 MAX_OUTPUT_FRAMES = 1500              # cap frames sent to the client per request
 
 
@@ -182,9 +194,16 @@ def _band_envelope(sig: np.ndarray, fs: float, band: tuple) -> np.ndarray:
         return np.abs(sig).astype(np.float32)
 
     b, a = butter(4, [lo / nyq, hi / nyq], btype="band")
-    # filtfilt/hilbert operate along axis 0 (time).
+    # filtfilt/hilbert operate along axis 0 (time). hilbert FFTs at exactly
+    # n_samples; padding to a fast length was measured to perturb the displayed
+    # z-score by up to ~0.9 near recording edges, so we keep the exact length.
+    t0 = time.perf_counter()
     filtered = filtfilt(b, a, sig, axis=0)
+    t1 = time.perf_counter()
     env = np.abs(hilbert(filtered, axis=0))
+    t2 = time.perf_counter()
+    _dbg(f"[SEEG] band envelope: filtfilt {t1 - t0:.2f}s + hilbert {t2 - t1:.2f}s "
+          f"(n={filtered.shape[0]}, {sig.shape[1]} ch)")
     return env.astype(np.float32)
 
 
@@ -199,67 +218,103 @@ def _env_cache_path(h5_path: str, band: str) -> str:
                         f"{os.path.basename(h5_path)}.{band}.npz")
 
 
-def _load_or_compute_envelope(h5_path: str, band: str, sig: np.ndarray, fs: float) -> np.ndarray:
+def _load_or_compute_envelope(h5_path: str, band: str, meta: dict):
     """
-    Band envelope for ``sig``, cached on disk keyed by (h5 file, band).
+    Band envelope, cached on disk keyed by (h5 file, band).
+
+    On a cache MISS the full signal is read here (the filtfilt+Hilbert needs it)
+    and returned so the caller can reuse it for the raw ERP -- avoiding a second
+    read. On a HIT the signal is NOT read at all.
+
+    Returns (env, full_sig_or_None). full_sig is None on a cache hit.
 
     The cache stores the source file's size + mtime; a changed/replaced file
     (different size, mtime, or channel count) misses and is recomputed. Cache
     read/write failures degrade silently to a fresh computation.
     """
     cache = _env_cache_path(h5_path, band)
+    shape = (meta["n_samples"], len(meta["channels"]))
     try:
         st = os.stat(h5_path)
         if os.path.exists(cache):
+            t0 = time.perf_counter()
             with np.load(cache, allow_pickle=False) as d:
                 if (int(d["src_size"]) == st.st_size
                         and abs(float(d["src_mtime"]) - st.st_mtime) < 1e-3
-                        and tuple(d["shape"]) == sig.shape):
-                    return d["env"]
+                        and tuple(d["shape"]) == shape):
+                    env = d["env"]
+                    _dbg(f"[SEEG] env cache hit ({band}): loaded in {time.perf_counter() - t0:.2f}s")
+                    return env, None
     except Exception as e:
-        print(f"[SEEG] env cache read miss ({band}): {e}")
+        _dbg(f"[SEEG] env cache read miss ({band}): {e}")
 
-    env = _band_envelope(sig, fs, BANDS[band])
+    _dbg(f"[SEEG] env cache miss ({band}): reading full signal + computing envelope")
+    sig = _read_full_signal(h5_path, meta)
+    env = _band_envelope(sig, meta["rate_hz"], BANDS[band])
     try:
         os.makedirs(os.path.dirname(cache), exist_ok=True)
         st = os.stat(h5_path)
         np.savez(cache, env=env, shape=np.array(sig.shape, dtype=np.int64),
                  src_size=np.int64(st.st_size), src_mtime=np.float64(st.st_mtime))
     except Exception as e:
-        print(f"[SEEG] env cache write failed ({band}): {e}")
-    return env
+        _dbg(f"[SEEG] env cache write failed ({band}): {e}")
+    return env, sig
 
 
-def _load_mappable_signal(path: str):
-    """
-    Load the mappable-channel signal block from an h5.
+# ── Mappable-channel signal reads ─────────────────────────────────────────────
+# The ieeg data is gzip-compressed and chunked across channels (e.g. 3 ch/chunk),
+# so reads are decompression-bound. Three access patterns, cheapest first:
+#   * _read_windows  -- only the epoch row-ranges (trial mode, env cached)
+#   * _read_strided  -- every step-th sample (continuous mode, env cached)
+#   * _read_full     -- the whole block (needed to compute the envelope on a miss)
+# In every case we read full-width rows then subset columns in numpy: h5py fancy
+# COLUMN indexing (data[:, cols]) is ~10x slower than reading rows + numpy subset.
 
-    Returns (meta, fs, names, groups, sig) where sig is (n_samples, n_channels)
-    float32 volts in the mappable-channel order. sig has 0 columns if none map.
+def _read_full_signal(h5_path: str, meta: dict) -> np.ndarray:
+    """Contiguous read of the whole mappable-channel block, (n_samples, n_ch) float32."""
+    import h5py
+    cols = [c["col"] for c in meta["channels"]]
+    with h5py.File(h5_path, "r") as h5:
+        data = h5["ieeg"][meta["group_name"]]["data"]
+        return data[:][:, cols].astype(np.float32, copy=False)
+
+
+def _read_windows(h5_path: str, meta: dict, windows) -> list:
+    """Lazily read only the given [s, e) sample windows for mappable channels.
+
+    Returns a list of (e-s, n_ch) float32 arrays aligned to ``windows``. Reading
+    only the epoch row-ranges avoids decompressing the whole recording when the
+    envelope is already cached and only the raw ERP epochs are needed.
     """
     import h5py
-
-    meta = parse_seeg_h5(path)
-    fs = meta["rate_hz"]
     cols = [c["col"] for c in meta["channels"]]
-    names = [c["name"] for c in meta["channels"]]
-    groups = [c["group"] for c in meta["channels"]]
-    if not cols:
-        return meta, fs, names, groups, np.zeros((meta["n_samples"], 0), dtype=np.float32)
+    out = []
+    with h5py.File(h5_path, "r") as h5:
+        d = h5["ieeg"][meta["group_name"]]["data"]
+        for s, e in windows:
+            out.append(d[s:e][:, cols].astype(np.float32))
+    return out
 
-    with h5py.File(path, "r") as h5:
-        # h5py fancy-indexing needs sorted, unique columns; restore order after.
-        data = h5["ieeg"][meta["group_name"]]["data"]
-        order = np.argsort(cols)
-        sig_sorted = data[:, list(np.array(cols)[order])].astype(np.float32)
-        sig = sig_sorted[:, np.argsort(order)]
-    return meta, fs, names, groups, sig
+
+def _read_strided(h5_path: str, meta: dict, step: int) -> np.ndarray:
+    """Lazily read every ``step``-th sample for mappable channels (continuous view).
+
+    Continuous decimation spans the whole recording, so this still touches every
+    gzip chunk, but it skips materializing + decimating the full 300+ MB array,
+    which is ~30% faster than a full read.
+    """
+    import h5py
+    cols = [c["col"] for c in meta["channels"]]
+    with h5py.File(h5_path, "r") as h5:
+        d = h5["ieeg"][meta["group_name"]]["data"]
+        return d[::step][:, cols].astype(np.float32)
 
 
 def compute_band_activity(path: str, band: str = DEFAULT_BAND,
                           window_ms: tuple = DEFAULT_WINDOW_MS,
                           baseline_ms: tuple = None,
-                          max_frames: int = MAX_OUTPUT_FRAMES) -> dict:
+                          max_frames: int = MAX_OUTPUT_FRAMES,
+                          include_raw: bool = True) -> dict:
     """
     Compute the event-related display activity matrix for one h5 recording.
 
@@ -287,12 +342,17 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
         raise ValueError(f"unknown band {band!r}; options: {sorted(BANDS)}")
     if baseline_ms is None:
         baseline_ms = (window_ms[0], 0.0)
-    meta, fs, names, groups, sig = _load_mappable_signal(path)
-    if sig.shape[1] == 0:
+    meta = parse_seeg_h5(path)
+    fs = meta["rate_hz"]
+    names = [c["name"] for c in meta["channels"]]
+    groups = [c["group"] for c in meta["channels"]]
+    if not meta["channels"]:
         return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
                 "mode": "trial", "time_unit": "ms", "band": band, "n_trials": 0}
 
-    env = _load_or_compute_envelope(path, band, sig, fs)
+    t_env = time.perf_counter()
+    env, full_sig = _load_or_compute_envelope(path, band, meta)
+    _dbg(f"[SEEG] trial: envelope ready in {time.perf_counter() - t_env:.2f}s")
 
     # ── Trial-averaged: epoch around trial onsets ─────────────────────────────
     onsets = np.array([t["start_time"] for t in meta["trials"]], dtype=np.float64)
@@ -307,55 +367,80 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
 
     n_ch = env.shape[1]
     n_samp = env.shape[0]
-    acc = np.zeros((n_pst, n_ch), dtype=np.float64)          # z-score envelope
-    acc_raw = np.zeros((n_pst, n_ch), dtype=np.float64)      # baseline-corrected ERP
-    used = 0
-    b0 = int(round(baseline_ms[0] / 1000.0 * fs)) + pre      # index into epoch
-    b1 = int(round(baseline_ms[1] / 1000.0 * fs)) + pre
-    b0, b1 = max(0, b0), max(1, min(n_pst, b1))
 
+    # Trial epochs fully inside the segment (edge-truncated epochs are dropped).
+    windows = []
     for onset in onsets:
         c = int(round(onset * fs))
         s, e = c - pre, c + post
         if s < 0 or e > n_samp:
-            continue  # epoch runs off the segment edge
+            continue
+        windows.append((s, e))
+    if not windows:
+        raise ValueError("all trial epochs fell outside the segment -- check onsets")
+
+    # Raw voltage for the ERP is only needed for the trace panel, and reading it is
+    # the slow part on a cache hit. When include_raw is False the caller wants just
+    # the activation map, so we skip the raw read entirely (see compute_activity).
+    raw_epochs = None
+    if include_raw:
+        t_raw = time.perf_counter()
+        if full_sig is not None:
+            raw_epochs = [full_sig[s:e] for s, e in windows]
+            raw_src = "reused full signal"
+        else:
+            raw_epochs = _read_windows(path, meta, windows)
+            raw_src = "lazy epoch reads"
+        _dbg(f"[SEEG] trial: raw epochs ({len(windows)}) via {raw_src} in {time.perf_counter() - t_raw:.2f}s")
+
+    acc = np.zeros((n_pst, n_ch), dtype=np.float64)          # z-score envelope
+    acc_raw = np.zeros((n_pst, n_ch), dtype=np.float64) if include_raw else None
+    b0 = int(round(baseline_ms[0] / 1000.0 * fs)) + pre      # index into epoch
+    b1 = int(round(baseline_ms[1] / 1000.0 * fs)) + pre
+    b0, b1 = max(0, b0), max(1, min(n_pst, b1))
+
+    for i, (s, e) in enumerate(windows):
         epoch = env[s:e]                                    # (n_pst, n_ch)
         base = epoch[b0:b1]
         acc += (epoch - base.mean(axis=0)) / (base.std(axis=0) + 1e-9)
-        raw_epoch = sig[s:e]
-        acc_raw += raw_epoch - raw_epoch[b0:b1].mean(axis=0)  # baseline-corrected
-        used += 1
-
-    if used == 0:
-        raise ValueError("all trial epochs fell outside the segment -- check onsets")
+        if include_raw:
+            raw_epoch = raw_epochs[i]
+            acc_raw += raw_epoch - raw_epoch[b0:b1].mean(axis=0)  # baseline-corrected
+    used = len(windows)
     # Degenerate channels (flat / all-zero signal) can yield NaN/Inf, which is not
     # JSON-serializable -- map them to 0 (neutral / baseline).
     avg = np.nan_to_num(acc / used, nan=0.0, posinf=0.0, neginf=0.0)
-    avg_raw = np.nan_to_num(acc_raw / used, nan=0.0, posinf=0.0, neginf=0.0) * 1e6  # uV
+    avg_raw = (np.nan_to_num(acc_raw / used, nan=0.0, posinf=0.0, neginf=0.0) * 1e6
+               if include_raw else None)  # uV
 
     # The pre-onset samples exist only to build the baseline; the displayed time
     # course runs over the POST-stimulus window [0, end] ms.
     post_mask = pst_times_ms >= 0
-    avg, avg_raw, pst_times_ms = avg[post_mask], avg_raw[post_mask], pst_times_ms[post_mask]
+    avg, pst_times_ms = avg[post_mask], pst_times_ms[post_mask]
+    if include_raw:
+        avg_raw = avg_raw[post_mask]
 
     # Decimate the post-stimulus time axis if very long.
     n_out = len(pst_times_ms)
     if n_out > max_frames:
         sel = np.arange(0, n_out, int(np.ceil(n_out / max_frames)))
-        avg, avg_raw, pst_times_ms = avg[sel], avg_raw[sel], pst_times_ms[sel]
+        avg, pst_times_ms = avg[sel], pst_times_ms[sel]
+        if include_raw:
+            avg_raw = avg_raw[sel]
 
     return {
         "channels": names,
         "groups": groups,
         "times": [round(float(t), 2) for t in pst_times_ms],
         "activity": np.round(avg, 3).tolist(),
-        "raw": np.round(avg_raw, 2).tolist(),
+        "raw": np.round(avg_raw, 2).tolist() if include_raw else [],
         "mode": "trial", "time_unit": "ms", "band": band, "n_trials": used,
     }
 
 
 def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
-                              max_frames: int = 2500) -> dict:
+                              max_frames: int = 2500,
+                              include_raw: bool = True) -> dict:
     """
     Continuous (scrollable) traces over the whole recording.
 
@@ -367,26 +452,128 @@ def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
     """
     if band not in BANDS:
         raise ValueError(f"unknown band {band!r}; options: {sorted(BANDS)}")
-    meta, fs, names, groups, sig = _load_mappable_signal(path)
-    if sig.shape[1] == 0:
+    meta = parse_seeg_h5(path)
+    fs = meta["rate_hz"]
+    names = [c["name"] for c in meta["channels"]]
+    groups = [c["group"] for c in meta["channels"]]
+    if not meta["channels"]:
         return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
                 "mode": "scroll", "time_unit": "s", "band": band, "n_trials": 0}
 
-    env = _load_or_compute_envelope(path, band, sig, fs)
+    t_env = time.perf_counter()
+    env, full_sig = _load_or_compute_envelope(path, band, meta)
+    _dbg(f"[SEEG] scroll: envelope ready in {time.perf_counter() - t_env:.2f}s")
+    # z-score over the whole recording; env stats are cheap on the (cached) envelope.
     z = np.nan_to_num((env - env.mean(axis=0)) / (env.std(axis=0) + 1e-9),
                       nan=0.0, posinf=0.0, neginf=0.0)
 
-    n = sig.shape[0]
-    idx = np.arange(0, n, int(np.ceil(n / max_frames))) if n > max_frames else np.arange(n)
+    n = env.shape[0]
+    step = int(np.ceil(n / max_frames)) if n > max_frames else 1
+    idx = np.arange(0, n, step)
     times_s = idx / fs
+
+    # Decimated raw voltage (trace panel only). Skipped when the caller wants just
+    # the activation map (include_raw False). Otherwise reuse the full signal if the
+    # env miss already read it, else a strided lazy read.
+    raw = None
+    if include_raw:
+        t_raw = time.perf_counter()
+        if full_sig is not None:
+            raw = full_sig[idx]
+            raw_src = "reused full signal"
+        else:
+            raw = _read_strided(path, meta, step)[:len(idx)]
+            raw_src = "strided lazy read"
+        _dbg(f"[SEEG] scroll: decimated raw via {raw_src} in {time.perf_counter() - t_raw:.2f}s")
+
     return {
         "channels": names,
         "groups": groups,
         "times": [round(float(t), 4) for t in times_s],
         "activity": np.round(z[idx], 3).tolist(),
-        "raw": np.round(sig[idx] * 1e6, 2).tolist(),   # uV
+        "raw": np.round(raw * 1e6, 2).tolist() if include_raw else [],   # uV
         "mode": "scroll", "time_unit": "s", "band": band, "n_trials": 0,
     }
+
+
+# ── In-process result cache + cached dispatch ────────────────────────────────
+# Computed activity/trace responses are a pure function of (file identity, mode,
+# band, window, include_raw, max_frames). Memoize them in an LRU so flipping back
+# to a previously-viewed recording+settings is instant. Entries are small (the
+# decimated matrices), so a few dozen cost only tens of MB of RAM -- no disk.
+
+_RESULT_CACHE = OrderedDict()
+_RESULT_CACHE_MAX = 32
+
+
+def _file_identity(path: str):
+    try:
+        st = os.stat(path)
+        return (st.st_size, round(st.st_mtime, 3))
+    except OSError:
+        return None
+
+
+def _cache_get(key):
+    val = _RESULT_CACHE.get(key)
+    if val is not None:
+        _RESULT_CACHE.move_to_end(key)
+    return val
+
+
+def _cache_put(key, val):
+    _RESULT_CACHE[key] = val
+    _RESULT_CACHE.move_to_end(key)
+    while len(_RESULT_CACHE) > _RESULT_CACHE_MAX:
+        _RESULT_CACHE.popitem(last=False)
+
+
+def clear_result_cache():
+    """Drop all memoized results (used by tests)."""
+    _RESULT_CACHE.clear()
+
+
+def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND,
+                     window_ms=None, include_raw: bool = True,
+                     max_frames: int = None) -> dict:
+    """
+    Cached dispatch for trial/scroll activity.
+
+    include_raw=False returns just the activation map (``raw`` empty), skipping the
+    slow raw-voltage read so the map can render fast; a follow-up include_raw=True
+    call fills in the trace-panel voltages. Results are memoized per distinct key.
+    """
+    if mode not in ("trial", "scroll"):
+        raise ValueError(f"unknown mode {mode!r}; options: ['trial', 'scroll']")
+    if band not in BANDS:
+        raise ValueError(f"unknown band {band!r}; options: {sorted(BANDS)}")
+
+    ident = _file_identity(path)
+    if mode == "trial":
+        window = tuple(window_ms) if window_ms else DEFAULT_WINDOW_MS
+        mf = max_frames if max_frames is not None else MAX_OUTPUT_FRAMES
+        base = (os.path.abspath(path), ident, "trial", band, window, mf)
+    else:
+        mf = max_frames if max_frames is not None else 2500
+        base = (os.path.abspath(path), ident, "scroll", band, mf)
+
+    hit = _cache_get(base + (include_raw,))
+    if hit is not None:
+        _dbg(f"[SEEG] result cache hit ({mode}, {band}, raw={include_raw})")
+        return hit
+    # A cached full result (with raw) also satisfies a raw=False request.
+    if not include_raw:
+        full = _cache_get(base + (True,))
+        if full is not None:
+            _dbg(f"[SEEG] result cache hit ({mode}, {band}, reused full for raw=False)")
+            return full
+
+    if mode == "trial":
+        result = compute_band_activity(path, band, window, max_frames=mf, include_raw=include_raw)
+    else:
+        result = compute_continuous_traces(path, band, max_frames=mf, include_raw=include_raw)
+    _cache_put(base + (include_raw,), result)
+    return result
 
 
 # ── Channel <-> contact name join ────────────────────────────────────────────

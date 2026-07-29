@@ -72,9 +72,9 @@ export const useAppStore = create((set, get) => ({
   seegBand: 'high_gamma',
   setSeegBand: (b) => set({ seegBand: b }),
   // Trial-averaged peri-stimulus window (ms magnitudes before/after onset).
-  seegPre: 200,
+  seegPre: 500,
   setSeegPre: (v) => set({ seegPre: v }),
-  seegPost: 800,
+  seegPost: 2000,
   setSeegPost: (v) => set({ seegPost: v }),
   seegMode: 'trial',             // 'trial' (trial-averaged) | 'scroll' (continuous)
   setSeegMode: (m) => set({ seegMode: m }),

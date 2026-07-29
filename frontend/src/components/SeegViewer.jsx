@@ -67,6 +67,7 @@ export default function SeegViewer({ reconId, onBack }) {
   const [computing, setComputing] = useState(false);
   const [error, setError] = useState(null);
   const fileRef = useRef(null);
+  const reqSeqRef = useRef(0);   // guards against stale two-phase responses
 
   // Draft window inputs — applied to the store (which triggers recompute) only on
   // commit, so typing doesn't fire a recompute on every keystroke.
@@ -99,16 +100,39 @@ export default function SeegViewer({ reconId, onBack }) {
   };
 
   // ── Compute activity whenever recording / band / window changes ───────────────
+  // Two-phase fetch: phase 1 asks for the activation map only (include_raw=false),
+  // which returns fast so the brain re-colors and the spinner clears; phase 2 then
+  // fetches the raw voltages to fill the trace panel. reqSeqRef discards responses
+  // from a request that a newer switch has superseded.
   useEffect(() => {
-    if (!reconId || !seegRecordingId) return;
+    if (!reconId || !seegRecordingId) return undefined;
+    const seq = ++reqSeqRef.current;
+    const params = { band: seegBand, mode: seegMode, window_ms: [-seegPre, seegPost] };
     setComputing(true);
     setError(null);
     setSeegPlaying(false);
-    computeSeegActivity(reconId, seegRecordingId,
-      { band: seegBand, mode: seegMode, window_ms: [-seegPre, seegPost] })
-      .then((r) => setSeegActivity(r.data))
-      .catch((e) => { setError(e?.response?.data?.detail || 'Could not compute activity'); setSeegActivity(null); })
-      .finally(() => setComputing(false));
+    computeSeegActivity(reconId, seegRecordingId, { ...params, include_raw: false })
+      .then((r) => {
+        if (seq !== reqSeqRef.current) return;                 // superseded
+        setSeegActivity(r.data);
+        setComputing(false);                                   // map is ready
+        // Phase 2: raw voltages for the trace panel (map stays put on failure).
+        computeSeegActivity(reconId, seegRecordingId, { ...params, include_raw: true })
+          .then((r2) => {
+            if (seq !== reqSeqRef.current) return;
+            // setSeegActivity has no functional-updater form; read latest from the store.
+            const cur = useAppStore.getState().seegActivity;
+            setSeegActivity(cur ? { ...cur, raw: r2.data.raw } : r2.data);
+          })
+          .catch(() => {});
+      })
+      .catch((e) => {
+        if (seq !== reqSeqRef.current) return;
+        setError(e?.response?.data?.detail || 'Could not compute activity');
+        setSeegActivity(null);
+        setComputing(false);
+      });
+    return undefined;
   }, [reconId, seegRecordingId, seegBand, seegMode, seegPre, seegPost]);
 
   // ── Playback ──────────────────────────────────────────────────────────────────
