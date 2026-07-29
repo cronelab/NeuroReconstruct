@@ -53,7 +53,7 @@ export default function SeegViewer({ reconId, onBack }) {
     seegTraceSignal, setSeegTraceSignal, seegTraceScope, setSeegTraceScope,
     seegTraceShaft, setSeegTraceShaft, seegTracePanelW, setSeegTracePanelW,
     seegBrainOpacity, setSeegBrainOpacity, seegStructureOpacity, setSeegStructureOpacity,
-    seegIgnoreOutside, setSeegIgnoreOutside,
+    seegIgnoreOutside, setSeegIgnoreOutside, seegColorLimit, setSeegColorLimit,
     seegTimeIndex, setSeegTimeIndex, seegPlaying, setSeegPlaying,
     // Structures live in the global store so the shared StructurePanel (master
     // toggle + hierarchical tri-state + opacity) drives both this view and the
@@ -153,11 +153,13 @@ export default function SeegViewer({ reconId, onBack }) {
     return map;
   }, [seegIgnoreOutside, brainRaycastMesh, seegActivity?.coords_native]);
 
-  // ── Domain (color-scale half-range): 95th percentile of |activity| ────────────
+  // ── Domain (color-scale half-range): 99th percentile of |activity| ────────────
   // A robust upper bound: using the raw max lets a single extreme contact compress
-  // the color range for everyone else, so use the 95th percentile of |z| instead.
-  // Contacts outside the brain are excluded when "ignore outside" is on.
-  const domain = useMemo(() => {
+  // the color range for everyone else, so use the 99th percentile of |z| instead.
+  // Contacts outside the brain are excluded when "ignore outside" is on. No floor
+  // is applied, so quiet recordings get a tight scale; a manual limit
+  // (seegColorLimit) overrides this auto value when set.
+  const autoDomain = useMemo(() => {
     const act = seegActivity?.activity;
     if (!act?.length) return 6;
     const chans = seegActivity.channels;
@@ -170,9 +172,14 @@ export default function SeegViewer({ reconId, onBack }) {
     }
     if (!vals.length) return 6;
     vals.sort((a, b) => a - b);
-    const p95 = vals[Math.floor(0.95 * (vals.length - 1))];
-    return Math.max(3, Math.min(15, Math.round(p95)));
+    const p99 = vals[Math.floor(0.99 * (vals.length - 1))];
+    // No floor or ceiling — the scale tracks the data; use the manual limit to
+    // tame outliers. The guard only handles the all-zero case.
+    if (p99 <= 0) return 6;
+    return Math.round(p99 * 10) / 10;
   }, [seegActivity, seegIgnoreOutside, insideByName]);
+
+  const domain = (seegColorLimit != null && seegColorLimit > 0) ? seegColorLimit : autoDomain;
 
   // ── Resolve contacts (native brain space) at the current time index ───────────
   const contacts = useMemo(() => {
@@ -294,7 +301,26 @@ export default function SeegViewer({ reconId, onBack }) {
           </>)}
         </div>
 
-        <ColorBar domain={domain} />
+        <div>
+          <ColorBar domain={domain} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
+            <span style={{ fontSize: 10, color: '#7a8a99' }}>Limit ±z</span>
+            <input type="number" min={0.1} step={0.5} placeholder={String(autoDomain)}
+              value={seegColorLimit ?? ''}
+              onChange={(e) => {
+                const v = e.target.value;
+                setSeegColorLimit(v === '' ? null : Math.max(0.1, Number(v)));
+              }}
+              style={{ width: 56, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
+                border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }} />
+            <button onClick={() => setSeegColorLimit(null)} disabled={seegColorLimit == null}
+              style={{ ...seg(false), padding: '4px 10px', opacity: seegColorLimit == null ? 0.4 : 1,
+                cursor: seegColorLimit == null ? 'default' : 'pointer' }}>Auto</button>
+          </div>
+          <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 4 }}>
+            {seegColorLimit != null ? 'Manual color limit' : `Auto · 99th percentile of |z| (±${autoDomain})`}
+          </div>
+        </div>
 
         {/* Brain surface opacity */}
         <div>
