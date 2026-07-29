@@ -189,6 +189,10 @@ export default function SeegTracePanel({
 
   const tUnit = data.time_unit || 'ms';
   const tVal = data.times[timeIndex];
+  // Continuous (seconds) timestamps show one decimal; trial (ms) rounds to the
+  // nearest whole millisecond.
+  const tDisplay = typeof tVal !== 'number' ? `${tVal}`
+    : tUnit === 's' ? tVal.toFixed(1) : tVal.toFixed(0);
 
   // Editable current-time field: type a timestamp and jump to the nearest frame.
   const [editingTime, setEditingTime] = useState(false);
@@ -238,7 +242,7 @@ export default function SeegTracePanel({
         )}
         <div style={{ flex: 1 }} />
         <input
-          value={editingTime ? timeDraft : `${tVal}`}
+          value={editingTime ? timeDraft : tDisplay}
           onFocus={() => { setEditingTime(true); setTimeDraft(String(tVal)); }}
           onChange={(e) => setTimeDraft(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') { commitTime(); e.currentTarget.blur(); } }}
