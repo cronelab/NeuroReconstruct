@@ -1,5 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import * as THREE from 'three';
 import { useAppStore } from '../store';
+import { buildStructureMeshes, structureAtPoint } from '../anatomy';
 import LocatorOverlay from './LocatorOverlay';
 
 const AXIS_INFO = {
@@ -12,6 +14,20 @@ const PREFETCH_AHEAD = 10;
 const PREFETCH_BEHIND = 4;
 const MAX_CONCURRENT = 6; // throttle simultaneous requests
 const CONTACT_THICKNESS_MM = 4.0; // show contacts within ±this many mm of slice plane
+
+// Raycastable structure meshes for the electrode-centric hover (which structure a
+// contact sits in). Built once per structuresData and shared across all SliceViewer
+// instances (one per axis) since the coordinate space is identical. Tests every
+// structure -- including hidden ones -- to match the 3D viewer's naming.
+let _structMeshKey = null;
+let _structMeshes = null;
+function getStructureMeshes(structuresData) {
+  if (structuresData === _structMeshKey) return _structMeshes;
+  if (_structMeshes) _structMeshes.forEach(m => m.geometry.dispose());
+  _structMeshes = structuresData ? buildStructureMeshes(structuresData) : null;
+  _structMeshKey = structuresData;
+  return _structMeshes;
+}
 
 export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = false, onSliceChange, locator }) {
   const { reconstruction, meshData, structuresData, structureVisible } = useAppStore();
@@ -42,6 +58,15 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
   const [sliceLabel, setSliceLabel] = useState({ idx: 0, count: 1 });
   const [status, setStatus] = useState('loading');
   const [errorMsg, setErrorMsg] = useState('');
+
+  // Electrode-centric hover: screen positions of the contacts drawn this frame (for
+  // hit-testing), the currently-hovered contact id, and a per-contact region cache
+  // (structureAtPoint is a multi-mesh raycast, so cache it across mouse moves).
+  const contactHitsRef = useRef([]);
+  const hoveredIdRef = useRef(null);
+  const regionCacheRef = useRef(new Map());
+  const [hoveredContact, setHoveredContact] = useState(null);
+
   const info = AXIS_INFO[axis];
 
   const triggerDraw = useCallback(() => setRenderTick(t => t + 1), []);
@@ -142,6 +167,7 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
       // and stretch the overlay by n/(n-1) about the centre.
       const flipNorm = (v, n) => (n - 0.5 - v) / n;
 
+      const hits = [];
       shafts.forEach(shaft => {
         (shaft.contacts || []).forEach(c => {
           if (c.x_mm == null) return;
@@ -206,8 +232,23 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
           ctx.strokeStyle = '#000';
           ctx.lineWidth = 1;
           ctx.stroke();
+
+          const id = `${shaft.id}-${c.contact_number}`;
+          const label = `${shaft.name}${c.contact_number}${shaft.label ? ` (${shaft.label})` : ''}`;
+          hits.push({ id, canX, canY, radius, color: shaft.color,
+            meshPos: [c.x_mm, c.y_mm, c.z_mm], label });
+
+          // Electrode-centric hover: ring the hovered contact (matches 3D viewer).
+          if (id === hoveredIdRef.current) {
+            ctx.beginPath();
+            ctx.arc(canX, canY, radius + 4, 0, Math.PI * 2);
+            ctx.strokeStyle = shaft.color;
+            ctx.lineWidth = 2;
+            ctx.stroke();
+          }
         });
       });
+      contactHitsRef.current = hits;
 
       // Labels
       ctx.fillStyle = info.color;
@@ -317,6 +358,9 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
     const clamped = Math.max(0, Math.min(sliceCountRef.current - 1, idx));
     sliceIdxRef.current = clamped;
 
+    // A hovered contact may leave the slice plane on scroll; drop the hover.
+    if (hoveredIdRef.current !== null) { hoveredIdRef.current = null; setHoveredContact(null); }
+
     // Move the scrollbar/label to the requested slice NOW, synchronously —
     // the input is controlled by sliceLabel.idx, so if we waited for the async
     // image to load the thumb would snap back to the previous value mid-drag.
@@ -352,6 +396,14 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
     // Fetch structure overlay for this slice if structures are loaded
     if (useAppStore.getState().structuresData) fetchOverlay(clamped);
   }, [doFetch, triggerDraw, processQueue, onSliceChange, fetchOverlay]);
+
+  // Structure geometry changed -> drop cached contact regions and any active hover
+  // (regions are independent of visibility, so this keys only on structuresData).
+  useEffect(() => {
+    regionCacheRef.current.clear();
+    hoveredIdRef.current = null;
+    setHoveredContact(null);
+  }, [structuresData]);
 
   // When structuresData loads/unloads or visibility changes, clear cache and re-fetch
   useEffect(() => {
@@ -407,6 +459,49 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
     goToSlice(sliceIdxRef.current + dir);
   }, [isThumbnail, goToSlice]);
 
+  // Electrode-centric hover: pick the nearest contact under the cursor, name the
+  // structure it sits in, and ring it -- the same interaction as the 3D viewer.
+  const handleMouseMove = useCallback((e) => {
+    if (isThumbnail) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+
+    let best = null, bestD = Infinity;
+    for (const h of contactHitsRef.current) {
+      const d = Math.hypot(mx - h.canX, my - h.canY);
+      if (d <= h.radius + 4 && d < bestD) { bestD = d; best = h; }
+    }
+    canvas.style.cursor = best ? 'pointer' : 'default';
+
+    if (!best) {
+      if (hoveredIdRef.current !== null) { hoveredIdRef.current = null; setHoveredContact(null); triggerDraw(); }
+      return;
+    }
+    if (best.id === hoveredIdRef.current) {
+      setHoveredContact(hc => (hc ? { ...hc, x: mx, y: my } : hc));  // track cursor
+      return;
+    }
+    hoveredIdRef.current = best.id;
+    let region = regionCacheRef.current.get(best.id);
+    if (region === undefined) {
+      const sd = useAppStore.getState().structuresData;
+      const meshes = getStructureMeshes(sd);
+      region = (sd && meshes && meshes.size)
+        ? structureAtPoint(new THREE.Vector3(best.meshPos[0], best.meshPos[1], best.meshPos[2]), sd, meshes)
+        : null;
+      regionCacheRef.current.set(best.id, region);
+    }
+    setHoveredContact({ id: best.id, label: best.label, color: best.color, region, x: mx, y: my });
+    triggerDraw();
+  }, [isThumbnail, triggerDraw]);
+
+  const handleMouseLeave = useCallback(() => {
+    if (hoveredIdRef.current !== null) { hoveredIdRef.current = null; setHoveredContact(null); triggerDraw(); }
+  }, [triggerDraw]);
+
   const handleScrollbar = useCallback((e) => {
     if (isThumbnail) return;
     const idx = parseInt(e.target.value);
@@ -420,6 +515,8 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
         ref={canvasRef}
         style={{ flex: 1, height: '100%', display: 'block', cursor: isThumbnail ? 'pointer' : 'default', minWidth: 0 }}
         onWheel={handleWheel}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={handleMouseLeave}
       />
       {!isThumbnail && (
         <div style={{ width: 18, height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0d1117', borderLeft: '1px solid #1e2733' }}>
@@ -455,6 +552,30 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
       {status === 'ok' && !isThumbnail && (
         <div style={{ position: 'absolute', bottom: 8, right: 8, fontSize: 10, color: '#2a3340', fontFamily: 'IBM Plex Mono, monospace' }}>
           scroll · {sliceLabel.idx + 1} / {sliceLabel.count}
+        </div>
+      )}
+      {!isThumbnail && hoveredContact && (
+        <div style={{
+          position: 'absolute', left: hoveredContact.x + 12, top: hoveredContact.y + 12,
+          pointerEvents: 'none', zIndex: 6,
+          background: 'rgba(10,12,16,0.92)', border: `1px solid ${hoveredContact.color}`,
+          borderRadius: 4, padding: '5px 10px', maxWidth: 200,
+          fontFamily: 'IBM Plex Mono, monospace', fontSize: 11,
+          boxShadow: `0 0 12px ${hoveredContact.color}44`,
+        }}>
+          <div style={{ color: hoveredContact.color, marginBottom: 3 }}>{hoveredContact.label}</div>
+          {hoveredContact.region ? (
+            hoveredContact.region.inside ? (
+              <div style={{ color: hoveredContact.region.color, fontSize: 10 }}>{hoveredContact.region.label}</div>
+            ) : (
+              <div>
+                <div style={{ color: hoveredContact.region.color, fontSize: 10 }}>{hoveredContact.region.label}</div>
+                <span style={{ color: '#7a8a99', fontSize: 9 }}>nearest · {hoveredContact.region.dist.toFixed(1)} mm</span>
+              </div>
+            )
+          ) : (
+            <span style={{ color: '#7a8a99', fontSize: 10 }}>unlabelled</span>
+          )}
         </div>
       )}
       {!isThumbnail && locator && status === 'ok' && (
