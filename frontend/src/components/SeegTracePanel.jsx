@@ -33,8 +33,9 @@ function contactNum(name, group) {
  */
 export default function SeegTracePanel({
   data, signal, setSignal, scope, setScope, shaft, setShaft,
-  domain, timeIndex, setTimeIndex, hoveredChannel, setHoveredChannel,
-  width: panelW, setWidth: setPanelW, playing, setPlaying, shaftColors,
+  timeIndex, setTimeIndex, hoveredChannel, setHoveredChannel,
+  width: panelW, setWidth: setPanelW, traceGain = 1, setTraceGain,
+  playing, setPlaying, shaftColors,
 }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
@@ -79,16 +80,21 @@ export default function SeegTracePanel({
   // into a missing array.
   const rawReady = !isRaw || (Array.isArray(data.raw) && data.raw.length === nT);
 
-  // Common gain for raw voltage: 98th percentile of |uV| across shown rows.
-  const rawScale = useMemo(() => {
-    if (!isRaw || !rawReady) return 1;
-    let m = 1e-6;
+  // Common gain (shared across channels so amplitudes stay comparable): the largest
+  // |value| across shown rows for the active signal. Deliberately the data's own
+  // peak rather than the colorbar's robust z limit -- tying the traces to `domain`
+  // clipped the biggest deflections at the map scale; this shows them in full.
+  const traceScale = useMemo(() => {
+    if (isRaw && !rawReady) return 1;
+    const arr = isRaw ? data.raw : data.activity;
+    if (!arr || !arr.length) return 1;
+    let m = isRaw ? 1e-6 : 1;   // floor so a flat/quiet block doesn't over-amplify
     const step = Math.max(1, Math.floor(nT / 400));
     for (const r of rows) for (let k = 0; k < nT; k += step) {
-      const v = Math.abs(data.raw[k][r.ci]); if (v > m) m = v;
+      const v = Math.abs(arr[k][r.ci]); if (v > m) m = v;
     }
     return m;
-  }, [isRaw, rawReady, rows, data.raw, nT]);
+  }, [isRaw, rawReady, rows, data.raw, data.activity, nT]);
 
   // ── Track width ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -99,7 +105,10 @@ export default function SeegTracePanel({
     return () => ro.disconnect();
   }, []);
 
-  const canvasH = Math.max(rows.length * ROW_H, 1);
+  // Vertical zoom: scale row spacing and amplitude together so amplified traces
+  // spread apart instead of overlapping. The canvas grows and its container scrolls.
+  const rowH = ROW_H * traceGain;
+  const canvasH = Math.max(rows.length * rowH, 1);
 
   // ── Draw traces ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -114,14 +123,14 @@ export default function SeegTracePanel({
 
     const plotW = width - GUTTER;
     const step = Math.max(1, Math.floor(nT / plotW));
-    const amp = isRaw ? rawScale : Math.max(domain, 1);
+    const amp = traceScale;
     ctx.font = '10px IBM Plex Mono, monospace';
     ctx.textBaseline = 'middle';
 
     rows.forEach((r, i) => {
-      const yc = i * ROW_H + ROW_H / 2;
+      const yc = i * rowH + rowH / 2;
       const hot = hoveredChannel === r.name;
-      if (hot) { ctx.fillStyle = '#00d4ff14'; ctx.fillRect(0, i * ROW_H, width, ROW_H); }
+      if (hot) { ctx.fillStyle = '#00d4ff14'; ctx.fillRect(0, i * rowH, width, rowH); }
       // baseline + separator
       ctx.strokeStyle = '#1a2029'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(GUTTER, yc); ctx.lineTo(width, yc); ctx.stroke();
@@ -137,7 +146,7 @@ export default function SeegTracePanel({
         for (let k = 0; k < nT; k += step) {
           const v = isRaw ? data.raw[k][r.ci] : data.activity[k][r.ci];
           const x = GUTTER + (nT > 1 ? (k / (nT - 1)) * plotW : 0);
-          const y = yc - Math.max(-1, Math.min(1, v / amp)) * (ROW_H * 0.46);
+          const y = yc - Math.max(-1, Math.min(1, v / amp)) * (rowH * 0.8);
           if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
         }
         ctx.stroke();
@@ -149,7 +158,7 @@ export default function SeegTracePanel({
       ctx.fillStyle = '#7a8a99'; ctx.font = '11px IBM Plex Sans, sans-serif';
       ctx.fillText('Loading voltages…', GUTTER + 8, 12);
     }
-  }, [data, rows, signal, domain, hoveredChannel, width, canvasH, nT, isRaw, rawReady, rawScale, shaftColors]);
+  }, [data, rows, signal, hoveredChannel, width, canvasH, rowH, nT, isRaw, rawReady, traceScale, shaftColors]);
 
   // ── Cursor + interaction ───────────────────────────────────────────────────
   const plotW = width - GUTTER;
@@ -173,7 +182,7 @@ export default function SeegTracePanel({
     // Hover row → cross-highlight
     const rect = scrollRef.current.getBoundingClientRect();
     const y = e.clientY - rect.top + scrollRef.current.scrollTop;
-    const idx = Math.floor(y / ROW_H);
+    const idx = Math.floor(y / rowH);
     setHoveredChannel(idx >= 0 && idx < rows.length ? rows[idx].name : null);
   };
   const onUp = () => { draggingRef.current = false; };
@@ -240,6 +249,19 @@ export default function SeegTracePanel({
             {shafts.map((s) => <option key={s} value={s}>{s}</option>)}
           </select>
         )}
+        <div style={{ width: 1, height: 16, background: '#1e2530' }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }} title="Vertical trace scale">
+          <span style={{ fontSize: 10, color: '#7a8a99' }}>y</span>
+          <input type="number" min={0.5} max={20} step={0.5} value={traceGain}
+            onChange={(e) => {
+              const v = parseFloat(e.target.value);
+              if (!Number.isNaN(v)) setTraceGain?.(Math.min(50, Math.max(0.1, v)));
+            }}
+            style={{ width: 46, padding: '3px 6px', background: '#111418', color: '#e8edf2',
+              border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, textAlign: 'right',
+              fontFamily: 'IBM Plex Mono, monospace' }} />
+          <span style={{ fontSize: 10, color: '#7a8a99' }}>×</span>
+        </div>
         <div style={{ flex: 1 }} />
         <input
           value={editingTime ? timeDraft : tDisplay}

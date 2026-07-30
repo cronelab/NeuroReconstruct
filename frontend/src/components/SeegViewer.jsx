@@ -52,6 +52,7 @@ export default function SeegViewer({ reconId, onBack }) {
     seegMode, setSeegMode,
     seegTraceSignal, setSeegTraceSignal, seegTraceScope, setSeegTraceScope,
     seegTraceShaft, setSeegTraceShaft, seegTracePanelW, setSeegTracePanelW,
+    seegTraceGain, setSeegTraceGain,
     seegBrainOpacity, setSeegBrainOpacity, seegStructureOpacity, setSeegStructureOpacity,
     seegIgnoreOutside, setSeegIgnoreOutside, seegColorLimit, setSeegColorLimit,
     seegTimeIndex, setSeegTimeIndex, seegPlaying, setSeegPlaying,
@@ -441,10 +442,10 @@ export default function SeegViewer({ reconId, onBack }) {
           signal={seegTraceSignal} setSignal={setSeegTraceSignal}
           scope={seegTraceScope} setScope={setSeegTraceScope}
           shaft={seegTraceShaft} setShaft={setSeegTraceShaft}
-          domain={domain}
           timeIndex={seegTimeIndex} setTimeIndex={setSeegTimeIndex}
           hoveredChannel={hoveredChannel} setHoveredChannel={setHoveredChannel}
           width={seegTracePanelW} setWidth={setSeegTracePanelW}
+          traceGain={seegTraceGain} setTraceGain={setSeegTraceGain}
           playing={seegPlaying} setPlaying={setSeegPlaying}
           shaftColors={shaftColors}
         />

@@ -86,6 +86,8 @@ export const useAppStore = create((set, get) => ({
   setSeegTraceShaft: (s) => set({ seegTraceShaft: s }),
   seegTracePanelW: 400,          // right trace-panel width (px), user-resizable
   setSeegTracePanelW: (w) => set({ seegTracePanelW: w }),
+  seegTraceGain: 1,              // vertical zoom of the trace stack (row height + amplitude)
+  setSeegTraceGain: (g) => set({ seegTraceGain: g }),
   seegBrainOpacity: 0.4,         // native-brain surface opacity in the sEEG view
   setSeegBrainOpacity: (v) => set({ seegBrainOpacity: v }),
   seegIgnoreOutside: true,       // render contacts outside the brain mesh inert (default on)
