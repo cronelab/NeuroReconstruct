@@ -824,12 +824,12 @@ async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str,
                     import numpy as _np
                     ct_abs = _abs(recon.ct_path)
                     transform_path = get_transform_path(ct_abs)
+                    loop = asyncio.get_event_loop()
                     if ct_preregistered:
                         # CT already in MRI space — save identity, skip computation
                         _np.save(transform_path, _np.eye(4))
                         print(f"[REG] CT marked as pre-registered - identity transform saved for recon {recon_id}")
                     else:
-                        loop = asyncio.get_event_loop()
                         await loop.run_in_executor(
                             None, register_ct_to_mri, mri_path, ct_abs, transform_path
                         )
