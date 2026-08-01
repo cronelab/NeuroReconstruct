@@ -13,6 +13,7 @@ Usage:
 
 import numpy as np
 import os
+import time
 
 # ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS must be set (via launcher.py or env)
 # before this import so ITK initializes its thread pool with 1 thread.
@@ -79,10 +80,21 @@ def register_ct_to_mri(mri_path: str, ct_path: str, out_path: str) -> np.ndarray
     reg.SetSmoothingSigmasPerLevel(smoothingSigmas=[4, 3, 2, 1, 0])
     reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
 
-    print("[REG] Running registration (this may take 1-3 minutes)...")
+    print("[REG] Running registration...")
+    _t0 = time.perf_counter()
     final_transform = reg.Execute(mri_sitk, ct_sitk)
-    print(f"[REG] Done. Metric: {reg.GetMetricValue():.4f}, "
+    _elapsed = time.perf_counter() - _t0
+    print(f"[REG] Done in {_elapsed:.1f} s ({_elapsed/60:.2f} min). "
+          f"Metric: {reg.GetMetricValue():.4f}, "
           f"Stop: {reg.GetOptimizerStopConditionDescription()}")
+    # Log the factors that drive runtime so the timing number is interpretable.
+    # Guarded: instrumentation must never be able to fail a real registration.
+    try:
+        threads = sitk.ProcessObject.GetGlobalDefaultNumberOfThreads()
+    except Exception:
+        threads = "?"
+    print(f"[REG] Timing context: MRI(fixed) size {mri_sitk.GetSize()}, "
+          f"CT(moving) size {ct_sitk.GetSize()}, threads={threads}")
 
     metric = reg.GetMetricValue()
     if metric > -0.1:
