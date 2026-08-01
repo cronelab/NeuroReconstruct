@@ -190,7 +190,11 @@ def _render_fusion_slice(mri_path: str, ct_path: str, transform: np.ndarray, axi
     if slice_idx < 0 or slice_idx >= n:
         slice_idx = n // 2
 
-    cache_key = (mri_path, axis, slice_idx)
+    # Include a signature of the transform matrix in the cache key so that a
+    # re-registration (which overwrites ct_to_mri.npy with a different matrix)
+    # invalidates any previously cached render for this slice.
+    t_sig = hashlib.sha1(np.ascontiguousarray(transform, dtype=np.float64).tobytes()).hexdigest()[:12]
+    cache_key = (mri_path, axis, slice_idx, t_sig)
     if cache_key in ct_vol["fusion_png_cache"]:
         return ct_vol["fusion_png_cache"][cache_key]
 
@@ -637,6 +641,7 @@ async def list_reconstructions(
                 os.path.exists(os.path.join(os.path.dirname(_abs(recon.ct_path)), "ct_to_mri.npy"))
                 if recon.ct_path else False
             ),
+            "registration_deterministic": _read_reg_deterministic(_abs(recon.ct_path)) if recon.ct_path else None,
             "registration_confirmed": getattr(recon, "registration_confirmed", False) or False,
             "export_status": getattr(recon, "export_status", "none") or "none",
             "exported_at": getattr(recon, "exported_at", None),
@@ -755,6 +760,90 @@ async def upload_reconstruction_files(
     return {"status": "processing"}
 
 
+# ── Registration mode metadata (sidecar next to ct_to_mri.npy) ──────────────────
+# We record whether the stored transform came from the fast multithreaded path or
+# the deterministic single-threaded path. A JSON sidecar avoids a DB migration
+# (the app uses SQLAlchemy create_all, no Alembic) and travels with the transform.
+
+def _reg_meta_path(ct_abs: str) -> str:
+    """Path of the registration-mode sidecar for a given CT path."""
+    return os.path.join(os.path.dirname(ct_abs), "ct_to_mri.meta.json")
+
+
+def _write_reg_meta(ct_abs: str, threads: int, deterministic: bool) -> None:
+    try:
+        with open(_reg_meta_path(ct_abs), "w") as f:
+            json.dump({
+                "threads": int(threads),
+                "deterministic": bool(deterministic),
+                "updated_at": datetime.utcnow().isoformat(),
+            }, f)
+    except Exception as e:
+        print(f"[REG] could not write registration meta: {e}")
+
+
+def _read_reg_deterministic(ct_abs: Optional[str]) -> bool:
+    """True if the stored transform is deterministic (or unknown/legacy → assume
+    deterministic, since the historical default was single-threaded)."""
+    if not ct_abs:
+        return True
+    p = _reg_meta_path(ct_abs)
+    if os.path.exists(p):
+        try:
+            with open(p) as f:
+                return bool(json.load(f).get("deterministic", True))
+        except Exception:
+            pass
+    return True
+
+
+async def _run_registration(recon_id: int, mri_path: str, ct_abs: str,
+                            ct_preregistered: bool, threads: int):
+    """Register CT→MRI for a recon, write the mode sidecar, and (re)generate the
+    masked CT. Shared by the initial pipeline (fast, multithreaded) and the
+    deterministic re-run endpoint (threads=1). Manages the 'registering'→'ready'
+    status transition and resets any prior manual confirmation."""
+    from database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            update(Reconstruction)
+            .where(Reconstruction.id == recon_id)
+            .values(status="registering", registration_confirmed=False, updated_at=datetime.utcnow())
+        )
+        await db.commit()
+    try:
+        from services.registration import (
+            register_ct_to_mri, get_transform_path, preprocess_ct, get_masked_ct_path,
+        )
+        transform_path = get_transform_path(ct_abs)
+        loop = asyncio.get_event_loop()
+        if ct_preregistered:
+            np.save(transform_path, np.eye(4))
+            _write_reg_meta(ct_abs, threads=1, deterministic=True)  # identity is trivially reproducible
+            print(f"[REG] CT pre-registered — identity transform saved for recon {recon_id}")
+        else:
+            # threads passed positionally (4th arg) to avoid functools.partial
+            await loop.run_in_executor(
+                None, register_ct_to_mri, mri_path, ct_abs, transform_path, threads
+            )
+            _write_reg_meta(ct_abs, threads=threads, deterministic=(threads == 1))
+            print(f"[REG] Registration complete for recon {recon_id} (threads={threads})")
+        # Preprocess CT to strip table/air regardless of registration path
+        masked_ct_path = get_masked_ct_path(ct_abs)
+        await loop.run_in_executor(None, preprocess_ct, ct_abs, masked_ct_path)
+    except Exception as e:
+        print(f"[REG] Registration failed for recon {recon_id}: {e}")
+    finally:
+        async with AsyncSessionLocal() as db2:
+            await db2.execute(
+                update(Reconstruction)
+                .where(Reconstruction.id == recon_id)
+                .values(status="ready", updated_at=datetime.utcnow())
+            )
+            await db2.commit()
+
+
 async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str, ct_path: str = None, ct_preregistered: bool = False, mri_modality: str = "t1"):
     """Background task: extract brain mesh from MRI NIfTI, then register CT if available."""
     from database import AsyncSessionLocal
@@ -803,53 +892,20 @@ async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str,
         )
         await db.commit()
 
-    # If mesh extraction succeeded and a CT exists, run registration
+    # If mesh extraction succeeded and a CT exists, run registration.
+    # Initial pass uses the FAST multithreaded path for speed; the result is
+    # human-reviewed in the fusion viewer and can be re-run deterministically
+    # (single-threaded) from the review panel if it looks off.
     if status == "ready":
         async with AsyncSessionLocal() as db:
             result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
             recon = result.scalar_one_or_none()
-            if recon and recon.ct_path and os.path.exists(_abs(recon.ct_path)):
-                # Mark as registering so the UI shows spinner and blocks access.
-                # Also reset registration_confirmed — a fresh registration run is
-                # about to replace ct_to_mri.npy, so any prior manual confirmation
-                # no longer applies to the transform that will exist afterward.
-                await db.execute(
-                    update(Reconstruction)
-                    .where(Reconstruction.id == recon_id)
-                    .values(status="registering", registration_confirmed=False, updated_at=datetime.utcnow())
-                )
-                await db.commit()
-                try:
-                    from services.registration import register_ct_to_mri, get_transform_path
-                    import numpy as _np
-                    ct_abs = _abs(recon.ct_path)
-                    transform_path = get_transform_path(ct_abs)
-                    loop = asyncio.get_event_loop()
-                    if ct_preregistered:
-                        # CT already in MRI space — save identity, skip computation
-                        _np.save(transform_path, _np.eye(4))
-                        print(f"[REG] CT marked as pre-registered - identity transform saved for recon {recon_id}")
-                    else:
-                        await loop.run_in_executor(
-                            None, register_ct_to_mri, mri_path, ct_abs, transform_path
-                        )
-                        print(f"[REG] Registration complete for recon {recon_id}")
-                    # Preprocess CT to strip table/air regardless of registration path
-                    from services.registration import preprocess_ct, get_masked_ct_path
-                    masked_ct_path = get_masked_ct_path(ct_abs)
-                    await loop.run_in_executor(
-                        None, preprocess_ct, ct_abs, masked_ct_path
-                    )
-                except Exception as e:
-                    print(f"[REG] Registration failed for recon {recon_id}: {e}")
-                finally:
-                    async with AsyncSessionLocal() as db2:
-                        await db2.execute(
-                            update(Reconstruction)
-                            .where(Reconstruction.id == recon_id)
-                            .values(status="ready", updated_at=datetime.utcnow())
-                        )
-                        await db2.commit()
+            ct_path_val = recon.ct_path if recon else None
+        if ct_path_val and os.path.exists(_abs(ct_path_val)):
+            fast_threads = min(8, os.cpu_count() or 1)
+            await _run_registration(
+                recon_id, mri_path, _abs(ct_path_val), ct_preregistered, threads=fast_threads
+            )
 
 
 
@@ -953,6 +1009,7 @@ async def get_reconstruction(
             os.path.exists(os.path.join(os.path.dirname(_abs(recon.ct_path)), "ct_to_mri.npy"))
             if recon.ct_path else False
         ),
+        "registration_deterministic": _read_reg_deterministic(_abs(recon.ct_path)) if recon.ct_path else None,
         "registration_confirmed": getattr(recon, "registration_confirmed", False) or False,
         "export_status": getattr(recon, "export_status", "none") or "none",
         "exported_at": getattr(recon, "exported_at", None),
@@ -1013,6 +1070,47 @@ async def confirm_registration(
     recon.registration_confirmed = confirmed
     await db.commit()
     return {"registration_confirmed": recon.registration_confirmed}
+
+
+@app.post("/api/reconstructions/{recon_id}/reregister")
+async def reregister_deterministic(
+    recon_id: int,
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-run CT→MRI registration on the deterministic single-threaded path.
+
+    Used when a reviewer judges the fast (multithreaded) registration poor. This
+    overwrites ct_to_mri.npy with the reproducible single-threaded result and
+    clears the manual confirmation. Runs in the background; the recon flips to
+    status 'registering' and back to 'ready' when done (poll to detect completion).
+    """
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Reconstruction not found")
+    if recon.status == "registering":
+        raise HTTPException(status_code=409, detail="A registration is already in progress")
+    if not recon.ct_path or not os.path.exists(_abs(recon.ct_path)):
+        raise HTTPException(status_code=400, detail="No CT available to register")
+    if not recon.mri_path or not os.path.exists(_abs(recon.mri_path)):
+        raise HTTPException(status_code=400, detail="No MRI available to register against")
+
+    mri_abs = _abs(recon.mri_path)
+    ct_abs = _abs(recon.ct_path)
+    # Flip to "registering" synchronously so the client's poll always observes the
+    # transition (the background task also sets this, but not before we return).
+    await db.execute(
+        update(Reconstruction)
+        .where(Reconstruction.id == recon_id)
+        .values(status="registering", registration_confirmed=False, updated_at=datetime.utcnow())
+    )
+    await db.commit()
+    background_tasks.add_task(
+        _run_registration, recon_id, mri_abs, ct_abs, False, 1
+    )
+    return {"status": "registering", "deterministic": True}
 
 
 # ── MNI export pipeline ─────────────────────────────────────────────────────────

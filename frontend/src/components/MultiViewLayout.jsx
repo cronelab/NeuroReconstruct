@@ -2,7 +2,7 @@ import React, { useState, useCallback, useRef } from 'react';
 import SliceViewer from './SliceViewer';
 import FusionSliceViewer from './FusionSliceViewer';
 import { useAppStore } from '../store';
-import { uploadReconstructionFiles, confirmRegistration } from '../api';
+import { uploadReconstructionFiles, confirmRegistration, reregisterDeterministic, getReconstruction } from '../api';
 
 const BASE_VIEWS = [
   { id: '3d',       label: '3D',       icon: '⬡' },
@@ -24,11 +24,16 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
   const [activeView, setActiveView] = useState('3d');
   const { reconstruction, setReconstruction } = useAppStore();
   const [confirmBusy, setConfirmBusy] = useState(false);
+  const [reRegBusy, setReRegBusy] = useState(false);
+  const [reRegError, setReRegError] = useState('');
 
   // Fusion view is only meaningful when a CT is registered to the MRI.
   const hasFusion = !!reconstruction?.has_ct && !!reconstruction?.has_registration;
   const VIEWS = hasFusion ? [FUSION_VIEW, ...BASE_VIEWS] : BASE_VIEWS;
   const regConfirmed = !!reconstruction?.registration_confirmed;
+  // false = the stored transform came from the fast multithreaded path (unverified);
+  // true/undefined = deterministic or legacy.
+  const regDeterministic = reconstruction?.registration_deterministic !== false;
 
   const handleConfirmRegistration = useCallback(async (value) => {
     if (!reconstruction || confirmBusy) return;
@@ -42,6 +47,33 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
       setConfirmBusy(false);
     }
   }, [reconstruction, confirmBusy, setReconstruction]);
+
+  // Re-run the registration on the deterministic single-threaded path when the
+  // reviewer judges the fast result poor. Kicks off a background job, then polls
+  // the recon until it returns to "ready" and refreshes the store (which bumps
+  // updated_at → FusionSliceViewer reloads the freshly-registered slices).
+  const handleReregister = useCallback(async () => {
+    if (!reconstruction || reRegBusy) return;
+    const id = reconstruction.id;
+    setReRegBusy(true);
+    setReRegError('');
+    try {
+      await reregisterDeterministic(id);
+      for (let i = 0; i < 400; i++) {                 // ~20 min cap at 3s/poll
+        await new Promise(r => setTimeout(r, 3000));
+        const { data } = await getReconstruction(id);
+        if (data && data.status !== 'registering') {
+          setReconstruction(data);
+          return;
+        }
+      }
+      setReRegError('Timed out waiting for re-registration.');
+    } catch (e) {
+      setReRegError('Re-registration failed to start.');
+    } finally {
+      setReRegBusy(false);
+    }
+  }, [reconstruction, reRegBusy, setReconstruction]);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const mriRef = useRef(null);
@@ -195,9 +227,17 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
                 {regConfirmed ? '✓ Registration reviewed & confirmed' : '⚠ Registration not yet reviewed'}
               </span>
               <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Sans, sans-serif', flex: 1 }}>
-                Sweep the MRI↔CT blend and check that skull, ventricle, and midline edges stay aligned.
+                {reRegError
+                  ? <span style={{ color: '#ff5252' }}>{reRegError}</span>
+                  : (!regConfirmed && !regDeterministic)
+                    ? 'Fast registration — review carefully. Sweep the MRI↔CT blend; if edges jump, re-run precise.'
+                    : 'Sweep the MRI↔CT blend and check that skull, ventricle, and midline edges stay aligned.'}
               </span>
-              {regConfirmed ? (
+              {reRegBusy ? (
+                <span style={{ fontSize: 12, fontWeight: 600, color: '#ffab40', fontFamily: 'IBM Plex Sans, sans-serif' }}>
+                  ⏳ Re-running deterministic registration… (3–10 min)
+                </span>
+              ) : regConfirmed ? (
                 <button
                   onClick={() => handleConfirmRegistration(false)}
                   disabled={confirmBusy}
@@ -206,17 +246,27 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
                   Un-confirm
                 </button>
               ) : (
-                <button
-                  onClick={() => handleConfirmRegistration(true)}
-                  disabled={confirmBusy}
-                  style={{ fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 4, cursor: 'pointer', background: '#0d2a1a', color: '#00e676', border: '1px solid #00e67655', fontFamily: 'IBM Plex Sans, sans-serif', opacity: confirmBusy ? 0.6 : 1 }}
-                >
-                  ✓ Looks correct — Confirm
-                </button>
+                <>
+                  <button
+                    onClick={handleReregister}
+                    disabled={confirmBusy}
+                    title="Re-run registration single-threaded — deterministic and reproducible, but slower (3–10 min)"
+                    style={{ fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 4, cursor: 'pointer', background: 'transparent', color: '#ffab40', border: '1px solid #ffab4066', fontFamily: 'IBM Plex Sans, sans-serif' }}
+                  >
+                    ↻ Looks off — Re-run precise
+                  </button>
+                  <button
+                    onClick={() => handleConfirmRegistration(true)}
+                    disabled={confirmBusy}
+                    style={{ fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 4, cursor: 'pointer', background: '#0d2a1a', color: '#00e676', border: '1px solid #00e67655', fontFamily: 'IBM Plex Sans, sans-serif', opacity: confirmBusy ? 0.6 : 1 }}
+                  >
+                    ✓ Looks correct — Confirm
+                  </button>
+                </>
               )}
             </div>
             <div style={{ flex: 1, minHeight: 0 }}>
-              {activeView === 'fusion' && <FusionSliceViewer reconId={reconId} />}
+              {activeView === 'fusion' && <FusionSliceViewer reconId={reconId} version={reconstruction?.updated_at} />}
             </div>
           </div>
         )}

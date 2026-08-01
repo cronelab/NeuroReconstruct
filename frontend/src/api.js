@@ -83,6 +83,12 @@ export const getStructures = (id, token) =>
 export const confirmRegistration = (id, confirmed) =>
   api.patch(`/reconstructions/${id}/registration-confirm`, { confirmed });
 
+// Re-run CT→MRI registration on the deterministic single-threaded path when the
+// fast (multithreaded) result looks poor. Runs in the background; poll the recon
+// status until it returns to "ready".
+export const reregisterDeterministic = (id) =>
+  api.post(`/reconstructions/${id}/reregister`);
+
 // ── MNI export pipeline ─────────────────────────────────────────────────────────
 export const startMniExport = (id) =>
   api.post(`/reconstructions/${id}/export`);

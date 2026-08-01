@@ -21,7 +21,7 @@ import SimpleITK as sitk
 sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
 
 
-def register_ct_to_mri(mri_path: str, ct_path: str, out_path: str) -> np.ndarray:
+def register_ct_to_mri(mri_path: str, ct_path: str, out_path: str, threads: int = 1) -> np.ndarray:
     """
     Rigidly register CT to MRI using mutual information.
 
@@ -29,10 +29,27 @@ def register_ct_to_mri(mri_path: str, ct_path: str, out_path: str) -> np.ndarray
         mri_path: Path to pre-op T1 MRI NIfTI
         ct_path:  Path to post-implant CT NIfTI
         out_path: Where to save the 4x4 transform matrix (.npy)
+        threads:  ITK worker threads for this run. Default 1 = deterministic
+                  (see module note). Values > 1 give a ~4x speed-up but the
+                  optimizer may converge to a different MI optimum (drift is
+                  case-dependent, up to several mm), so multithreaded results
+                  MUST be human-reviewed before use.
 
     Returns:
         (4, 4) numpy array: CT world RAS -> MRI world RAS
     """
+    # Per-call thread control. The module/launcher pin the global default to 1;
+    # here we raise it only for the duration of this registration, then restore
+    # it in the finally so nothing else inherits a nondeterministic default.
+    threads = max(1, int(threads))
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
+    try:
+        return _register_ct_to_mri_impl(mri_path, ct_path, out_path, threads)
+    finally:
+        sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
+
+
+def _register_ct_to_mri_impl(mri_path: str, ct_path: str, out_path: str, threads: int) -> np.ndarray:
     print("[REG] Loading images...")
     # Let SimpleITK read NIfTI directly — it handles the coordinate system
     # correctly without manual nibabel->SimpleITK conversion
