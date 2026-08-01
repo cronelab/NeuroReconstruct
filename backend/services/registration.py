@@ -21,7 +21,8 @@ import SimpleITK as sitk
 sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
 
 
-def register_ct_to_mri(mri_path: str, ct_path: str, out_path: str, threads: int = 1) -> np.ndarray:
+def register_ct_to_mri(mri_path: str, ct_path: str, out_path: str, threads: int = 1,
+                       init_jitter=None) -> np.ndarray:
     """
     Rigidly register CT to MRI using mutual information.
 
@@ -34,6 +35,9 @@ def register_ct_to_mri(mri_path: str, ct_path: str, out_path: str, threads: int 
                   optimizer may converge to a different MI optimum (drift is
                   case-dependent, up to several mm), so multithreaded results
                   MUST be human-reviewed before use.
+        init_jitter: optional (rot_deg, trans_mm, seed) — perturb the initial
+                  transform by Gaussian rotation/translation offsets (used by the
+                  multi-start "precise" mode to explore both MI basins).
 
     Returns:
         (4, 4) numpy array: CT world RAS -> MRI world RAS
@@ -44,12 +48,69 @@ def register_ct_to_mri(mri_path: str, ct_path: str, out_path: str, threads: int 
     threads = max(1, int(threads))
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
     try:
-        return _register_ct_to_mri_impl(mri_path, ct_path, out_path, threads)
+        return _register_ct_to_mri_impl(mri_path, ct_path, out_path, threads, init_jitter)
     finally:
         sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
 
 
-def _register_ct_to_mri_impl(mri_path: str, ct_path: str, out_path: str, threads: int) -> np.ndarray:
+def _make_registration_method():
+    """Build the ImageRegistrationMethod with the production Mattes-MI / gradient-
+    descent / 5-level-pyramid settings. Shared by the single registration and the
+    multi-start precise mode so they use identical parameters."""
+    reg = sitk.ImageRegistrationMethod()
+    # Mattes mutual information — best for multi-modal MRI/CT
+    reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=100)
+    reg.SetMetricSamplingStrategy(reg.REGULAR)
+    # 50% sampling: enough signal to avoid local minima, still deterministic
+    reg.SetMetricSamplingPercentage(0.50)
+    reg.SetInterpolator(sitk.sitkLinear)
+    # Gradient descent with tighter convergence
+    reg.SetOptimizerAsGradientDescent(
+        learningRate=1.0, numberOfIterations=800,
+        convergenceMinimumValue=1e-9, convergenceWindowSize=40,
+    )
+    reg.SetOptimizerScalesFromPhysicalShift()
+    # Multi-resolution: 5 levels, extra-coarse start to escape local minima.
+    reg.SetShrinkFactorsPerLevel(shrinkFactors=[8, 4, 2, 2, 1])
+    reg.SetSmoothingSigmasPerLevel(smoothingSigmas=[4, 3, 2, 1, 0])
+    reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+    return reg
+
+
+def _build_initial_transform(mri_sitk, ct_sitk, init_jitter=None):
+    """Geometry-centered Euler3D initializer, optionally jittered by
+    init_jitter=(rot_deg, trans_mm, seed). MOMENTS is avoided — metal electrode
+    artifacts skew the intensity center of mass."""
+    init = sitk.CenteredTransformInitializer(
+        mri_sitk, ct_sitk, sitk.Euler3DTransform(),
+        sitk.CenteredTransformInitializerFilter.GEOMETRY,
+    )
+    if init_jitter is None:
+        return init
+    rot_deg, trans_mm, seed = init_jitter
+    euler = sitk.Euler3DTransform(init)
+    rng = np.random.default_rng(int(seed))
+    p = list(euler.GetParameters())          # (rx, ry, rz, tx, ty, tz)
+    for a in range(3):
+        p[a] += np.radians(rng.normal(0.0, rot_deg))
+    for a in range(3, 6):
+        p[a] += rng.normal(0.0, trans_mm)
+    euler.SetParameters(tuple(p))
+    return euler
+
+
+def _final_to_ct_to_mri(final_transform, metric):
+    """Convert an Execute(fixed=MRI, moving=CT) result to a CT->MRI RAS matrix.
+    Near-zero metric => images already aligned => identity."""
+    if metric > -0.1:
+        print("[REG] Images appear already aligned (metric near zero). Saving identity.")
+        return np.eye(4)
+    # Execute returns MRI->CT (fixed->moving); we need CT->MRI, so invert.
+    return np.linalg.inv(_sitk_transform_to_ras_matrix(final_transform))
+
+
+def _register_ct_to_mri_impl(mri_path: str, ct_path: str, out_path: str, threads: int,
+                             init_jitter=None) -> np.ndarray:
     print("[REG] Loading images...")
     # Let SimpleITK read NIfTI directly — it handles the coordinate system
     # correctly without manual nibabel->SimpleITK conversion
@@ -60,42 +121,8 @@ def _register_ct_to_mri_impl(mri_path: str, ct_path: str, out_path: str, threads
     print(f"[REG] CT  size: {ct_sitk.GetSize()},  spacing: {[round(s,2) for s in ct_sitk.GetSpacing()]}")
 
     print("[REG] Setting up registration...")
-    reg = sitk.ImageRegistrationMethod()
-
-    # Mattes mutual information — best for multi-modal MRI/CT
-    reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=100)
-    reg.SetMetricSamplingStrategy(reg.REGULAR)
-    # 50% sampling: enough signal to avoid local minima, still deterministic
-    reg.SetMetricSamplingPercentage(0.50)
-
-    reg.SetInterpolator(sitk.sitkLinear)
-
-    # Gradient descent with tighter convergence
-    reg.SetOptimizerAsGradientDescent(
-        learningRate=1.0,
-        numberOfIterations=800,
-        convergenceMinimumValue=1e-9,
-        convergenceWindowSize=40,
-    )
-    reg.SetOptimizerScalesFromPhysicalShift()
-
-    # Geometry-based centering — aligns image geometric centers.
-    # MOMENTS is unreliable for post-implant CT due to metal electrode artifacts
-    # skewing the intensity center of mass.
-    initial_transform = sitk.CenteredTransformInitializer(
-        mri_sitk,
-        ct_sitk,
-        sitk.Euler3DTransform(),
-        sitk.CenteredTransformInitializerFilter.GEOMETRY,
-    )
-    reg.SetInitialTransform(initial_transform, inPlace=False)
-
-    # Multi-resolution: 5 levels, extra-coarse start to escape local minima.
-    # The shrink-8 level blurs both images heavily — the optimizer finds a
-    # basin of attraction that carries through to finer levels.
-    reg.SetShrinkFactorsPerLevel(shrinkFactors=[8, 4, 2, 2, 1])
-    reg.SetSmoothingSigmasPerLevel(smoothingSigmas=[4, 3, 2, 1, 0])
-    reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+    reg = _make_registration_method()
+    reg.SetInitialTransform(_build_initial_transform(mri_sitk, ct_sitk, init_jitter), inPlace=False)
 
     print("[REG] Running registration...")
     _t0 = time.perf_counter()
@@ -104,28 +131,131 @@ def _register_ct_to_mri_impl(mri_path: str, ct_path: str, out_path: str, threads
     print(f"[REG] Done in {_elapsed:.1f} s ({_elapsed/60:.2f} min). "
           f"Metric: {reg.GetMetricValue():.4f}, "
           f"Stop: {reg.GetOptimizerStopConditionDescription()}")
-    # Log the factors that drive runtime so the timing number is interpretable.
-    # Guarded: instrumentation must never be able to fail a real registration.
     try:
-        threads = sitk.ProcessObject.GetGlobalDefaultNumberOfThreads()
+        _thr = sitk.ProcessObject.GetGlobalDefaultNumberOfThreads()
     except Exception:
-        threads = "?"
+        _thr = "?"
     print(f"[REG] Timing context: MRI(fixed) size {mri_sitk.GetSize()}, "
-          f"CT(moving) size {ct_sitk.GetSize()}, threads={threads}")
+          f"CT(moving) size {ct_sitk.GetSize()}, threads={_thr}")
 
-    metric = reg.GetMetricValue()
-    if metric > -0.1:
-        print("[REG] Images appear already aligned (metric near zero). "
-              "Saving identity transform — no spatial correction will be applied.")
-        matrix = np.eye(4)
-    else:
-        # SimpleITK Execute(fixed=MRI, moving=CT) returns a transform that maps
-        # MRI→CT (fixed→moving). We need CT→MRI, so convert to matrix then invert.
-        matrix = np.linalg.inv(_sitk_transform_to_ras_matrix(final_transform))
-
+    matrix = _final_to_ct_to_mri(final_transform, reg.GetMetricValue())
     np.save(out_path, matrix)
     print(f"[REG] Transform saved to {out_path}")
     return matrix
+
+
+# ── Multi-start "precise" registration (enumerate MI basins for human review) ──
+# On ill-conditioned cases the Mattes-MI landscape has multiple near-degenerate
+# optima a few mm apart that NO similarity metric can rank (see the registration
+# basin-ambiguity investigation). We therefore run many jittered-init starts,
+# cluster the results by physical displacement, collapse to <= max_basins, and
+# return one representative per basin for a human to choose in the fusion viewer.
+
+def _anatomy_world_points(ct_path: str, hu: float = 300.0, n: int = 60000):
+    """Sample CT bony-anatomy voxels (HU>hu) as world-space points, for the
+    displacement metric used to cluster transforms."""
+    import nibabel as nib
+    img = nib.load(ct_path)
+    data = img.get_fdata()
+    idx = np.argwhere(data > hu)
+    if len(idx) == 0:
+        idx = np.argwhere(data > -200)
+    if len(idx) > n:
+        idx = idx[np.random.default_rng(0).choice(len(idx), n, replace=False)]
+    return img.affine @ np.c_[idx, np.ones(len(idx))].T.astype(np.float64)
+
+
+def median_displacement(Ta: np.ndarray, Tb: np.ndarray, points_world: np.ndarray) -> float:
+    """Median physical distance (mm) between where Ta and Tb map the same points."""
+    return float(np.median(np.linalg.norm((Tb @ points_world)[:3] - (Ta @ points_world)[:3], axis=0)))
+
+
+def cluster_basins(transforms, points_world, metrics=None, thresh_mm: float = 2.0, max_basins: int = 2):
+    """Cluster transforms into AT MOST max_basins basins by median displacement
+    (single-linkage at thresh_mm; if more clusters emerge, keep the largest as
+    anchors and assign the rest to the nearer). Returns basins sorted by size,
+    each: {transform, size, spread_mm, metric, member_indices}."""
+    n = len(transforms)
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            D[i, j] = D[j, i] = median_displacement(transforms[i], transforms[j], points_world)
+
+    seen, comps = set(), []
+    for i in range(n):
+        if i in seen:
+            continue
+        comp, stack = [], [i]
+        while stack:
+            k = stack.pop()
+            if k in seen:
+                continue
+            seen.add(k); comp.append(k)
+            stack += [j for j in range(n) if j not in seen and D[k, j] < thresh_mm]
+        comps.append(comp)
+
+    if len(comps) > max_basins:
+        comps.sort(key=len, reverse=True)
+        anchors = [min(c, key=lambda a: sum(D[a, b] for b in c)) for c in comps[:max_basins]]
+        groups = [[] for _ in anchors]
+        for i in range(n):
+            g = min(range(len(anchors)), key=lambda gi: D[i, anchors[gi]])
+            groups[g].append(i)
+        comps = groups
+
+    basins = []
+    for comp in comps:
+        medoid = min(comp, key=lambda a: sum(D[a, b] for b in comp))
+        spread = max((D[a, b] for a in comp for b in comp), default=0.0)
+        best_metric = None
+        if metrics is not None:
+            best_metric = float(min(metrics[c] for c in comp))  # most-negative MI
+        basins.append({"transform": transforms[medoid], "size": len(comp),
+                       "spread_mm": float(spread), "metric": best_metric,
+                       "member_indices": comp})
+    basins.sort(key=lambda b: -b["size"])
+    return basins
+
+
+def run_multistart(mri_path: str, ct_path: str, k: int = 11, threads: int = 8,
+                   rot_deg: float = 12.0, trans_mm: float = 20.0, seed0: int = 0,
+                   thresh_mm: float = 2.0, max_basins: int = 2):
+    # Jitter (12 deg, 20 mm) chosen by a coverage sweep on fa94010a: per-start
+    # P(basin A) ~= 0.40 -> P(A appears across k=11) ~= 0.996, with no wasted
+    # "other"-basin starts (wider jitter plateaus p_A but starts landing in garbage
+    # optima). See the jitter-coverage sweep in the basin-ambiguity investigation.
+    """Run k jittered-init registrations (all multithreaded for speed), then
+    cluster into <= max_basins distinct basins. Returns the basins list from
+    cluster_basins (medoid transform + size/spread/metric per basin). The caller
+    presents each basin for human selection — no automatic winner is chosen,
+    because no metric can rank the near-degenerate basins."""
+    threads = max(1, int(threads))
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
+    try:
+        mri_sitk = sitk.ReadImage(mri_path, sitk.sitkFloat32)
+        ct_sitk = sitk.ReadImage(ct_path, sitk.sitkFloat32)
+        transforms, metrics = [], []
+        for s in range(k):
+            reg = _make_registration_method()
+            reg.SetInitialTransform(
+                _build_initial_transform(mri_sitk, ct_sitk, (rot_deg, trans_mm, seed0 + s)),
+                inPlace=False,
+            )
+            _t0 = time.perf_counter()
+            final = reg.Execute(mri_sitk, ct_sitk)
+            metric = reg.GetMetricValue()
+            transforms.append(_final_to_ct_to_mri(final, metric))
+            metrics.append(metric)
+            print(f"[MULTISTART] start {s+1}/{k}: {time.perf_counter()-_t0:.0f} s, metric {metric:.4f}")
+    finally:
+        sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
+
+    points = _anatomy_world_points(ct_path)
+    basins = cluster_basins(transforms, points, metrics=metrics,
+                            thresh_mm=thresh_mm, max_basins=max_basins)
+    print(f"[MULTISTART] {k} starts -> {len(basins)} basin(s): "
+          f"sizes {[b['size'] for b in basins]}")
+    return basins
 
 
 def load_transform(transform_path: str) -> np.ndarray:

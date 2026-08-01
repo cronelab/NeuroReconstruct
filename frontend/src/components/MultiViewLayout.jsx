@@ -2,7 +2,7 @@ import React, { useState, useCallback, useRef } from 'react';
 import SliceViewer from './SliceViewer';
 import FusionSliceViewer from './FusionSliceViewer';
 import { useAppStore } from '../store';
-import { uploadReconstructionFiles, confirmRegistration, reregisterDeterministic, getReconstruction } from '../api';
+import { uploadReconstructionFiles, confirmRegistration, preciseReregister, selectRegistrationCandidate, getReconstruction } from '../api';
 
 const BASE_VIEWS = [
   { id: '3d',       label: '3D',       icon: '⬡' },
@@ -26,6 +26,8 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [reRegBusy, setReRegBusy] = useState(false);
   const [reRegError, setReRegError] = useState('');
+  const [previewCandidate, setPreviewCandidate] = useState(0);
+  const [selectBusy, setSelectBusy] = useState(false);
 
   // Fusion view is only meaningful when a CT is registered to the MRI.
   const hasFusion = !!reconstruction?.has_ct && !!reconstruction?.has_registration;
@@ -34,6 +36,10 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
   // false = the stored transform came from the fast multithreaded path (unverified);
   // true/undefined = deterministic or legacy.
   const regDeterministic = reconstruction?.registration_deterministic !== false;
+  // A precise re-run that found >1 distinct MI basin leaves candidates for the
+  // reviewer to pick between (no metric can auto-select the correct one).
+  const candidates = reconstruction?.registration_candidates || [];
+  const awaitingBasin = !!reconstruction?.awaiting_basin_selection && candidates.length > 1;
 
   const handleConfirmRegistration = useCallback(async (value) => {
     if (!reconstruction || confirmBusy) return;
@@ -48,17 +54,18 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
     }
   }, [reconstruction, confirmBusy, setReconstruction]);
 
-  // Re-run the registration on the deterministic single-threaded path when the
-  // reviewer judges the fast result poor. Kicks off a background job, then polls
-  // the recon until it returns to "ready" and refreshes the store (which bumps
-  // updated_at → FusionSliceViewer reloads the freshly-registered slices).
+  // "Re-run precise": jittered multi-start that enumerates the distinct MI basins.
+  // Kicks off a background job, polls until "ready", then refreshes the store. If
+  // >1 basin was found the recon comes back with awaiting_basin_selection and the
+  // picker appears; a single basin is applied directly (updated_at bump reloads slices).
   const handleReregister = useCallback(async () => {
     if (!reconstruction || reRegBusy) return;
     const id = reconstruction.id;
     setReRegBusy(true);
     setReRegError('');
+    setPreviewCandidate(0);
     try {
-      await reregisterDeterministic(id);
+      await preciseReregister(id);
       for (let i = 0; i < 400; i++) {                 // ~20 min cap at 3s/poll
         await new Promise(r => setTimeout(r, 3000));
         const { data } = await getReconstruction(id);
@@ -74,6 +81,24 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
       setReRegBusy(false);
     }
   }, [reconstruction, reRegBusy, setReconstruction]);
+
+  // Apply the reviewer-chosen candidate basin, then refresh the recon (clears
+  // awaiting_basin_selection, bumps updated_at → fusion viewer shows the applied one).
+  const handleSelectCandidate = useCallback(async (idx) => {
+    if (!reconstruction || selectBusy) return;
+    const id = reconstruction.id;
+    setSelectBusy(true);
+    try {
+      await selectRegistrationCandidate(id, idx);
+      const { data } = await getReconstruction(id);
+      if (data) setReconstruction(data);
+    } catch (e) {
+      // leave the picker up on failure
+    } finally {
+      setSelectBusy(false);
+    }
+  }, [reconstruction, selectBusy, setReconstruction]);
+
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState('');
   const mriRef = useRef(null);
@@ -221,7 +246,40 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
 
         {hasFusion && (
           <div style={{ position: 'absolute', inset: 0, display: activeView === 'fusion' ? 'flex' : 'none', flexDirection: 'column' }}>
-            {/* Registration review / confirm bar */}
+            {awaitingBasin ? (
+              /* Basin picker: a precise re-run found >1 distinct registration; the
+                 reviewer compares each in the fusion viewer and applies one. */
+              <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 10, padding: '8px 14px', background: '#101a2a', borderBottom: '1px solid #4fc3f733' }}>
+                <span style={{ fontSize: 12, fontWeight: 600, color: '#4fc3f7', fontFamily: 'IBM Plex Sans, sans-serif' }}>
+                  ⑂ {candidates.length} registrations found
+                </span>
+                <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Sans, sans-serif' }}>
+                  Toggle and pick the one where skull / ventricle / midline edges line up:
+                </span>
+                {candidates.map((c, i) => (
+                  <button
+                    key={i}
+                    onClick={() => setPreviewCandidate(i)}
+                    title={`${c.size} start(s), spread ${c.spread_mm} mm`}
+                    style={{ fontSize: 12, fontWeight: 600, padding: '5px 12px', borderRadius: 4, cursor: 'pointer', fontFamily: 'IBM Plex Sans, sans-serif',
+                      background: previewCandidate === i ? '#4fc3f7' : 'transparent',
+                      color: previewCandidate === i ? '#06121f' : '#4fc3f7',
+                      border: '1px solid #4fc3f788' }}
+                  >
+                    Option {i + 1}
+                  </button>
+                ))}
+                <span style={{ flex: 1 }} />
+                <button
+                  onClick={() => handleSelectCandidate(previewCandidate)}
+                  disabled={selectBusy}
+                  style={{ fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 4, cursor: 'pointer', background: '#0d2a1a', color: '#00e676', border: '1px solid #00e67655', fontFamily: 'IBM Plex Sans, sans-serif', opacity: selectBusy ? 0.6 : 1 }}
+                >
+                  {selectBusy ? 'Applying…' : `✓ Use Option ${previewCandidate + 1}`}
+                </button>
+              </div>
+            ) : (
+            /* Registration review / confirm bar */
             <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12, padding: '8px 14px', background: regConfirmed ? '#0d2a1a' : '#1a1000', borderBottom: `1px solid ${regConfirmed ? '#00e67633' : '#ffab4033'}` }}>
               <span style={{ fontSize: 12, fontFamily: 'IBM Plex Sans, sans-serif', color: regConfirmed ? '#00e676' : '#ffab40', fontWeight: 600 }}>
                 {regConfirmed ? '✓ Registration reviewed & confirmed' : '⚠ Registration not yet reviewed'}
@@ -235,7 +293,7 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
               </span>
               {reRegBusy ? (
                 <span style={{ fontSize: 12, fontWeight: 600, color: '#ffab40', fontFamily: 'IBM Plex Sans, sans-serif' }}>
-                  ⏳ Re-running deterministic registration… (3–10 min)
+                  ⏳ Exploring registrations (multi-start)… ~7–8 min
                 </span>
               ) : regConfirmed ? (
                 <button
@@ -250,7 +308,7 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
                   <button
                     onClick={handleReregister}
                     disabled={confirmBusy}
-                    title="Re-run registration single-threaded — deterministic and reproducible, but slower (3–10 min)"
+                    title="Re-run registration with a jittered multi-start and pick between the distinct results (~7–8 min)"
                     style={{ fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 4, cursor: 'pointer', background: 'transparent', color: '#ffab40', border: '1px solid #ffab4066', fontFamily: 'IBM Plex Sans, sans-serif' }}
                   >
                     ↻ Looks off — Re-run precise
@@ -265,8 +323,9 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
                 </>
               )}
             </div>
+            )}
             <div style={{ flex: 1, minHeight: 0 }}>
-              {activeView === 'fusion' && <FusionSliceViewer reconId={reconId} version={reconstruction?.updated_at} />}
+              {activeView === 'fusion' && <FusionSliceViewer reconId={reconId} version={reconstruction?.updated_at} candidate={awaitingBasin ? previewCandidate : undefined} />}
             </div>
           </div>
         )}

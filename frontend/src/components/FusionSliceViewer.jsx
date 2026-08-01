@@ -32,7 +32,7 @@ const AXES = [
 
 const CT_TINT = [255, 48, 48]; // red
 
-function FusionCanvas({ reconId, axis, version }) {
+function FusionCanvas({ reconId, axis, version, candidate }) {
   const canvasRef = useRef(null);
   const mriCacheRef = useRef(new Map());   // idx -> ImageBitmap
   const ctCacheRef = useRef(new Map());    // idx -> ImageBitmap (may be null if unavailable)
@@ -42,7 +42,7 @@ function FusionCanvas({ reconId, axis, version }) {
   const pxWmmRef = useRef(1);   // physical mm-per-pixel (display width) — for anisotropic voxels
   const pxHmmRef = useRef(1);   // physical mm-per-pixel (display height)
 
-  const [blend, setBlend] = useState(0.5);   // 0 = MRI only, 1 = CT only
+  const [blend, setBlend] = useState(0.8);   // 0 = MRI only, 1 = CT only; default 0.8 accentuates CT edges
   const [sliceLabel, setSliceLabel] = useState({ idx: 0, count: 1 });
   const [status, setStatus] = useState('loading');
   const [errorMsg, setErrorMsg] = useState('');
@@ -52,6 +52,9 @@ function FusionCanvas({ reconId, axis, version }) {
   // Cache-bust query param: bumped after a re-registration so the browser and the
   // backend fusion-slice cache both return the freshly-registered CT.
   const vparam = version ? `&v=${encodeURIComponent(version)}` : '';
+  // When previewing a precise-mode candidate basin, render that transform instead
+  // of the applied ct_to_mri.npy (only affects the CT overlay, not the MRI base).
+  const cparam = candidate != null ? `&candidate=${candidate}` : '';
 
   const authHeaders = () => {
     const token = localStorage.getItem('token');
@@ -164,14 +167,14 @@ function FusionCanvas({ reconId, axis, version }) {
       setErrorMsg(e.message);
       setStatus('error');
     }
-  }, [reconId, axis, version, doDraw]); // eslint-disable-line
+  }, [reconId, axis, version, candidate, doDraw]); // eslint-disable-line
 
   const fetchCt = useCallback(async (idx) => {
     if (ctCacheRef.current.has(idx)) return;
     ctCacheRef.current.set(idx, null); // mark in-flight/attempted
     try {
       const res = await fetch(
-        `/api/reconstructions/${reconId}/fusion-slice?axis=${axis}&slice_idx=${idx}${vparam}`,
+        `/api/reconstructions/${reconId}/fusion-slice?axis=${axis}&slice_idx=${idx}${vparam}${cparam}`,
         { headers: authHeaders() }
       );
       if (!res.ok) return;
@@ -181,7 +184,7 @@ function FusionCanvas({ reconId, axis, version }) {
       ctTintedRef.current.set(idx, tinted);
       if (sliceIdxRef.current === idx) doDraw();
     } catch (_) { /* ignore — CT stays unavailable for this slice */ }
-  }, [reconId, axis, version, tintCt, doDraw]);
+  }, [reconId, axis, version, candidate, tintCt, doDraw]);
 
   // Initial + axis change (also re-runs after a re-registration bumps `version`)
   useEffect(() => {
@@ -213,7 +216,7 @@ function FusionCanvas({ reconId, axis, version }) {
         fetchCt(actual);
       } catch (e) { setErrorMsg(e.message); setStatus('error'); }
     })();
-  }, [reconId, axis, version]); // eslint-disable-line
+  }, [reconId, axis, version, candidate]); // eslint-disable-line
 
   useEffect(() => { doDraw(); }, [blend, doDraw]);
 
@@ -288,7 +291,7 @@ function FusionCanvas({ reconId, axis, version }) {
   );
 }
 
-export default function FusionSliceViewer({ reconId, version }) {
+export default function FusionSliceViewer({ reconId, version, candidate }) {
   const [axis, setAxis] = useState('axial');
   return (
     <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', background: '#000' }}>
@@ -310,7 +313,7 @@ export default function FusionSliceViewer({ reconId, version }) {
         ))}
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
-        <FusionCanvas reconId={reconId} axis={axis} version={version} />
+        <FusionCanvas reconId={reconId} axis={axis} version={version} candidate={candidate} />
       </div>
     </div>
   );
