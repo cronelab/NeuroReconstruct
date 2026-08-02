@@ -83,6 +83,20 @@ export const getStructures = (id, token) =>
 export const confirmRegistration = (id, confirmed) =>
   api.patch(`/reconstructions/${id}/registration-confirm`, { confirmed });
 
+// Re-run CT→MRI registration when the fast result looks poor. 'precise' runs a
+// jittered multi-start and enumerates the distinct MI basins (up to 2) for the
+// reviewer to pick from; 'deterministic' does a single-threaded reproducible
+// re-run. Runs in the background; poll the recon until status returns to "ready".
+export const preciseReregister = (id) =>
+  api.post(`/reconstructions/${id}/reregister?mode=precise`);
+
+export const reregisterDeterministic = (id) =>
+  api.post(`/reconstructions/${id}/reregister?mode=deterministic`);
+
+// Apply a reviewer-chosen candidate basin from a precise re-run.
+export const selectRegistrationCandidate = (id, idx) =>
+  api.post(`/reconstructions/${id}/registration-candidates/${idx}/select`);
+
 // ── MNI export pipeline ─────────────────────────────────────────────────────────
 export const startMniExport = (id) =>
   api.post(`/reconstructions/${id}/export`);
