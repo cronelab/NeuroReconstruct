@@ -99,10 +99,13 @@ def _build_initial_transform(mri_sitk, ct_sitk, init_jitter=None):
     return euler
 
 
-def _final_to_ct_to_mri(final_transform, metric):
+def _final_to_ct_to_mri(final_transform, metric, allow_identity=True):
     """Convert an Execute(fixed=MRI, moving=CT) result to a CT->MRI RAS matrix.
-    Near-zero metric => images already aligned => identity."""
-    if metric > -0.1:
+    Near-zero metric => images already aligned => identity (single-registration
+    path only). In the multi-start path allow_identity=False: a jittered start
+    that reaches near-zero MI is a FAILED convergence, not a pre-aligned CT, so we
+    return its actual (poor) pose and let the metric filter drop it."""
+    if allow_identity and metric > -0.1:
         print("[REG] Images appear already aligned (metric near zero). Saving identity.")
         return np.eye(4)
     # Execute returns MRI->CT (fixed->moving); we need CT->MRI, so invert.
@@ -170,49 +173,68 @@ def median_displacement(Ta: np.ndarray, Tb: np.ndarray, points_world: np.ndarray
     return float(np.median(np.linalg.norm((Tb @ points_world)[:3] - (Ta @ points_world)[:3], axis=0)))
 
 
-def cluster_basins(transforms, points_world, metrics=None, thresh_mm: float = 2.0, max_basins: int = 2):
-    """Cluster transforms into AT MOST max_basins basins by median displacement
-    (single-linkage at thresh_mm; if more clusters emerge, keep the largest as
-    anchors and assign the rest to the nearer). Returns basins sorted by size,
-    each: {transform, size, spread_mm, metric, member_indices}."""
+def cluster_basins(transforms, points_world, metrics=None, thresh_mm: float = 2.0,
+                   max_basins: int = 2, metric_margin: float = 0.05):
+    """Cluster multi-start transforms into distinct MI basins for human selection.
+
+    1. Metric filter (with margin, not a hard cutoff): keep only starts whose
+       metric is within `metric_margin` of the best (most-negative) one. Failed /
+       garbage convergences score far worse (e.g. -0.4 vs -0.63) and drop out,
+       while genuine near-degenerate optima (which sit close to the best metric,
+       like the ec4dda8a improvement at -0.617) are retained.
+    2. Single-linkage cluster the SURVIVORS at thresh_mm.
+    3. Return the top `max_basins` clusters by size — a plain selection of the
+       tightest real basins, NOT a forced reassignment of every start to an anchor
+       (that swept garbage into groups and inflated spread_mm to 80-185 mm).
+
+    One returned cluster => a single basin the caller applies directly.
+    Each basin: {transform (medoid), size, spread_mm, metric, member_indices}.
+    """
     n = len(transforms)
-    D = np.zeros((n, n))
-    for i in range(n):
-        for j in range(i + 1, n):
-            D[i, j] = D[j, i] = median_displacement(transforms[i], transforms[j], points_world)
+    if n == 0:
+        return []
+    kept = list(range(n))
+    if metrics is not None:
+        best = min(metrics)
+        kept = [i for i in range(n) if metrics[i] <= best + metric_margin]
+        dropped = [i for i in range(n) if i not in kept]
+        if dropped:
+            print(f"[MULTISTART] metric filter (best {best:.4f} + margin {metric_margin}): "
+                  f"kept {len(kept)}/{n}, dropped metrics "
+                  f"{[round(metrics[i], 3) for i in dropped]}")
+        if not kept:
+            kept = list(range(n))
+
+    m = len(kept)
+    D = np.zeros((m, m))
+    for a in range(m):
+        for b in range(a + 1, m):
+            D[a, b] = D[b, a] = median_displacement(transforms[kept[a]], transforms[kept[b]], points_world)
 
     seen, comps = set(), []
-    for i in range(n):
-        if i in seen:
+    for a in range(m):
+        if a in seen:
             continue
-        comp, stack = [], [i]
+        comp, stack = [], [a]
         while stack:
             k = stack.pop()
             if k in seen:
                 continue
             seen.add(k); comp.append(k)
-            stack += [j for j in range(n) if j not in seen and D[k, j] < thresh_mm]
+            stack += [c for c in range(m) if c not in seen and D[k, c] < thresh_mm]
         comps.append(comp)
-
-    if len(comps) > max_basins:
-        comps.sort(key=len, reverse=True)
-        anchors = [min(c, key=lambda a: sum(D[a, b] for b in c)) for c in comps[:max_basins]]
-        groups = [[] for _ in anchors]
-        for i in range(n):
-            g = min(range(len(anchors)), key=lambda gi: D[i, anchors[gi]])
-            groups[g].append(i)
-        comps = groups
+    comps.sort(key=len, reverse=True)
+    comps = comps[:max_basins]
 
     basins = []
     for comp in comps:
         medoid = min(comp, key=lambda a: sum(D[a, b] for b in comp))
         spread = max((D[a, b] for a in comp for b in comp), default=0.0)
-        best_metric = None
-        if metrics is not None:
-            best_metric = float(min(metrics[c] for c in comp))  # most-negative MI
-        basins.append({"transform": transforms[medoid], "size": len(comp),
+        members = [kept[c] for c in comp]
+        best_metric = float(min(metrics[i] for i in members)) if metrics is not None else None
+        basins.append({"transform": transforms[kept[medoid]], "size": len(comp),
                        "spread_mm": float(spread), "metric": best_metric,
-                       "member_indices": comp})
+                       "member_indices": members})
     basins.sort(key=lambda b: -b["size"])
     return basins
 
@@ -244,7 +266,11 @@ def run_multistart(mri_path: str, ct_path: str, k: int = 11, threads: int = 8,
             _t0 = time.perf_counter()
             final = reg.Execute(mri_sitk, ct_sitk)
             metric = reg.GetMetricValue()
-            transforms.append(_final_to_ct_to_mri(final, metric))
+            # allow_identity=False: a jittered start reaching near-zero MI is a
+            # failed convergence (not a pre-aligned CT); keep its real pose so the
+            # metric filter in cluster_basins drops it instead of it becoming a
+            # spurious identity "basin".
+            transforms.append(_final_to_ct_to_mri(final, metric, allow_identity=False))
             metrics.append(metric)
             print(f"[MULTISTART] start {s+1}/{k}: {time.perf_counter()-_t0:.0f} s, metric {metric:.4f}")
     finally:
