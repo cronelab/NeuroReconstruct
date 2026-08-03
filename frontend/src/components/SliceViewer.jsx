@@ -560,21 +560,21 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
           pointerEvents: 'none', zIndex: 6,
           background: 'rgba(10,12,16,0.92)', border: `1px solid ${hoveredContact.color}`,
           borderRadius: 4, padding: '5px 10px', maxWidth: 200,
-          fontFamily: 'IBM Plex Mono, monospace', fontSize: 11,
+          fontFamily: 'IBM Plex Mono, monospace', fontSize: 16.5,
           boxShadow: `0 0 12px ${hoveredContact.color}44`,
         }}>
           <div style={{ color: hoveredContact.color, marginBottom: 3 }}>{hoveredContact.label}</div>
           {hoveredContact.region ? (
             hoveredContact.region.inside ? (
-              <div style={{ color: hoveredContact.region.color, fontSize: 10 }}>{hoveredContact.region.label}</div>
+              <div style={{ color: hoveredContact.region.color, fontSize: 15 }}>{hoveredContact.region.label}</div>
             ) : (
               <div>
-                <div style={{ color: hoveredContact.region.color, fontSize: 10 }}>{hoveredContact.region.label}</div>
-                <span style={{ color: '#7a8a99', fontSize: 9 }}>nearest · {hoveredContact.region.dist.toFixed(1)} mm</span>
+                <div style={{ color: hoveredContact.region.color, fontSize: 15 }}>{hoveredContact.region.label}</div>
+                <span style={{ color: '#7a8a99', fontSize: 13.5 }}>nearest · {hoveredContact.region.dist.toFixed(1)} mm</span>
               </div>
             )
           ) : (
-            <span style={{ color: '#7a8a99', fontSize: 10 }}>unlabelled</span>
+            <span style={{ color: '#7a8a99', fontSize: 15 }}>unlabelled</span>
           )}
         </div>
       )}

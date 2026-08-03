@@ -398,7 +398,7 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
           position: 'absolute', top: 16, right: 16, pointerEvents: 'none',
           background: 'rgba(10,12,16,0.92)', border: `1px solid ${hoveredContact.color}`,
           borderRadius: 4, padding: '6px 12px', maxWidth: 260,
-          fontFamily: 'IBM Plex Mono, monospace', fontSize: 11,
+          fontFamily: 'IBM Plex Mono, monospace', fontSize: 16.5,
           boxShadow: `0 0 12px ${hoveredContact.color}44`,
         }}>
           <div style={{ color: hoveredContact.color, marginBottom: 4 }}>
@@ -406,11 +406,11 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
           </div>
           {hoveredContact.region ? (
             hoveredContact.region.inside ? (
-              <div style={{ color: hoveredContact.region.color, fontSize: 10 }}>{hoveredContact.region.label}</div>
+              <div style={{ color: hoveredContact.region.color, fontSize: 15 }}>{hoveredContact.region.label}</div>
             ) : (
               <div>
-                <div style={{ color: hoveredContact.region.color, fontSize: 10 }}>{hoveredContact.region.label}</div>
-                <span style={{ color: '#7a8a99', fontSize: 9 }}>
+                <div style={{ color: hoveredContact.region.color, fontSize: 15 }}>{hoveredContact.region.label}</div>
+                <span style={{ color: '#7a8a99', fontSize: 13.5 }}>
                   nearest · {hoveredContact.region.dist.toFixed(1)} mm
                 </span>
               </div>
@@ -427,7 +427,7 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
           position: 'absolute', top: 16, right: 16, pointerEvents: 'none',
           background: 'rgba(10,12,16,0.92)', border: `1px solid ${hoveredStruct.color}`,
           borderRadius: 4, padding: '6px 12px',
-          fontFamily: 'IBM Plex Mono, monospace', fontSize: 11,
+          fontFamily: 'IBM Plex Mono, monospace', fontSize: 16.5,
           boxShadow: `0 0 12px ${hoveredStruct.color}44`,
         }}>
           <span style={{ color: hoveredStruct.color }}>{hoveredStruct.label}</span>
