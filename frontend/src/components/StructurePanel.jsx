@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useAppStore } from '../store';
+import { setParcellationSource } from '../api';
 
 // Checkbox that can render a dash (indeterminate) when only some descendants are checked
 export function TriStateCheckbox({ checked, indeterminate, onChange, onClick, style }) {
@@ -41,13 +42,36 @@ export default function StructurePanel({
     structureVisible,
     setStructureVisible,
     setStructureVisibleMany,
+    reconstruction,
+    setReconstruction,
+    setStructuresData,
   } = useAppStore();
   const [loading, setLoading] = useState(false);
+  const [switching, setSwitching] = useState(false);
 
   const handleLoad = async () => {
     if (loading) return;
     setLoading(true);
     try { await onLoadStructures?.(); } finally { setLoading(false); }
+  };
+
+  // Which MRI drives the parcellation. Only offered when a 2nd MRI was uploaded.
+  // Switching invalidates the cached structures server-side; drop them locally and
+  // reload so the tree rebuilds from the newly-selected source.
+  const parcSource = reconstruction?.parcellation_source || 'main';
+  const handleSourceChange = async (newSource) => {
+    if (switching || newSource === parcSource || !reconstruction?.id) return;
+    setSwitching(true);
+    try {
+      await setParcellationSource(reconstruction.id, newSource);
+      setReconstruction({ ...reconstruction, parcellation_source: newSource });
+      setStructuresData(null);
+      await onLoadStructures?.();
+    } catch (e) {
+      console.error('Failed to switch parcellation source', e);
+    } finally {
+      setSwitching(false);
+    }
   };
 
   const hasStructures = structuresData && Object.keys(structuresData).length > 0;
@@ -82,6 +106,29 @@ export default function StructurePanel({
           </button>
         )}
       </div>
+
+      {reconstruction?.has_mri2 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace' }}>Parcellate from</span>
+          {[['main', 'Main MRI'], ['secondary', '2nd MRI']].map(([val, lbl]) => (
+            <button key={val}
+              onClick={() => handleSourceChange(val)}
+              disabled={switching}
+              title={val === 'secondary' ? 'Use the uploaded 2nd MRI (e.g. pre-op) for cortical parcellation' : 'Use the main reconstruction MRI'}
+              style={{
+                fontSize: 10, padding: '2px 7px', borderRadius: 4,
+                cursor: switching ? 'default' : 'pointer',
+                fontFamily: 'IBM Plex Mono, monospace',
+                border: '1px solid ' + (parcSource === val ? '#74C0FC' : '#1e2530'),
+                background: parcSource === val ? '#12202c' : 'none',
+                color: parcSource === val ? '#74C0FC' : '#7a8a99',
+              }}>
+              {lbl}
+            </button>
+          ))}
+          {switching && <span style={{ fontSize: 10, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>switching…</span>}
+        </div>
+      )}
 
       {hasStructures && (
         <div style={{ maxHeight, overflowY: 'auto' }}>

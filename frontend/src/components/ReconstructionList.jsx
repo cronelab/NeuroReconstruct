@@ -134,7 +134,7 @@ export default function ReconstructionList({ onSelect, onTrash }) {
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [form, setForm] = useState({ patient_id: '', mri_file: null, mri_modality: 't1', ct_file: null, ct_preregistered: false });
+  const [form, setForm] = useState({ patient_id: '', mri_file: null, mri_modality: 't1', ct_file: null, ct_preregistered: false, mri2_file: null });
   const [confirmDelete, setConfirmDelete] = useState(null); // recon object pending soft delete
   const [deleting, setDeleting] = useState(false);
 
@@ -169,6 +169,7 @@ export default function ReconstructionList({ onSelect, onTrash }) {
       fd.append('mri_modality', form.mri_modality);
       if (form.ct_file) fd.append('ct_file', form.ct_file);
       fd.append('ct_preregistered', form.ct_preregistered ? 'true' : 'false');
+      if (form.mri2_file) fd.append('mri2_file', form.mri2_file);
       const res = await createReconstruction(fd);
       const newRecon = res.data;
       // Optimistically block the card immediately on upload:
@@ -178,7 +179,7 @@ export default function ReconstructionList({ onSelect, onTrash }) {
       else if (form.ct_file && form.ct_preregistered) newRecon.status = 'processing';
       setReconstructions(prev => [newRecon, ...prev]);
       setShowCreate(false);
-      setForm({ patient_id: '', mri_file: null, mri_modality: 't1', ct_file: null, ct_preregistered: false });
+      setForm({ patient_id: '', mri_file: null, mri_modality: 't1', ct_file: null, ct_preregistered: false, mri2_file: null });
     } catch (e) {
       alert('Failed: ' + (e.response?.data?.detail || e.message));
     } finally {
@@ -256,6 +257,11 @@ export default function ReconstructionList({ onSelect, onTrash }) {
                 <label style={{ display: 'block', fontSize: 13, color: '#c8d0da', marginBottom: 6, fontWeight: 600 }}>CT NIfTI (.nii / .nii.gz) <span style={{ color: '#4a5568', fontWeight: 400 }}>— optional</span></label>
                 <input type="file" accept=".nii,.nii.gz" onChange={e => setForm(p => ({ ...p, ct_file: e.target.files[0] }))} style={{ padding: '4px 8px', fontSize: 12 }} />
               </div>
+            </div>
+            <div style={{ marginBottom: 14 }}>
+              <label style={{ display: 'block', fontSize: 13, color: '#c8d0da', marginBottom: 6, fontWeight: 600 }}>2nd MRI <span style={{ color: '#4a5568', fontWeight: 400 }}>— optional, T1 · for parcellation</span></label>
+              <input type="file" accept=".nii,.nii.gz" onChange={e => setForm(p => ({ ...p, mri2_file: e.target.files[0] }))} style={{ padding: '4px 8px', fontSize: 12, width: '100%', boxSizing: 'border-box' }} />
+              <div style={{ fontSize: 11, color: '#4a5568', marginTop: 4 }}>Registered to the main MRI in the background. Used for parcellation only when you select it in the viewer.</div>
             </div>
             {form.ct_file && (
               <div style={{ marginBottom: 14, display: 'flex', alignItems: 'center', gap: 10 }}>

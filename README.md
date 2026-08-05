@@ -78,9 +78,12 @@ cd backend
 python migrate_shaft_fields.py   # adds electrode shaft metadata columns
 python migrate_lock_fields.py    # adds is_complete / is_locked columns
 python migrate_deleted_at.py     # adds soft-delete support
+python migrate_mri2.py           # adds mri2_path / parcellation_source columns
 ```
 
-All three are safe to run multiple times — they skip columns that already exist.
+All are safe to run multiple times — they skip columns that already exist. After
+`migrate_mri2.py`, existing reconstructions keep `mri2_path = NULL` and
+`parcellation_source = 'main'`, so single-MRI reconstructions are unchanged.
 
 ---
 
@@ -360,4 +363,6 @@ Register users via the API: `POST /api/auth/register`
 - [ ] Share link read-only viewer (token exists in DB, UI not fully wired)
 - [ ] Cloud deployment (JH Research Computing / AWS)
 - [ ] Postgres migration for multi-user cloud deployment
+- [ ] Optional second MRI for parcellation — upload a separate (e.g. pre-op) T1, run cortical/subcortical parcellation on it in its native space, then register it to the main MRI (ANTs) and warp the parcellation onto the main grid with label-safe interpolation (`genericLabel`/nearest-neighbor), landing it as `structures_cortical.nii.gz` in the main MRI frame. `extract_all_structures()` then runs unchanged (it anchors to the shared `mesh.json` center). Main additions: a DB column + migration, an upload slot, the MRI→MRI registration + label-warp step, and a source toggle.
+- [ ] Automated electrode localization — auto-detect electrode contacts from the CT instead of manual click-to-place: sweep HU thresholds, take connected components filtered by physical volume and an inside-brain-mesh test, pick the threshold band where the count is stable, and propose weighted-centroid candidates for the user to accept/assign. Builds on `snap_to_blob_centroid()` in `services/ct_electrode_extractor.py` (already does threshold + connected-component + weighted-centroid). Approach mirrors LeGUI's `LeG_autoElecs.m`.
 - [ ] FreeSurfer surface import (upload lh.pial/rh.pial instead of marching cubes)

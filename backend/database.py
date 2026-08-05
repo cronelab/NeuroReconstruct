@@ -37,6 +37,11 @@ class Reconstruction(Base):
     mesh_path = Column(String, nullable=True)
     mri_path = Column(String, nullable=True)
     ct_path = Column(String, nullable=True)
+    # Optional second MRI (e.g. a cleaner pre-op T1) used *only* for cortical
+    # parcellation when the user opts in. mri2_path is NULL for single-MRI recons;
+    # parcellation_source stays "main" unless the user explicitly selects "secondary".
+    mri2_path = Column(String, nullable=True)
+    parcellation_source = Column(String, default="main")  # "main" | "secondary"
     status = Column(String, default="pending")
     is_complete = Column(Boolean, default=False)
     is_locked = Column(Boolean, default=False)

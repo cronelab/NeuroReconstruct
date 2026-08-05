@@ -497,6 +497,7 @@ class ReconstructionResponse(BaseModel):
     is_complete: bool = False
     is_locked: bool = False
     registration_confirmed: bool = False
+    parcellation_source: str = "main"
 
     class Config:
         from_attributes = True
@@ -637,6 +638,8 @@ async def list_reconstructions(
             "has_mri": recon.mri_path is not None and os.path.exists(_abs(recon.mri_path) or ""),
             "has_mesh": recon.mesh_path is not None and os.path.exists(_abs(recon.mesh_path) or ""),
             "has_ct": recon.ct_path is not None,
+            "has_mri2": recon.mri2_path is not None,
+            "parcellation_source": getattr(recon, "parcellation_source", "main") or "main",
             "has_registration": (
                 os.path.exists(os.path.join(os.path.dirname(_abs(recon.ct_path)), "ct_to_mri.npy"))
                 if recon.ct_path else False
@@ -660,6 +663,7 @@ async def create_reconstruction(
     mri_modality: str = Form("t1"),
     ct_file: Optional[UploadFile] = File(None),
     ct_preregistered: bool = Form(False),
+    mri2_file: Optional[UploadFile] = File(None),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db),
@@ -682,11 +686,22 @@ async def create_reconstruction(
         with open(ct_path, "wb") as f:
             f.write(await ct_file.read())
 
+    # Optional second MRI (must be T1 for DKT) — stored only; parcellation stays
+    # on the main MRI until the user explicitly opts in. Registration to the main
+    # MRI is precomputed in the background task below.
+    mri2_path = None
+    if mri2_file:
+        mri2_path = os.path.join(recon_dir, "mri2.nii.gz")
+        with open(mri2_path, "wb") as f:
+            f.write(await mri2_file.read())
+
     recon = Reconstruction(
         patient_id=patient_id,
         label=label,
         mri_path=_rel(mri_path),
         ct_path=_rel(ct_path),
+        mri2_path=_rel(mri2_path) if mri2_path else None,
+        parcellation_source="main",
         created_by=current_user.id,
         status="processing",
         share_token=uuid.uuid4().hex,
@@ -695,8 +710,8 @@ async def create_reconstruction(
     await db.commit()
     await db.refresh(recon)
 
-    # Run mesh extraction in background
-    background_tasks.add_task(_extract_mesh_background, recon.id, mri_path, recon_dir, ct_path, ct_preregistered, mri_modality)
+    # Run mesh extraction (+ CT and optional MRI2 registration) in background
+    background_tasks.add_task(_extract_mesh_background, recon.id, mri_path, recon_dir, ct_path, ct_preregistered, mri_modality, mri2_path)
 
     return recon
 
@@ -708,11 +723,12 @@ async def upload_reconstruction_files(
     mri_modality: str = Form("t1"),
     ct_file: Optional[UploadFile] = File(None),
     ct_preregistered: bool = Form(False),
+    mri2_file: Optional[UploadFile] = File(None),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upload or replace MRI/CT files for an existing reconstruction and re-run processing."""
+    """Upload or replace MRI/CT/2nd-MRI files for an existing reconstruction and re-run processing."""
     mri_modality = mri_modality.lower()
     if mri_modality not in ("t1", "t2"):
         raise HTTPException(status_code=400, detail="mri_modality must be 't1' or 't2'")
@@ -744,20 +760,41 @@ async def upload_reconstruction_files(
         with open(ct_path, "wb") as f:
             f.write(await ct_file.read())
 
+    # Optional second MRI (T1) for parcellation. Storing/replacing it invalidates
+    # the precomputed MRI2->main transform; if the recon is currently parcellating
+    # from the secondary MRI, also drop the cortical-label cache so it rebuilds.
+    mri2_path = _abs(recon.mri2_path) if recon.mri2_path else None
+    if mri2_file:
+        mri2_path = os.path.join(recon_dir, "mri2.nii.gz")
+        with open(mri2_path, "wb") as f:
+            f.write(await mri2_file.read())
+        from services.secondary_parcellation import get_affine_transform_path
+        _safe_remove(get_affine_transform_path(recon_dir))
+        if getattr(recon, "parcellation_source", "main") == "secondary":
+            _invalidate_structure_cache(recon_dir)
+
     await db.execute(
         update(Reconstruction)
         .where(Reconstruction.id == recon_id)
         .values(
             mri_path=_rel(mri_path) if mri_path else recon.mri_path,
             ct_path=_rel(ct_path)   if ct_path  else recon.ct_path,
-            status="processing",
+            mri2_path=_rel(mri2_path) if mri2_path else recon.mri2_path,
+            # Only a main/CT change reprocesses the mesh; a 2nd-MRI-only upload
+            # just (re)registers in the background and keeps the current status.
+            status="processing" if (mri_file or ct_file) else recon.status,
             updated_at=datetime.utcnow(),
         )
     )
     await db.commit()
 
-    if mri_path:
-        background_tasks.add_task(_extract_mesh_background, recon_id, mri_path, recon_dir, ct_path, ct_preregistered, mri_modality)
+    if mri_file or ct_file:
+        # Main/CT changed -> full reprocess (mesh + CT + optional MRI2 registration).
+        if mri_path:
+            background_tasks.add_task(_extract_mesh_background, recon_id, mri_path, recon_dir, ct_path, ct_preregistered, mri_modality, mri2_path)
+    elif mri2_file and mri_path:
+        # Only the 2nd MRI changed -> just (re)register it; don't touch mesh/contacts.
+        background_tasks.add_task(_register_mri2_background, recon_id, mri_path, mri2_path, recon_dir)
 
     return {"status": "processing"}
 
@@ -936,8 +973,9 @@ async def _run_multistart_registration(recon_id: int, mri_path: str, ct_abs: str
             await db2.commit()
 
 
-async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str, ct_path: str = None, ct_preregistered: bool = False, mri_modality: str = "t1"):
-    """Background task: extract brain mesh from MRI NIfTI, then register CT if available."""
+async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str, ct_path: str = None, ct_preregistered: bool = False, mri_modality: str = "t1", mri2_path: str = None):
+    """Background task: extract brain mesh from MRI NIfTI, then register CT (and the
+    optional 2nd MRI) if available."""
     from database import AsyncSessionLocal
     import hashlib
 
@@ -998,6 +1036,82 @@ async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str,
             await _run_registration(
                 recon_id, mri_path, _abs(ct_path_val), ct_preregistered, threads=fast_threads
             )
+
+        # Precompute the affine MRI2->main registration in the background so a later
+        # opt-in to secondary parcellation is fast. Registration only -- no DKT here.
+        if mri2_path and os.path.exists(mri2_path):
+            try:
+                from services.secondary_parcellation import register_mri2_to_main
+                await loop.run_in_executor(None, register_mri2_to_main, recon_dir, mri_path, mri2_path)
+                print(f"[MRI2] Background registration complete for recon {recon_id}")
+            except Exception:
+                import traceback
+                print(f"[MRI2 ERROR] Registration failed for recon {recon_id}:")
+                traceback.print_exc()
+
+
+def _safe_remove(path: str):
+    """Delete a file if it exists; never raise."""
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        print(f"[CACHE] could not remove {path}: {e}")
+
+
+def _invalidate_structure_cache(recon_dir: str):
+    """Drop the cached cortical label volume + per-structure meshes so they
+    regenerate. Used when the parcellation source or the 2nd MRI changes."""
+    import glob as _glob
+    label_path = os.path.join(recon_dir, "structures_cortical.nii.gz")
+    _safe_remove(label_path)
+    for p in _glob.glob(os.path.join(recon_dir, "structures", "*.json")):
+        _safe_remove(p)
+    # The 2D overlay slice cache is keyed by the label volume path -- drop it too.
+    _struct_overlay_cache.pop(label_path, None)
+
+
+def ensure_cortical_labels(recon_dir: str, main_mri_path: str, mri2_path: str, parcellation_source: str):
+    """When parcellating from the secondary MRI, ensure ``structures_cortical.nii.gz``
+    exists in the main frame (native DKT on MRI2 + label-safe warp). No-op for the
+    main source -- ``extract_all_structures`` builds it from the main MRI as usual.
+    Runs synchronously; call inside an executor."""
+    if parcellation_source != "secondary" or not mri2_path or not os.path.exists(mri2_path):
+        return
+    label_path = os.path.join(recon_dir, "structures_cortical.nii.gz")
+    if os.path.exists(label_path):
+        return
+    from services.secondary_parcellation import build_cortical_labels_from_secondary
+    build_cortical_labels_from_secondary(recon_dir, main_mri_path, mri2_path, label_path)
+
+
+async def _register_mri2_background(recon_id: int, main_mri_path: str, mri2_path: str, recon_dir: str):
+    """Background task for a 2nd-MRI-only (re)upload: (re)register the 2nd MRI to the
+    main MRI (affine). If the recon is currently on the secondary source, rebuild
+    its cortical labels from the new registration."""
+    loop = asyncio.get_event_loop()
+    try:
+        from services.secondary_parcellation import register_mri2_to_main
+        await loop.run_in_executor(None, register_mri2_to_main, recon_dir, main_mri_path, mri2_path)
+        print(f"[MRI2] Background registration complete for recon {recon_id}")
+    except Exception:
+        import traceback
+        print(f"[MRI2 ERROR] Registration failed for recon {recon_id}:")
+        traceback.print_exc()
+        return
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+        recon = result.scalar_one_or_none()
+    if recon and getattr(recon, "parcellation_source", "main") == "secondary":
+        try:
+            _invalidate_structure_cache(recon_dir)
+            await loop.run_in_executor(None, ensure_cortical_labels, recon_dir, main_mri_path, mri2_path, "secondary")
+            print(f"[MRI2] Secondary labels rebuilt for recon {recon_id}")
+        except Exception:
+            import traceback
+            print(f"[MRI2 ERROR] Secondary label rebuild failed for recon {recon_id}:")
+            traceback.print_exc()
 
 
 
@@ -1097,6 +1211,8 @@ async def get_reconstruction(
         "has_mri": recon.mri_path is not None and os.path.exists(_abs(recon.mri_path) or ""),
         "has_mesh": recon.mesh_path is not None and os.path.exists(_abs(recon.mesh_path) or ""),
         "has_ct": recon.ct_path is not None,
+        "has_mri2": recon.mri2_path is not None,
+        "parcellation_source": getattr(recon, "parcellation_source", "main") or "main",
         "has_registration": (
             os.path.exists(os.path.join(os.path.dirname(_abs(recon.ct_path)), "ct_to_mri.npy"))
             if recon.ct_path else False
@@ -1322,6 +1438,15 @@ async def _export_mni_background(recon_id: int):
 
         from services.mni_registration import export_reconstruction_to_mni
         loop = asyncio.get_event_loop()
+        # If parcellating from the 2nd MRI, ensure the secondary-derived label volume
+        # is in place before the export labels contacts against it.
+        if getattr(recon, "parcellation_source", "main") == "secondary" and recon.mri2_path:
+            try:
+                await loop.run_in_executor(
+                    None, ensure_cortical_labels, recon_dir, mri_abs, _abs(recon.mri2_path), "secondary"
+                )
+            except Exception as e:
+                print(f"[MRI2] export: secondary label build failed ({e}); using main MRI")
         await loop.run_in_executor(
             None, export_reconstruction_to_mni,
             recon_dir, mri_abs, ct_abs, ct_to_mri_npy, contacts, mesh_center,
@@ -1820,6 +1945,45 @@ async def prerender_slices(
     return {"status": "started", "axis": axis}
 
 
+@app.post("/api/reconstructions/{recon_id}/parcellation-source")
+async def set_parcellation_source(
+    recon_id: int,
+    source: str = Form(...),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Choose which MRI drives cortical/structure parcellation: 'main' or
+    'secondary' (the uploaded 2nd MRI). Switching invalidates the cached structures
+    so they rebuild from the selected source on the next structures load."""
+    source = (source or "").lower()
+    if source not in ("main", "secondary"):
+        raise HTTPException(status_code=400, detail="source must be 'main' or 'secondary'")
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Not found")
+    if source == "secondary" and not recon.mri2_path:
+        raise HTTPException(status_code=400, detail="No second MRI uploaded for this reconstruction")
+
+    if getattr(recon, "parcellation_source", "main") != source:
+        recon_dir = None
+        if recon.mesh_path:
+            recon_dir = os.path.dirname(_abs(recon.mesh_path))
+        elif recon.mri_path:
+            recon_dir = os.path.dirname(_abs(recon.mri_path))
+        if recon_dir:
+            # Drop structures built from the previous source; the next /structures
+            # call rebuilds from the newly-selected one (ensure_cortical_labels).
+            _invalidate_structure_cache(recon_dir)
+        await db.execute(
+            update(Reconstruction)
+            .where(Reconstruction.id == recon_id)
+            .values(parcellation_source=source, updated_at=datetime.utcnow())
+        )
+        await db.commit()
+    return {"parcellation_source": source}
+
+
 @app.get("/api/reconstructions/{recon_id}/structures")
 async def get_structures(
     recon_id: int,
@@ -1842,6 +2006,16 @@ async def get_structures(
     recon_dir = os.path.dirname(mesh_abs)
 
     loop = asyncio.get_event_loop()
+    # If parcellating from the 2nd MRI, ensure structures_cortical.nii.gz exists in
+    # the main frame before mesh extraction reads it (no-op for the main source).
+    if getattr(recon, "parcellation_source", "main") == "secondary" and recon.mri2_path:
+        try:
+            await loop.run_in_executor(
+                None, ensure_cortical_labels, recon_dir,
+                _abs(recon.mri_path), _abs(recon.mri2_path), "secondary",
+            )
+        except Exception as e:
+            print(f"[MRI2] secondary label build failed, falling back to main MRI: {e}")
     try:
         structures = await loop.run_in_executor(
             None, extract_all_structures, mesh_abs, recon_dir, _abs(recon.mri_path)

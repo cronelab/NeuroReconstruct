@@ -39,6 +39,15 @@ export const getMesh = (id, token) =>
 
 export const getShareLink = (id) => api.get(`/reconstructions/${id}/share-link`);
 
+// Choose which MRI drives cortical/structure parcellation: 'main' or 'secondary'.
+export const setParcellationSource = (id, source) => {
+  const form = new URLSearchParams();
+  form.append('source', source);
+  return api.post(`/reconstructions/${id}/parcellation-source`, form, {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+};
+
 // ── Trash ─────────────────────────────────────────────────────────────────────
 export const softDeleteReconstruction = (id) =>
   api.patch(`/reconstructions/${id}/soft-delete`);
