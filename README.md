@@ -181,6 +181,30 @@ kept, capped at 512 MB total. Override with `NEURO_CT_CACHE_MAX_FILES` and
 | `structure_extractor.py` | Patient-specific brain structure segmentation via **antspynet**. Segments hippocampus, amygdala, thalamus, putamen, caudate, pallidum, and cortical parcellation. Results cached as `structures.json` + `structures_cortical.nii.gz`. Falls back to borrowing cached structures from any other reconstruction if antspynet is unavailable. |
 | `ct_electrode_extractor.py` | CT mesh generation (HU threshold + marching cubes). `snap_to_blob_centroid()` snaps a clicked world position to the nearest bright CT blob centroid within 8mm. |
 | `electrode_service.py` | Autofill: cubic spline fit parameterized by contact number. Interpolates between placed contacts, linear extrapolation beyond the manual range. Blob-snap applied to interpolated contacts only. |
+| `mni_registration.py` | Results-export pipeline. Registers the patient MRI to MNI152 via **ANTs** affine + SyN (`SyNRA`), warps the CT into MNI using the existing `ct_to_mri.npy`, and maps electrode contacts (RAS points, LPS-flipped for ANTs) into MNI space. Writes `MRI_mni.nii.gz`, `CT_mni.nii.gz`, transforms, `electrodes_mni.csv`/`.json`, and `export_manifest.json` to `<recon>/export/`. CPU-only, deterministic. |
+| `contact_labeling.py` | Labels each contact with the patient-specific DKT structure it sits in — or, for white-matter contacts, a plurality vote among structure voxels within a 2mm radius (reports structure, group, `distance_mm`, `vote_share`, `voxel_content`), leaving genuinely off-structure contacts unassigned. Native MRI space (no atlas warp); uses the cached `structures_cortical.nii.gz`. Writes `electrodes_structures.csv`. |
+
+### Results export
+
+Completing a reconstruction can trigger a **results export** (`_export_mni_background`
+in `main.py`, tracked by `Reconstruction.export_status`). It runs the MNI
+normalization (`mni_registration.py`) and contact-to-structure labeling
+(`contact_labeling.py`), producing a `<recon>/export/` folder that the
+`/export/download` endpoint zips for the user:
+
+| Artifact | Contents |
+|---|---|
+| `electrodes_mni.csv` / `.json` | Per-contact MNI152 coordinates (JSON also keeps native mm for traceability). |
+| `electrodes_structures.csv` | Per-contact anatomical structure (or nearest, with distance and vote share). |
+| `MRI_mni.nii.gz`, `CT_mni.nii.gz` | Patient MRI and CT warped into MNI152 space. |
+| `mri_to_mni_*`, `mni_to_mri_invwarp.nii.gz` | Forward/inverse ANTs transforms, retained for re-runs. |
+| `export_manifest.json` | Template, ANTs version, transform type, contact counts, phase timings. |
+
+> MNI registration is CPU-heavy (SyN is multi-minute) but uses plain `ants`,
+> which **is** bundled in the standalone exe — so MNI coordinate export runs
+> there. Only the contact-structure labeling step depends on a DKT segmentation:
+> if structures were never computed for a case, that step needs antspynet (absent
+> in the exe) and is skipped, though `electrodes_mni.csv` is still produced.
 
 ### Frontend (`frontend/src/`)
 
@@ -331,9 +355,9 @@ Register users via the API: `POST /api/auth/register`
 
 ## Roadmap
 
-- [ ] CSV/Excel export of electrode coordinates (shaft, contact, x/y/z mm)
+- [x] CSV export of electrode coordinates — shipped via the results export: `electrodes_mni.csv` (MNI coords) and `electrodes_structures.csv` (shaft, contact, structure). Backed by MNI normalization in `services/mni_registration.py`.
+- [x] Contact-to-atlas labeling — shipped: `electrodes_structures.csv` reports the DKT structure each contact sits in (or the nearest one, with distance and vote share). See `services/contact_labeling.py`.
 - [ ] Share link read-only viewer (token exists in DB, UI not fully wired)
 - [ ] Cloud deployment (JH Research Computing / AWS)
 - [ ] Postgres migration for multi-user cloud deployment
-- [ ] Contact-to-atlas labeling (report which structure each contact falls within)
 - [ ] FreeSurfer surface import (upload lh.pial/rh.pial instead of marching cubes)
