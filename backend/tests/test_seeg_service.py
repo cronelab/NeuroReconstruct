@@ -92,12 +92,13 @@ def test_event_activity_rise():
         assert out["groups"] == ["LAH", "LAH", "LAH", "LPH"]
         act = np.array(out["activity"])                     # (frames, channels)
         raw = np.array(out["raw"])                          # (frames, channels) uV ERP
-        times = np.array(out["times"])                      # ms, post-stimulus only
+        times = np.array(out["times"])                      # ms, full peri-event window
+        assert out["align"] == "stimulus"
         assert act.shape[0] == len(times)
         assert act.shape[1] == len(chans)
         assert raw.shape == act.shape and np.isfinite(raw).all()
-        # Output is post-stimulus only (t >= 0); the baseline is not returned.
-        assert times.min() >= 0
+        # Output now spans the full window (default start -500 ms); baseline separate.
+        assert -505 <= times.min() <= -495, times.min()
         # Active channels show a strong positive baseline-z in the burst (0..400 ms);
         # since z is normalized to the pre-onset baseline, that means z well above 0.
         post = act[(times > 20) & (times < 400)].mean(axis=0)
@@ -169,11 +170,63 @@ def test_window_param():
         make_fake_h5(p, chans, active=["LAH2"], n_trials=15, duration_s=40)
         out = S.compute_band_activity(p, band="high_gamma", window_ms=(-100.0, 500.0))
         t = np.array(out["times"])
-        # Displayed time course is post-stimulus only: 0 .. end.
-        assert 0 <= t.min() < 5, t.min()
+        # Displayed time course spans the full window: start .. end.
+        assert -105 < t.min() <= -95, t.min()
         assert 495 < t.max() <= 500.5, t.max()
         assert np.array(out["activity"]).shape[0] == len(t)
     print("ok test_window_param")
+
+
+def test_response_alignment():
+    # LAH2 bursts at STIMULUS onset; LRESP1 bursts at RESPONSE onset. Response-aligned
+    # averaging should reveal LRESP1's burst near t=0 (the response), and drop the one
+    # trial with no detected response.
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "f.h5")
+        chans = ["LAH1", "LAH2", "LRESP1"]
+        make_fake_h5(p, chans, active=["LAH2"], response_active=["LRESP1"],
+                     n_trials=20, duration_s=60, no_response_trials=[19])
+        out = S.compute_band_activity(p, band="high_gamma", align="response",
+                                      window_ms=(-800.0, 800.0))
+        assert out["align"] == "response"
+        assert out["n_no_response"] >= 1, out["n_no_response"]      # trial 19 dropped
+        assert out["n_trials"] == 19, out["n_trials"]
+        act = np.array(out["activity"]); times = np.array(out["times"])
+        assert times.min() < 0 < times.max()                        # full window
+        near0 = act[(times > -100) & (times < 400)].mean(axis=0)    # around the response
+        assert near0[chans.index("LRESP1")] > 2.0, near0[chans.index("LRESP1")]
+
+        # A file with NO responses at all -> response mode raises.
+        p2 = os.path.join(d, "g.h5")
+        make_fake_h5(p2, chans, active=["LAH2"], n_trials=10, duration_s=30,
+                     no_response_trials=list(range(10)))
+        try:
+            S.compute_band_activity(p2, band="high_gamma", align="response")
+            assert False, "expected ValueError for a file with no responses"
+        except ValueError as e:
+            assert "response" in str(e).lower(), str(e)
+    print("ok test_response_alignment")
+
+
+def test_stimulus_relative_baseline():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "f.h5")
+        chans = ["LAH1", "LAH2", "LRESP1"]
+        make_fake_h5(p, chans, active=["LAH2"], response_active=["LRESP1"],
+                     n_trials=20, duration_s=60)
+        # An explicit pre-stimulus baseline window is accepted and stays finite even
+        # when the display is aligned to the response.
+        out = S.compute_band_activity(p, band="high_gamma", align="response",
+                                      window_ms=(-800.0, 800.0),
+                                      baseline_ms=(-500.0, -100.0))
+        assert np.isfinite(np.array(out["activity"])).all()
+        # Stimulus mode is unchanged whether baseline is omitted (defaults to the whole
+        # pre-stimulus interval [window[0], 0]) or passed explicitly as that interval.
+        a = S.compute_band_activity(p, band="high_gamma", window_ms=(-500.0, 1500.0))
+        b = S.compute_band_activity(p, band="high_gamma", window_ms=(-500.0, 1500.0),
+                                    baseline_ms=(-500.0, 0.0))
+        assert a["activity"] == b["activity"]
+    print("ok test_stimulus_relative_baseline")
 
 
 if __name__ == "__main__":
@@ -186,4 +239,6 @@ if __name__ == "__main__":
     test_env_cache()
     test_window_param()
     test_event_activity_rise()
+    test_response_alignment()
+    test_stimulus_relative_baseline()
     print("\nALL PASSED")

@@ -71,11 +71,19 @@ export const useAppStore = create((set, get) => ({
   setSeegActivity: (a) => set({ seegActivity: a, seegTimeIndex: 0 }),
   seegBand: 'high_gamma',
   setSeegBand: (b) => set({ seegBand: b }),
-  // Trial-averaged peri-stimulus window (ms magnitudes before/after onset).
+  // Trial-averaged peri-EVENT display window (ms magnitudes before/after the align event).
   seegPre: 500,
   setSeegPre: (v) => set({ seegPre: v }),
   seegPost: 2000,
   setSeegPost: (v) => set({ seegPost: v }),
+  // Alignment event for trial epochs: 'stimulus' (stimulus onset) | 'response' (spoken-response onset).
+  seegAlign: 'stimulus',
+  setSeegAlign: (a) => set({ seegAlign: a }),
+  // Z-score baseline window (ms, both <= 0), ALWAYS relative to stimulus onset.
+  seegBaseStart: -500,
+  setSeegBaseStart: (v) => set({ seegBaseStart: v }),
+  seegBaseEnd: 0,
+  setSeegBaseEnd: (v) => set({ seegBaseEnd: v }),
   seegMode: 'trial',             // 'trial' (trial-averaged) | 'scroll' (continuous)
   setSeegMode: (m) => set({ seegMode: m }),
   seegTraceSignal: 'z',          // 'z' (band-power z) | 'raw' (voltage)

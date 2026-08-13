@@ -1568,8 +1568,12 @@ async def list_seeg(
 class SeegActivityRequest(BaseModel):
     band: str = "high_gamma"
     mode: str = "trial"                              # 'trial' | 'scroll'
-    # Peri-stimulus window [start_ms, end_ms] relative to onset (start < 0 < end).
+    # Alignment event for trial epochs: 'stimulus' (start_time) | 'response' (response_onset).
+    align: str = "stimulus"
+    # Peri-event display window [start_ms, end_ms] relative to the align event (start < 0 < end).
     window_ms: Optional[List[float]] = None
+    # Baseline window [start_ms, end_ms], both <= 0, ALWAYS relative to stimulus onset.
+    baseline_ms: Optional[List[float]] = None
     # False = activation map only (skip the slow raw-voltage read; ``raw`` empty).
     include_raw: bool = True
 
@@ -1609,11 +1613,19 @@ async def compute_seeg_activity(
         raise HTTPException(status_code=400, detail="mode must be 'trial' or 'scroll'")
 
     window = None
+    baseline = None
     if req.mode == "trial":
+        if req.align not in ("stimulus", "response"):
+            raise HTTPException(status_code=400, detail="align must be 'stimulus' or 'response'")
         window = tuple(req.window_ms) if req.window_ms else DEFAULT_WINDOW_MS
         if len(window) != 2 or not (window[0] < 0 < window[1]):
             raise HTTPException(status_code=400,
                                 detail="window_ms must be [start, end] with start < 0 < end")
+        if req.baseline_ms is not None:
+            baseline = tuple(req.baseline_ms)
+            if len(baseline) != 2 or not (baseline[0] < baseline[1] <= 0):
+                raise HTTPException(status_code=400,
+                                    detail="baseline_ms must be [start, end] with start < end <= 0")
 
     # Signal processing is CPU-bound; keep the event loop responsive.
     loop = asyncio.get_event_loop()
@@ -1621,7 +1633,7 @@ async def compute_seeg_activity(
         activity = await loop.run_in_executor(
             None, lambda: compute_activity(
                 h5_path, mode=req.mode, band=req.band, window_ms=window,
-                include_raw=req.include_raw)
+                baseline_ms=baseline, align=req.align, include_raw=req.include_raw)
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))

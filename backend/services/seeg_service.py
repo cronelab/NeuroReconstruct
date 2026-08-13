@@ -142,11 +142,16 @@ def parse_seeg_h5(path: str) -> dict:
             stim = _decode(tg["stimulus"]) if "stimulus" in tg else []
             start = tg["start_time"][:] if "start_time" in tg else np.array([])
             stop = tg["stop_time"][:] if "stop_time" in tg else np.array([])
+            # response_onset (NeurosEEGRead, seconds; NaN when no spoken response was
+            # detected) drives response-locked alignment. Absent in older h5 files.
+            resp = tg["response_onset"][:] if "response_onset" in tg else np.array([])
             for i in range(len(start)):
+                r = float(resp[i]) if i < len(resp) else float("nan")
                 trials.append({
                     "stimulus": stim[i] if i < len(stim) else "",
                     "start_time": float(start[i]),
                     "stop_time": float(stop[i]) if i < len(stop) else None,
+                    "response_onset": (r if np.isfinite(r) else None),
                 })
 
         def _attr(key, default=None):
@@ -313,33 +318,41 @@ def _read_strided(h5_path: str, meta: dict, step: int) -> np.ndarray:
 def compute_band_activity(path: str, band: str = DEFAULT_BAND,
                           window_ms: tuple = DEFAULT_WINDOW_MS,
                           baseline_ms: tuple = None,
+                          align: str = "stimulus",
                           max_frames: int = MAX_OUTPUT_FRAMES,
                           include_raw: bool = True) -> dict:
     """
     Compute the event-related display activity matrix for one h5 recording.
 
-    Epochs each channel around every ``/trials`` onset over the peri-stimulus
-    ``window_ms`` [start, end] (start < 0 < end, relative to onset), z-scores each
-    epoch to its pre-onset baseline, averages across trials, and returns the
-    POST-stimulus portion [0, end] ms (the pre-onset samples only feed the baseline).
+    Epochs each channel around a per-trial alignment event over ``window_ms``
+    [start, end] (start < 0 < end, relative to the event), z-scores each epoch to a
+    baseline taken *before stimulus onset*, averages across trials, and returns the
+    FULL window (both pre- and post-event frames).
 
+    align:       'stimulus' -> epoch around ``/trials/start_time`` (stimulus onset);
+                 'response' -> epoch around ``/trials/response_onset`` (spoken-
+                 response onset), skipping trials with no detected response.
     band:        key in BANDS.
-    window_ms:   peri-stimulus window in ms [start, end], start < 0 < end. The
-                 pre-onset part [start, 0] is the baseline; the post-onset part
-                 [0, end] is the displayed activation time course.
-    baseline_ms: baseline window in ms [start, end]; defaults to the entire
-                 pre-stimulus interval [window_ms[0], 0].
+    window_ms:   peri-event display window in ms [start, end], start < 0 < end,
+                 relative to the alignment event.
+    baseline_ms: baseline window in ms [start, end], both <= 0, ALWAYS relative to
+                 STIMULUS onset (start_time) -- not the alignment event. Aligning to
+                 the response makes the pre-response interval a bad baseline (it holds
+                 stimulus-evoked activity at variable RT lags), so the baseline stays
+                 anchored to the stimulus. Defaults to [window_ms[0], 0].
 
     Returns:
       channels: [name, ...]              (mappable channels, order matches columns)
       groups:   [shaft, ...]             per-channel shaft name
-      times:    [t_ms, ...]              post-stimulus time in ms (>= 0)
+      times:    [t_ms, ...]              time in ms relative to the event (may be < 0)
       activity: [[v, ...], ...]          shape (n_frames, n_channels), baseline z
       raw:      [[uV, ...], ...]         trial-averaged, baseline-corrected ERP (uV)
-      mode ('trial'), time_unit ('ms'), band, n_trials
+      mode ('trial'), time_unit ('ms'), band, align, n_trials, n_no_response
     """
     if band not in BANDS:
         raise ValueError(f"unknown band {band!r}; options: {sorted(BANDS)}")
+    if align not in ("stimulus", "response"):
+        raise ValueError(f"unknown align {align!r}; options: ['stimulus', 'response']")
     if baseline_ms is None:
         baseline_ms = (window_ms[0], 0.0)
     meta = parse_seeg_h5(path)
@@ -348,79 +361,91 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
     groups = [c["group"] for c in meta["channels"]]
     if not meta["channels"]:
         return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
-                "mode": "trial", "time_unit": "ms", "band": band, "n_trials": 0}
+                "mode": "trial", "time_unit": "ms", "band": band, "align": align,
+                "n_trials": 0, "n_no_response": 0}
+
+    if not meta["trials"]:
+        raise ValueError("no trials in h5 -- trial-averaged mapping needs /trials onsets")
 
     t_env = time.perf_counter()
     env, full_sig = _load_or_compute_envelope(path, band, meta)
     _dbg(f"[SEEG] trial: envelope ready in {time.perf_counter() - t_env:.2f}s")
-
-    # ── Trial-averaged: epoch around trial onsets ─────────────────────────────
-    onsets = np.array([t["start_time"] for t in meta["trials"]], dtype=np.float64)
-    if len(onsets) == 0:
-        raise ValueError("no trials in h5 -- trial-averaged mapping needs /trials onsets")
 
     w0, w1 = window_ms[0] / 1000.0, window_ms[1] / 1000.0     # seconds
     pre = int(round(-w0 * fs)) if w0 < 0 else 0
     post = int(round(w1 * fs))
     n_pst = pre + post
     pst_times_ms = (np.arange(-pre, post) / fs) * 1000.0
+    # Baseline offsets (in samples) relative to STIMULUS onset. Both are typically
+    # <= 0 (pre-stimulus); they index off the stimulus sample, not the event.
+    b0off = int(round(baseline_ms[0] / 1000.0 * fs))
+    b1off = int(round(baseline_ms[1] / 1000.0 * fs))
 
     n_ch = env.shape[1]
     n_samp = env.shape[0]
 
-    # Trial epochs fully inside the segment (edge-truncated epochs are dropped).
-    windows = []
-    for onset in onsets:
-        c = int(round(onset * fs))
+    # ── Per-trial windows: display epoch around the alignment event + baseline
+    # epoch around the stimulus. A trial is dropped when either range falls outside
+    # the segment, or (response mode) it has no detected response. ────────────────
+    disp_windows, base_windows = [], []
+    n_no_response = 0
+    for t in meta["trials"]:
+        stim = t["start_time"]
+        if align == "response":
+            anchor = t.get("response_onset")
+            if anchor is None:
+                n_no_response += 1
+                continue
+        else:
+            anchor = stim
+        c = int(round(anchor * fs))
         s, e = c - pre, c + post
-        if s < 0 or e > n_samp:
+        bc = int(round(stim * fs))
+        bs, be = bc + b0off, bc + b1off
+        if s < 0 or e > n_samp or bs < 0 or be > n_samp or be <= bs:
             continue
-        windows.append((s, e))
-    if not windows:
-        raise ValueError("all trial epochs fell outside the segment -- check onsets")
+        disp_windows.append((s, e))
+        base_windows.append((bs, be))
+
+    if not disp_windows:
+        if align == "response" and n_no_response == len(meta["trials"]):
+            raise ValueError("recording has no response onsets")
+        raise ValueError("all trial epochs fell outside the segment -- check onsets/window")
 
     # Raw voltage for the ERP is only needed for the trace panel, and reading it is
     # the slow part on a cache hit. When include_raw is False the caller wants just
     # the activation map, so we skip the raw read entirely (see compute_activity).
-    raw_epochs = None
+    raw_disp = raw_base = None
     if include_raw:
         t_raw = time.perf_counter()
         if full_sig is not None:
-            raw_epochs = [full_sig[s:e] for s, e in windows]
+            raw_disp = [full_sig[s:e] for s, e in disp_windows]
+            raw_base = [full_sig[s:e] for s, e in base_windows]
             raw_src = "reused full signal"
         else:
-            raw_epochs = _read_windows(path, meta, windows)
+            raw_disp = _read_windows(path, meta, disp_windows)
+            raw_base = _read_windows(path, meta, base_windows)
             raw_src = "lazy epoch reads"
-        _dbg(f"[SEEG] trial: raw epochs ({len(windows)}) via {raw_src} in {time.perf_counter() - t_raw:.2f}s")
+        _dbg(f"[SEEG] trial: raw epochs ({len(disp_windows)}) via {raw_src} in {time.perf_counter() - t_raw:.2f}s")
 
     acc = np.zeros((n_pst, n_ch), dtype=np.float64)          # z-score envelope
     acc_raw = np.zeros((n_pst, n_ch), dtype=np.float64) if include_raw else None
-    b0 = int(round(baseline_ms[0] / 1000.0 * fs)) + pre      # index into epoch
-    b1 = int(round(baseline_ms[1] / 1000.0 * fs)) + pre
-    b0, b1 = max(0, b0), max(1, min(n_pst, b1))
 
-    for i, (s, e) in enumerate(windows):
+    for i, (s, e) in enumerate(disp_windows):
+        bs, be = base_windows[i]
         epoch = env[s:e]                                    # (n_pst, n_ch)
-        base = epoch[b0:b1]
+        base = env[bs:be]                                   # pre-stimulus baseline
         acc += (epoch - base.mean(axis=0)) / (base.std(axis=0) + 1e-9)
         if include_raw:
-            raw_epoch = raw_epochs[i]
-            acc_raw += raw_epoch - raw_epoch[b0:b1].mean(axis=0)  # baseline-corrected
-    used = len(windows)
+            acc_raw += raw_disp[i] - raw_base[i].mean(axis=0)  # baseline-corrected
+    used = len(disp_windows)
     # Degenerate channels (flat / all-zero signal) can yield NaN/Inf, which is not
     # JSON-serializable -- map them to 0 (neutral / baseline).
     avg = np.nan_to_num(acc / used, nan=0.0, posinf=0.0, neginf=0.0)
     avg_raw = (np.nan_to_num(acc_raw / used, nan=0.0, posinf=0.0, neginf=0.0) * 1e6
                if include_raw else None)  # uV
 
-    # The pre-onset samples exist only to build the baseline; the displayed time
-    # course runs over the POST-stimulus window [0, end] ms.
-    post_mask = pst_times_ms >= 0
-    avg, pst_times_ms = avg[post_mask], pst_times_ms[post_mask]
-    if include_raw:
-        avg_raw = avg_raw[post_mask]
-
-    # Decimate the post-stimulus time axis if very long.
+    # Decimate the (full-window) time axis if very long.
     n_out = len(pst_times_ms)
     if n_out > max_frames:
         sel = np.arange(0, n_out, int(np.ceil(n_out / max_frames)))
@@ -434,7 +459,8 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
         "times": [round(float(t), 2) for t in pst_times_ms],
         "activity": np.round(avg, 3).tolist(),
         "raw": np.round(avg_raw, 2).tolist() if include_raw else [],
-        "mode": "trial", "time_unit": "ms", "band": band, "n_trials": used,
+        "mode": "trial", "time_unit": "ms", "band": band, "align": align,
+        "n_trials": used, "n_no_response": n_no_response,
     }
 
 
@@ -534,14 +560,16 @@ def clear_result_cache():
 
 
 def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND,
-                     window_ms=None, include_raw: bool = True,
-                     max_frames: int = None) -> dict:
+                     window_ms=None, baseline_ms=None, align: str = "stimulus",
+                     include_raw: bool = True, max_frames: int = None) -> dict:
     """
     Cached dispatch for trial/scroll activity.
 
     include_raw=False returns just the activation map (``raw`` empty), skipping the
     slow raw-voltage read so the map can render fast; a follow-up include_raw=True
-    call fills in the trace-panel voltages. Results are memoized per distinct key.
+    call fills in the trace-panel voltages. Results are memoized per distinct key
+    (which for trial mode includes align + baseline so each alignment/baseline
+    setting is cached separately).
     """
     if mode not in ("trial", "scroll"):
         raise ValueError(f"unknown mode {mode!r}; options: ['trial', 'scroll']")
@@ -551,8 +579,9 @@ def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND
     ident = _file_identity(path)
     if mode == "trial":
         window = tuple(window_ms) if window_ms else DEFAULT_WINDOW_MS
+        baseline = tuple(baseline_ms) if baseline_ms else (window[0], 0.0)
         mf = max_frames if max_frames is not None else MAX_OUTPUT_FRAMES
-        base = (os.path.abspath(path), ident, "trial", band, window, mf)
+        base = (os.path.abspath(path), ident, "trial", band, window, baseline, align, mf)
     else:
         mf = max_frames if max_frames is not None else 2500
         base = (os.path.abspath(path), ident, "scroll", band, mf)
@@ -569,7 +598,8 @@ def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND
             return full
 
     if mode == "trial":
-        result = compute_band_activity(path, band, window, max_frames=mf, include_raw=include_raw)
+        result = compute_band_activity(path, band, window, baseline_ms=baseline,
+                                       align=align, max_frames=mf, include_raw=include_raw)
     else:
         result = compute_continuous_traces(path, band, max_frames=mf, include_raw=include_raw)
     _cache_put(base + (include_raw,), result)

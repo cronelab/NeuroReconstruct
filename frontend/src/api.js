@@ -123,8 +123,8 @@ export const uploadSeeg = (reconId, file) => {
 export const listSeeg = (reconId) =>
   api.get(`/reconstructions/${reconId}/seeg`);
 
-export const computeSeegActivity = (reconId, recId, { band, mode, window_ms, include_raw } = {}) =>
+export const computeSeegActivity = (reconId, recId, { band, mode, align, window_ms, baseline_ms, include_raw } = {}) =>
   api.post(`/reconstructions/${reconId}/seeg/${recId}/activity`,
-    { band, mode, window_ms, include_raw }, { timeout: 300000 });
+    { band, mode, align, window_ms, baseline_ms, include_raw }, { timeout: 300000 });
 
 export default api;

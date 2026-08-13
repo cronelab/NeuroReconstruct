@@ -164,6 +164,19 @@ export default function SeegTracePanel({
   const plotW = width - GUTTER;
   const cursorX = GUTTER + (nT > 1 ? (timeIndex / (nT - 1)) * plotW : 0);
 
+  // Event marker: a faint fixed line at t=0 (the alignment event — stimulus or
+  // response onset). Only meaningful for trial mode, whose window spans t<0..t>0.
+  const zeroIdx = useMemo(() => {
+    if (data.time_unit !== 'ms' || nT === 0) return -1;
+    let best = -1, bd = Infinity;
+    for (let i = 0; i < nT; i++) {
+      const d = Math.abs(data.times[i]);
+      if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+  }, [data.times, data.time_unit, nT]);
+  const zeroX = zeroIdx >= 0 ? GUTTER + (nT > 1 ? (zeroIdx / (nT - 1)) * plotW : 0) : -1;
+
   const timeFromX = useCallback((clientX) => {
     const rect = scrollRef.current.getBoundingClientRect();
     const x = clientX - rect.left;
@@ -286,6 +299,16 @@ export default function SeegTracePanel({
           style={{ position: 'absolute', inset: 0, overflowY: 'auto', overflowX: 'hidden', cursor: 'crosshair' }}>
           <canvas ref={canvasRef} style={{ display: 'block' }} />
         </div>
+        {/* t=0 event marker (overlay, not scrolled) — stimulus/response onset */}
+        {zeroX >= 0 && (
+          <>
+            <div style={{ position: 'absolute', top: 0, bottom: 0, left: zeroX, width: 1,
+              background: 'repeating-linear-gradient(#8a97a6 0 4px, transparent 4px 8px)',
+              opacity: 0.6, pointerEvents: 'none' }} />
+            <div style={{ position: 'absolute', top: 2, left: zeroX + 3, fontSize: 9, color: '#8a97a6',
+              fontFamily: 'IBM Plex Mono, monospace', pointerEvents: 'none' }}>0</div>
+          </>
+        )}
         {/* time cursor (overlay, not scrolled) */}
         <div style={{ position: 'absolute', top: 0, bottom: 0, left: cursorX, width: 1,
           background: '#00d4ff', pointerEvents: 'none', boxShadow: '0 0 6px #00d4ff88' }} />

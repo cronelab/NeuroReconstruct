@@ -183,6 +183,7 @@ kept, capped at 512 MB total. Override with `NEURO_CT_CACHE_MAX_FILES` and
 | `electrode_service.py` | Autofill: cubic spline fit parameterized by contact number. Interpolates between placed contacts, linear extrapolation beyond the manual range. Blob-snap applied to interpolated contacts only. |
 | `mni_registration.py` | Results-export pipeline. Registers the patient MRI to MNI152 via **ANTs** affine + SyN (`SyNRA`), warps the CT into MNI using the existing `ct_to_mri.npy`, and maps electrode contacts (RAS points, LPS-flipped for ANTs) into MNI space. Writes `MRI_mni.nii.gz`, `CT_mni.nii.gz`, transforms, `electrodes_mni.csv`/`.json`, and `export_manifest.json` to `<recon>/export/`. CPU-only, deterministic. |
 | `contact_labeling.py` | Labels each contact with the patient-specific DKT structure it sits in — or, for white-matter contacts, a plurality vote among structure voxels within a 2mm radius (reports structure, group, `distance_mm`, `vote_share`, `voxel_content`), leaving genuinely off-structure contacts unassigned. Native MRI space (no atlas warp); uses the cached `structures_cortical.nii.gz`. Writes `electrodes_structures.csv`. |
+| `seeg_service.py` | sEEG **functional mapping**. Reads a [NeurosEEGRead](https://github.com/cronelab/NeuroRead) HDF5 recording, computes a per-channel band-power envelope (Butterworth bandpass + Hilbert), and renders it on the brain by joining h5 channels to localized contacts **by shaft name + contact number** (the h5 carries no coordinates). Trial-averaged (event-related z-score) or continuous modes. See the [sEEG Functional Mapping](#seeg-functional-mapping) section. The Hilbert envelope is cached on disk per (file, band); computed results are memoized in-process. |
 
 ### Results export
 
@@ -227,6 +228,9 @@ normalization (`mni_registration.py`) and contact-to-structure labeling
 | `CTArtifactMesh.jsx` | Renders CT threshold mesh as white semi-transparent surface. Handles click-to-place contacts (only when `activeContactNumber != null`). |
 | `SliceViewer.jsx` | MRI slice viewer for sagittal / axial / coronal planes. Client-side cache + prefetch (10 ahead, 4 behind, 6 concurrent requests). Scroll wheel + scrollbar navigation. Depth-filtered electrode dot projection (±4mm). LocatorOverlay corner thumbnail. |
 | `ElectrodeEditor.jsx` | Right panel in edit mode. CT threshold slider, MRI toggle/opacity, shaft list (draggable divider between shaft list and contact grid), contact selector grid, autofill bar. Contains ColorPicker (50 named colors) and ContactSelector sub-components. |
+| `SeegViewer.jsx` | sEEG functional-mapping view. Control panel (recording upload/select, band, mapping mode, **trial alignment + display window + baseline**, color scale, brain/structure opacity, coverage), the 3D brain, and the trace panel. Holds a client-side LRU cache of computed results so switching band/alignment/baseline/window back to a viewed setting loads instantly. |
+| `SeegViewer3D.jsx` | Three.js canvas for the mapping view: native brain surface + contacts colored by the current-frame activation value (diverging z-score colormap), with structure overlays and hover tooltips. |
+| `SeegTracePanel.jsx` | Stacked per-channel trace canvas (band-power z or raw voltage) with a shared, scrubbable time cursor, a dashed **t=0 event marker**, and cross-highlighting to/from the brain. |
 
 ---
 
@@ -268,6 +272,58 @@ User clicks "Load" button
   → Returns structure meshes as vertices/faces in world RAS space
   → Viewer3D renders each structure as a semi-transparent mesh
 ```
+
+---
+
+## sEEG Functional Mapping
+
+Beyond anatomical localization, the viewer maps **task-evoked neural activity** onto the
+reconstructed brain. Upload a [NeurosEEGRead](https://github.com/cronelab/NeuroRead) HDF5
+recording (the `neuroseegread` package's output) and each channel's band power is rendered on
+the contact where it was localized.
+
+The h5 carries **no electrode coordinates** — only named channels (e.g. `LAH1`), their shaft
+group, channel types, trial timing, and raw voltage. Coordinates come from this app's own
+localization, and channels are joined to contacts **by shaft name + contact number** (case- and
+separator-insensitive, with digit-ending shaft disambiguation via the h5's `channel_groups`).
+
+### Controls
+
+| Control | Options | Meaning |
+|---|---|---|
+| **Frequency band** | delta, theta, alpha, beta, gamma, **high-γ (70–150 Hz)** | Band for the power envelope (Butterworth bandpass → Hilbert). High-γ is the standard functional-mapping band. |
+| **Mapping mode** | Trial-averaged · Continuous | Event-related average around trial events, or a scrollable band-power z-score over the whole session. |
+| **Align trials to** | **Stimulus onset** · **Response onset** | *(trial mode)* Epoch each trial around the stimulus (`/trials/start_time`) or the spoken-response onset (`/trials/response_onset`). Trials with no detected response are dropped from the response-aligned average (reported in the coverage panel). |
+| **Display window (± event)** | −pre … +post ms | Peri-event window shown around the alignment event. The **full** window is displayed (both pre- and post-event), with a `t=0` marker in the trace panel. Defaults per mode: stimulus −500 … +2000 ms, response −1000 … +1000 ms (switching alignment applies the new default unless you've customized the window). |
+| **Baseline (pre-stimulus)** | start … end ms (both ≤ 0) | Window used to z-score the band power. It is **always measured before stimulus onset**, even when the display is aligned to the response — the pre-response interval already contains stimulus-evoked activity at variable reaction-time lags, so it cannot serve as a baseline. |
+| **Color scale** | auto (99th pct of \|z\|) · manual ±z limit | Diverging colormap half-range. |
+
+Each trial's display epoch is z-scored to its own pre-stimulus baseline
+(`z = (envelope − baseline_mean) / baseline_std`), then averaged across trials. The trace panel
+additionally shows the trial-averaged, baseline-corrected raw voltage (µV).
+
+### Data Flow
+
+```
+Upload NeurosEEGRead .h5  (POST /seeg)
+  → stored under data/recon_<hash>/seeg/, associated with the reconstruction
+User picks band / mode / alignment / window / baseline
+  → POST /seeg/<id>/activity  { band, mode, align, window_ms, baseline_ms }
+  → Backend: band envelope (cached on disk per file+band)
+             → epoch around stimulus OR response onset
+             → z-score each epoch to its pre-stimulus baseline → average across trials
+             → join channels to contacts by shaft+number
+  → Frontend: colors contacts on the brain per time frame; stacked traces with a shared cursor
+  → Result cached client-side, so re-selecting a viewed setting is instant
+```
+
+> Two-phase fetch: the activation map (`include_raw=false`) returns first so the brain
+> re-colors immediately; the raw voltages for the trace panel follow in a second request.
+
+> **Generate a synthetic recording for testing** with
+> `backend/scripts/make_fake_seeg_h5.py` — supports `--active` (stimulus-locked bursts),
+> `--response-active` (response-locked bursts), and `--no-response-trials` to exercise the
+> alignment toggle and the dropped-trial path.
 
 ---
 

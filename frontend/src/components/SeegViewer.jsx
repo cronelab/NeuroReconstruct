@@ -43,12 +43,42 @@ function ColorBar({ domain }) {
   );
 }
 
+// Default display window (ms magnitudes before/after the event) per alignment.
+// Stimulus-locked activity trails the stimulus, so it uses a longer post window;
+// response-locked activity is roughly symmetric around the response.
+const DEFAULT_WINDOW = {
+  stimulus: { pre: 500, post: 2000 },
+  response: { pre: 1000, post: 1000 },
+};
+
+// Client-side cache of fully-computed trial-averaged results (activation map + raw
+// voltages), so flipping band / alignment / baseline / window back to a setting
+// already viewed loads instantly — no server round-trip and no two-phase fetch flash.
+// Keyed including recId (a fresh id per upload makes invalidation trivial); LRU-capped
+// to bound memory. Complements the backend result + envelope caches.
+const RESULT_CACHE = new Map();
+const RESULT_CACHE_MAX = 24;
+const cacheKey = (recId, p) => [
+  recId, p.mode, p.band, p.align,
+  p.window_ms?.[0], p.window_ms?.[1], p.baseline_ms?.[0], p.baseline_ms?.[1],
+].join('|');
+function cacheGet(key) {
+  const v = RESULT_CACHE.get(key);
+  if (v !== undefined) { RESULT_CACHE.delete(key); RESULT_CACHE.set(key, v); }  // LRU bump
+  return v;
+}
+function cachePut(key, val) {
+  RESULT_CACHE.set(key, val);
+  while (RESULT_CACHE.size > RESULT_CACHE_MAX) RESULT_CACHE.delete(RESULT_CACHE.keys().next().value);
+}
+
 export default function SeegViewer({ reconId, onBack }) {
   const {
     reconstruction, setReconstruction,
     seegRecordings, setSeegRecordings, seegRecordingId, setSeegRecordingId,
     seegActivity, setSeegActivity, seegBand, setSeegBand,
     seegPre, setSeegPre, seegPost, setSeegPost,
+    seegAlign, setSeegAlign, seegBaseStart, setSeegBaseStart, seegBaseEnd, setSeegBaseEnd,
     seegMode, setSeegMode,
     seegTraceSignal, setSeegTraceSignal, seegTraceScope, setSeegTraceScope,
     seegTraceShaft, setSeegTraceShaft, seegTracePanelW, setSeegTracePanelW,
@@ -82,6 +112,32 @@ export default function SeegViewer({ reconId, onBack }) {
     setSeegPre(pre); setSeegPost(post);
   };
 
+  // Baseline window drafts (both <= 0, relative to stimulus onset), applied on commit.
+  const [baseStartDraft, setBaseStartDraft] = useState(seegBaseStart);
+  const [baseEndDraft, setBaseEndDraft] = useState(seegBaseEnd);
+  useEffect(() => { setBaseStartDraft(seegBaseStart); setBaseEndDraft(seegBaseEnd); },
+    [seegBaseStart, seegBaseEnd]);
+  const baselineDirty = Number(baseStartDraft) !== seegBaseStart || Number(baseEndDraft) !== seegBaseEnd;
+  const applyBaseline = () => {
+    // Clamp to a valid pre-stimulus window: end <= 0 and start strictly < end.
+    const end = Math.min(0, Math.round(Number(baseEndDraft) || 0));
+    const start = Math.max(-4000, Math.min(end - 10, Math.round(Number(baseStartDraft) || 0)));
+    setSeegBaseStart(start); setSeegBaseEnd(end);
+  };
+
+  // Switch alignment, applying the target mode's default display window — but only
+  // when the current window is still the source mode's default, so a window the user
+  // deliberately set is preserved across toggles.
+  const handleAlign = (a) => {
+    if (a === seegAlign) return;
+    const src = DEFAULT_WINDOW[seegAlign];
+    if (seegPre === src.pre && seegPost === src.post) {
+      const dst = DEFAULT_WINDOW[a];
+      setSeegPre(dst.pre); setSeegPost(dst.post);
+    }
+    setSeegAlign(a);
+  };
+
   // ── Initial load: reconstruction, recordings, surfaces ────────────────────────
   useEffect(() => {
     if (!reconId) return;
@@ -108,10 +164,27 @@ export default function SeegViewer({ reconId, onBack }) {
   useEffect(() => {
     if (!reconId || !seegRecordingId) return undefined;
     const seq = ++reqSeqRef.current;
-    const params = { band: seegBand, mode: seegMode, window_ms: [-seegPre, seegPost] };
-    setComputing(true);
+    const params = {
+      band: seegBand, mode: seegMode, align: seegAlign,
+      window_ms: [-seegPre, seegPost],
+      baseline_ms: [seegBaseStart, seegBaseEnd],
+    };
     setError(null);
     setSeegPlaying(false);
+
+    // Cache hit: revisiting a computed setting loads instantly (full result, raw
+    // included) with no fetch. Only trial-mode results are cached (see RESULT_CACHE).
+    const key = seegMode === 'trial' ? cacheKey(seegRecordingId, params) : null;
+    if (key) {
+      const cached = cacheGet(key);
+      if (cached) {
+        setSeegActivity(cached);
+        setComputing(false);
+        return undefined;
+      }
+    }
+
+    setComputing(true);
     computeSeegActivity(reconId, seegRecordingId, { ...params, include_raw: false })
       .then((r) => {
         if (seq !== reqSeqRef.current) return;                 // superseded
@@ -123,7 +196,9 @@ export default function SeegViewer({ reconId, onBack }) {
             if (seq !== reqSeqRef.current) return;
             // setSeegActivity has no functional-updater form; read latest from the store.
             const cur = useAppStore.getState().seegActivity;
-            setSeegActivity(cur ? { ...cur, raw: r2.data.raw } : r2.data);
+            const full = cur ? { ...cur, raw: r2.data.raw } : r2.data;
+            setSeegActivity(full);
+            if (key) cachePut(key, full);   // cache the full result for instant re-switch
           })
           .catch(() => {});
       })
@@ -134,7 +209,8 @@ export default function SeegViewer({ reconId, onBack }) {
         setComputing(false);
       });
     return undefined;
-  }, [reconId, seegRecordingId, seegBand, seegMode, seegPre, seegPost]);
+  }, [reconId, seegRecordingId, seegBand, seegMode, seegAlign, seegPre, seegPost,
+      seegBaseStart, seegBaseEnd]);
 
   // ── Playback ──────────────────────────────────────────────────────────────────
   const nFrames = seegActivity?.times?.length || 0;
@@ -297,7 +373,17 @@ export default function SeegViewer({ reconId, onBack }) {
               Continuous recording · band-power z-score over the whole session.
             </div>
           ) : (<>
-          <div style={label}>Peri-stimulus window (ms)</div>
+          {/* Alignment event */}
+          <div style={label}>Align trials to</div>
+          <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
+            <div onClick={() => handleAlign('stimulus')}
+              style={{ ...seg(seegAlign === 'stimulus'), flex: 1, textAlign: 'center' }}>Stimulus onset</div>
+            <div onClick={() => handleAlign('response')}
+              style={{ ...seg(seegAlign === 'response'), flex: 1, textAlign: 'center' }}>Response onset</div>
+          </div>
+
+          {/* Display window (± the alignment event) */}
+          <div style={label}>Display window (± event, ms)</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
               <span style={{ fontSize: 10, color: '#7a8a99' }}>−</span>
@@ -321,7 +407,29 @@ export default function SeegViewer({ reconId, onBack }) {
                 cursor: windowDirty ? 'pointer' : 'default' }}>Apply</button>
           </div>
           <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 5 }}>
-            −pre = baseline (pre-onset) · +post = activation shown (post-onset)
+            Shown around {seegAlign === 'response' ? 'the response' : 'stimulus onset'} (t=0). Full window is displayed.
+          </div>
+
+          {/* Baseline window (always relative to stimulus onset) */}
+          <div style={{ ...label, marginTop: 12 }}>Baseline for z-score (pre-stimulus, ms)</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input type="number" max={0} step={50} value={baseStartDraft}
+              onChange={(e) => setBaseStartDraft(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && applyBaseline()}
+              style={{ width: 56, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
+                border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }} />
+            <span style={{ fontSize: 10, color: '#4a5568' }}>to</span>
+            <input type="number" max={0} step={50} value={baseEndDraft}
+              onChange={(e) => setBaseEndDraft(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && applyBaseline()}
+              style={{ width: 56, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
+                border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }} />
+            <button onClick={applyBaseline} disabled={!baselineDirty}
+              style={{ ...seg(baselineDirty), padding: '4px 10px', opacity: baselineDirty ? 1 : 0.4,
+                cursor: baselineDirty ? 'pointer' : 'default' }}>Apply</button>
+          </div>
+          <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 5 }}>
+            Always measured before <span style={{ color: '#c8d4e0' }}>stimulus</span> onset (both ≤ 0), even when aligned to the response.
           </div>
           </>)}
         </div>
@@ -398,8 +506,15 @@ export default function SeegViewer({ reconId, onBack }) {
               </div>
             )}
             <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 4 }}>
-              {seegActivity.mode === 'scroll' ? 'continuous recording' : `${seegActivity.n_trials} trials averaged`}
+              {seegActivity.mode === 'scroll'
+                ? 'continuous recording'
+                : `${seegActivity.n_trials} trials averaged · aligned to ${seegActivity.align === 'response' ? 'response' : 'stimulus'} onset`}
             </div>
+            {seegActivity.mode !== 'scroll' && seegActivity.align === 'response' && seegActivity.n_no_response > 0 && (
+              <div style={{ fontSize: 10, color: '#ffab40', marginTop: 2 }}>
+                {seegActivity.n_no_response} trial{seegActivity.n_no_response === 1 ? '' : 's'} dropped (no response detected)
+              </div>
+            )}
           </div>
         )}
 
