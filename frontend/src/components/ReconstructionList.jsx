@@ -200,7 +200,9 @@ export default function ReconstructionList({ onSelect, onTrash }) {
     }
   };
 
-  const completed = reconstructions.filter(r => r.is_complete);
+  const completed = reconstructions
+    .filter(r => r.is_complete)
+    .sort((a, b) => (a.patient_id || '').localeCompare(b.patient_id || '', undefined, { numeric: true, sensitivity: 'base' }));
   const inProgress = reconstructions.filter(r => !r.is_complete);
 
   const SectionHeader = ({ title, count, color }) => (
