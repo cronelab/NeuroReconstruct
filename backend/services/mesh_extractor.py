@@ -35,16 +35,30 @@ def _skull_strip_antspynet(data: np.ndarray, affine: np.ndarray, modality: str =
 
     print(f"[MESH] Using antspynet brain extraction (modality={modality})...")
 
-    # Build ANTs image from numpy array + affine
+    # Build ANTs image from numpy array + affine.
+    #
+    # The caller loads the volume as canonical RAS (nibabel), but ANTs/ITK read
+    # orientation metadata as LPS. Handing the RAS affine over unconverted makes
+    # ANTs flip L/R and A/P -- a 180 degree rotation about the S-I axis -- so
+    # brain_extraction sees the head backwards. The network is robust enough that
+    # the mask is usually still ~98% correct (dice 0.981 measured on PY26N003),
+    # which is why this stayed latent, but it leaks into extracerebral tissue at
+    # the anterior/inferior margins where the A/P flip does the most damage.
+    # Negating the first two axes gives ANTs correct LPS metadata while leaving
+    # the RAS voxel array untouched, so the returned mask still indexes `data`.
+    # (Same failure mode structure_extractor documents around its image_read call;
+    # image_read is not usable here because as_closest_canonical may have
+    # reordered the array relative to the on-disk voxel order.)
+    ras_to_lps = np.diag([-1.0, -1.0, 1.0])
     spacing = tuple(float(np.sqrt((affine[:3, i] ** 2).sum())) for i in range(3))
-    origin  = tuple(float(affine[i, 3]) for i in range(3))
-    direction = (affine[:3, :3] / np.array(spacing)).flatten().tolist()
+    origin  = tuple(float(v) for v in ras_to_lps @ affine[:3, 3])
+    direction = ras_to_lps @ (affine[:3, :3] / np.array(spacing))
 
     ants_img = ants.from_numpy(
         data.astype(np.float32),
         origin=origin,
         spacing=spacing,
-        direction=np.array(direction).reshape(3, 3),
+        direction=direction,
     )
 
     try:
