@@ -226,6 +226,36 @@ database moved to the share resolves against the new root without path rewriting
 
 ---
 
+### 5d. Rotate the admin password  ** DO NOT SKIP **
+
+The migrated `users` table carries the local `admin` account across, and its
+password is still the shipped default `changeme`.
+
+`ADMIN_PASSWORD` does **not** save you here: the seeding code in `main.py` only
+runs when the table is empty, so on a migrated database it never fires and the
+setting is silently ignored. The app would go live on a Hopkins-wide URL with a
+publicly known password.
+
+After the row migration, against the target database:
+
+```
+python scripts/manage_users.py set-password admin
+```
+
+Then create real per-person accounts rather than sharing one login --
+`reconstructions.created_by` is recorded, so separate accounts give a genuine
+attribution trail (all 12 existing rows currently point at the shared admin):
+
+```
+python scripts/manage_users.py create ncrone1 --role editor
+```
+
+Roles: `viewer` (read-only), `editor` (create/edit reconstructions, run exports),
+`admin` (also creates users, permanently deletes). `manage_users.py list` shows
+who exists and how many reconstructions each owns.
+
+---
+
 ## Phase 6 — Verify
 
 In order -- each step exercises more of the stack than the last:

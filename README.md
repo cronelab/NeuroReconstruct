@@ -39,10 +39,20 @@ npm install
 ```bash
 cd backend
 conda activate neuro-recon
-python create_admin.py
+python scripts/manage_users.py create admin --role admin
 ```
 
-This creates an `admin` user with password `changeme`. Change the password after first login.
+You are prompted for the password, so it never lands in shell history. The same
+tool manages accounts afterwards -- the app itself has no user-management UI:
+
+```bash
+python scripts/manage_users.py list
+python scripts/manage_users.py create ncrone1 --role editor
+python scripts/manage_users.py set-password admin
+```
+
+Roles are `viewer` (read-only), `editor` (create/edit reconstructions, run exports)
+and `admin` (also creates users and permanently deletes reconstructions).
 
 ### 4. Build the standalone exe (Windows only)
 

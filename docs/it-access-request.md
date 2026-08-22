@@ -93,3 +93,41 @@ Happy to run it myself if you'd rather make me Entra admin on the server.
 
 Thanks,
 Jeongjun
+
+---
+
+## Follow-up message — Entra ID sign-in
+
+Send as a reply on the same thread. Independent of the four items above; the
+deployment can proceed either way.
+
+**Subject:** re: NeuroReconstruct — Entra ID sign-in for the app?
+
+One more question, on authentication rather than infrastructure.
+
+The application currently manages its own accounts: a `users` table with bcrypt
+password hashes, a JWT issued at login, and three roles (viewer / editor / admin).
+That was fine as a single-user desktop tool, but for a hosted multi-user app it
+means we own password storage, resets and account lifecycle ourselves -- and today
+there is no password-reset flow at all.
+
+Since the app is Hopkins-internal and the App Service already has a managed
+identity, would you recommend putting **Entra ID authentication (App Service "Easy
+Auth")** in front of it instead? We would get JHED single sign-on, access managed
+by an Entra group rather than a table in our database, and no password handling on
+our side.
+
+Specifically:
+
+1. Is Easy Auth / Entra the standard for research apps in this environment?
+2. If so, can you enable it on `rit3845-neurorecon-APP` and point it at a group we
+   nominate?
+3. Would you expect us to keep our internal role model (mapping the Entra identity
+   onto viewer/editor/admin on first sign-in), or drive roles from Entra app roles?
+
+If Entra is not straightforward here, we will stay on the built-in login -- it
+works, and the app is network-restricted to Hopkins already. This is about reducing
+what we have to maintain, not a blocker.
+
+Thanks,
+Jeongjun
