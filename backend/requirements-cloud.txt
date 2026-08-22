@@ -1,0 +1,17 @@
+# Dependencies needed by the cloud container that are NOT in requirements.txt.
+#
+# The neuroimaging stack is imported lazily inside functions (services/*.py), so
+# it never appeared in requirements.txt -- locally it comes from the conda env
+# `neuro-recon`. Versions below are pinned to that env, which is what the
+# pipeline is actually validated against.
+antspyx==0.6.3
+antspynet==0.3.2
+tensorflow-cpu==2.21.0
+
+# Azure SQL (mssql+aioodbc), paired with ODBC Driver 18 installed in the image.
+aioodbc==0.5.0
+pyodbc==5.1.0
+
+# Schema migrations. Azure SQL removes the option of leaning on
+# Base.metadata.create_all() for schema changes.
+alembic==1.13.2

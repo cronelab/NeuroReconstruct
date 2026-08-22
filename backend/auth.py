@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
@@ -8,7 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db, User
 
-SECRET_KEY = "change-this-in-production-use-env-variable"
+# JWT signing key. The fallback keeps single-user desktop/dev runs working, but
+# any shared deployment MUST set SECRET_KEY -- tokens are forgeable without it.
+SECRET_KEY = os.environ.get("SECRET_KEY") or "change-this-in-production-use-env-variable"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 480  # 8 hours
 

@@ -332,7 +332,12 @@ app = FastAPI(title="Brain Reconstruction Viewer", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://127.0.0.1:8000", "http://localhost:8000"],
+    # Dev origins by default; CORS_ORIGINS (comma-separated) adds the deployed
+    # hostname. In the container the React build is served same-origin from
+    # frontend_build/, so this mainly covers local `npm start` against a remote API.
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000",
+                   "http://127.0.0.1:8000", "http://localhost:8000"]
+                  + [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -458,17 +463,20 @@ async def startup():
             await db.commit()
             print(f"[STARTUP] Migrated {migrated} reconstruction(s) to relative paths.")
 
-    # Create default admin user if none exists
+    # Create default admin user if none exists. The password comes from
+    # ADMIN_PASSWORD so a cloud deploy never ships the well-known default;
+    # local/desktop runs keep the old "changeme" behaviour.
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(User).where(User.username == "admin"))
         if not result.scalar_one_or_none():
             admin = User(
                 username="admin",
-                hashed_password=hash_password("changeme"),
+                hashed_password=hash_password(os.environ.get("ADMIN_PASSWORD") or "changeme"),
                 role="admin"
             )
             db.add(admin)
             await db.commit()
+            print("[STARTUP] Created default admin user.")
 
 
 # ─── Pydantic Schemas ─────────────────────────────────────────────────────────
