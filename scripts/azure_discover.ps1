@@ -46,7 +46,9 @@ Section "Managed identity (needed for passwordless SQL + registry pull)"
 az webapp identity show -g $RG -n $APP -o json
 
 Section "Storage mounts already attached to the App Service"
-az webapp config storage-account list -g $RG -n $APP -o json
+# accessKey is a live storage account key -- project it away so the output
+# of this script stays safe to paste into email or chat.
+az webapp config storage-account list -g $RG -n $APP --query "[].{name:name, share:value.shareName, account:value.accountName, mountPath:value.mountPath, protocol:value.protocol, state:value.state}" -o table
 
 Section "SQL databases on $SQL  (we need the database NAME)"
 az sql db list -g $RG --server $SQL --query "[].{name:name, sku:currentServiceObjectiveName, maxGB:maxSizeBytes, status:status}" -o table

@@ -131,3 +131,104 @@ what we have to maintain, not a blocker.
 
 Thanks,
 Jeongjun
+
+
+---
+
+## Reply #2 — 2026-08-28, after IT restored permissions
+
+Verified with `scripts/azure_discover.ps1`. Most of the earlier asks are now
+done; one permission gap blocks the image push.
+
+**Subject:** re: NeuroReconstruct — permissions confirmed, one gap left on the registry
+
+Thanks — that did it. I can now read the plan, SQL server, storage account and
+registry, and most of what I asked for is in place:
+
+- App Service is in **container mode** (`DOCKER|.../quickstart:1.0`) and set to
+  pull with its **managed identity**, which has **AcrPull**. 
+- SQL database **`neurorecondb01`** is there, `ActiveDirectoryMsi`. 
+- The **`neurodata` share is mounted** at `/mounts/neurodata`. 
+
+### No, I haven't been able to push the container yet
+
+`az acr build` gets as far as uploading the build context and then fails:
+
+```
+ERROR: Failed to get a SAS URL to upload context.
+(AuthorizationFailed) The client 'jkim605@jh.edu' does not have authorization to
+perform action 'Microsoft.ContainerRegistry/registries/listBuildSourceUploadUrl/action'
+over scope '.../registries/rit3845neuroreconacr01'
+```
+
+The registry has **AcrPush** assigned to the `JH-RIT-CRONE` group, but AcrPush
+only grants `registries/pull/read` and `registries/push/write`. A server-side
+build additionally needs the ACR Tasks actions, which AcrPush does not include:
+
+| Action |
+|---|
+| `Microsoft.ContainerRegistry/registries/listBuildSourceUploadUrl/action` |
+| `Microsoft.ContainerRegistry/registries/scheduleRun/action` |
+| `Microsoft.ContainerRegistry/registries/runs/read` |
+| `Microsoft.ContainerRegistry/registries/runs/listLogSasUrl/action` |
+
+**Simplest fix:** `Contributor` on `rit3845neuroreconacr01` for `jkim605` (and
+`ncrone1`). A custom role with just those four actions on top of AcrPush works
+equally well if you prefer least privilege.
+
+Could you also confirm I'm actually a **member of `JH-RIT-CRONE`**? That's where
+the AcrPush assignment lives, and I can't see my own membership of it.
+
+**Why a server-side build rather than pushing from my laptop:** the image is
+large (TensorFlow, ANTs, the ODBC driver, and ~1 GB of pretrained model weights
+baked in — the app can't download them at runtime because outbound traffic is
+VNet-routed). Building in ACR means uploading a **~2 MB source context** instead
+of pushing ~10 GB over the VPN. I can build locally instead if Contributor is a
+problem, but that needs Docker Desktop installed on my workstation.
+
+### On the file share
+
+From my side the configuration looks correct: the share is attached, the app is
+VNet-integrated, `WEBSITE_CONTENTOVERVNET` and `WEBSITES_VNET_ROUTE_ALL` are set,
+and `rit3845neuroreconst01.file.core.windows.net` resolves to a private address.
+
+The mount shows `state: NotValidated`. I believe that's expected rather than
+broken — the storage account denies public access, so App Service's validation
+probe can't reach it from outside the VNet even when the runtime mount over the
+VNet will succeed. The real test is a container that starts and can list the
+path, which I can run as soon as I can push an image.
+
+If it does turn out to be genuinely broken, the usual culprit is **outbound TCP
+445** from the App Service integration subnet
+(`AZ-EAST-...-10.208.209.128-28-AppSvcIntegration`) — SMB needs it, and some NSG
+baselines block it. That subnet is in `INFRASTRUCTURE-SVI-USE-ONLY-RG`, which I
+can't read.
+
+Thanks,
+Jeongjun
+
+---
+
+### Discovery snapshot, 2026-08-28
+
+| Item | State |
+|---|---|
+| App Service kind | `app,linux,container` |
+| Image | `DOCKER|rit3845neuroreconacr01.azurecr.io/quickstart:1.0` (IT placeholder) |
+| `acrUseManagedIdentityCreds` | `true` |
+| Managed identity `533de2af-…` | **AcrPull** on the registry |
+| SQL database | `neurorecondb01`, `GP_S_Gen5_2`, **Paused** (serverless auto-pause) |
+| SQL auth | `ActiveDirectoryMsi` |
+| Storage mount | `neurodata` → `/mounts/neurodata`, SMB, `NotValidated` |
+| ACR | Premium, `publicNetworkAccess: Disabled`, private endpoint approved, admin disabled |
+| ACR from workstation | reachable — resolves to `10.208.209.5`, data-plane reads work |
+| Blocker | `listBuildSourceUploadUrl` denied — needs Contributor on the ACR |
+
+App settings IT created, which the app now reads directly (see
+`backend/database.py::_azure_sql_url`): `AZURE_SQL_SERVER`, `AZURE_SQL_DATABASE`,
+`AZURE_SQL_AUTHENTICATION`, `DATABASE_AUTH_MODE`, `DATABASE_NAME`,
+`NEURO_DATA_DIR=/mounts/neurodata`, `WEBSITES_PORT=80`.
+
+> **Note:** `az webapp config storage-account list` returns the storage account
+> access key in plain text. `scripts/azure_discover.ps1` now projects it away so
+> its output is safe to paste into email.

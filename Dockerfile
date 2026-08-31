@@ -64,4 +64,4 @@ EXPOSE 8000
 
 # One worker on purpose: mesh extraction and MNI export run as in-process
 # background tasks, and the startup reaper in main.py assumes a single instance.
-CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --timeout-keep-alive 120"]
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-${WEBSITES_PORT:-8000}} --workers 1 --timeout-keep-alive 120"]

@@ -4,15 +4,53 @@ from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from datetime import datetime
 import os
 import re
+from urllib.parse import quote_plus
 
 _base = os.environ.get("NEURO_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(_base, "brain_viewer.db")
 
-# DATABASE_URL overrides the local SQLite file, e.g. for Azure SQL:
-#   mssql+aioodbc://user:pw@server.database.windows.net/db
-#       ?driver=ODBC+Driver+18+for+SQL+Server&Encrypt=yes
-# Unset (desktop / dev) keeps the SQLite file next to the data root.
-DATABASE_URL = os.environ.get("DATABASE_URL") or f"sqlite+aiosqlite:///{DB_PATH}"
+
+def _azure_sql_url():
+    """Build an Azure SQL URL out of the app settings App Service already has.
+
+    The App Service is provisioned with AZURE_SQL_SERVER / AZURE_SQL_DATABASE /
+    AZURE_SQL_AUTHENTICATION rather than one DATABASE_URL, so assemble the URL
+    from those instead of carrying a duplicate setting. Returns None when they
+    are absent, which is the normal desktop case.
+    """
+    server = os.environ.get("AZURE_SQL_SERVER")
+    database = os.environ.get("AZURE_SQL_DATABASE") or os.environ.get("DATABASE_NAME")
+    if not server or not database:
+        return None
+
+    auth = (os.environ.get("AZURE_SQL_AUTHENTICATION")
+            or os.environ.get("DATABASE_AUTH_MODE") or "ActiveDirectoryMsi")
+    params = [
+        "driver=ODBC+Driver+18+for+SQL+Server",
+        f"Authentication={auth}",
+        "Encrypt=yes",
+        "TrustServerCertificate=no",
+        # The serverless tier pauses after an idle period; the connection that
+        # wakes it has to sit through the resume, which busts the 15 s default.
+        "Connection+Timeout=60",
+    ]
+
+    # Managed identity puts no credentials in the URL. Password modes do.
+    credentials = ""
+    if not auth.lower().startswith("activedirectorymsi"):
+        user = os.environ.get("AZURE_SQL_USER") or ""
+        if user:
+            password = os.environ.get("AZURE_SQL_PASSWORD") or ""
+            credentials = f"{quote_plus(user)}:{quote_plus(password)}@"
+
+    return f"mssql+aioodbc://{credentials}{server}/{database}?" + "&".join(params)
+
+
+# Precedence: an explicit DATABASE_URL wins, then the Azure app settings, then
+# the local SQLite file next to the data root (desktop / dev).
+DATABASE_URL = (os.environ.get("DATABASE_URL")
+                or _azure_sql_url()
+                or f"sqlite+aiosqlite:///{DB_PATH}")
 IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
 # Managed databases drop idle connections and, on the serverless tier, pause
