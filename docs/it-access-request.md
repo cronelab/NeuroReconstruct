@@ -232,3 +232,143 @@ App settings IT created, which the app now reads directly (see
 > **Note:** `az webapp config storage-account list` returns the storage account
 > access key in plain text. `scripts/azure_discover.ps1` now projects it away so
 > its output is safe to paste into email.
+
+
+---
+
+## Reply #3 — 2026-08-31, registry firewall blocks the build agent
+
+The Contributor grant worked. A second, independent blocker surfaced behind it.
+
+**Subject:** re: NeuroReconstruct — permissions fixed, now the registry firewall blocks the build agent
+
+The permission change worked — the build now uploads its context, queues, and
+gets an agent. It then fails at the point the agent tries to log in to the
+registry:
+
+```
+Logging in to registry: rit3845neuroreconacr01.azurecr.io
+failed to login: Get "https://rit3845neuroreconacr01.azurecr.io/v2/":
+denied: client with IP '57.151.4.106' is not allowed access.
+Run ID: ca1 failed after 6s.
+```
+
+The registry has `publicNetworkAccess: Disabled`. ACR Tasks runs on Azure-hosted
+build agents that reach the registry over its **public** endpoint, so they're
+refused. The `AzureServices` network bypass doesn't cover Tasks agents, and an IP
+allow-rule won't help either — that `57.151.4.106` is assigned per run from a
+shared pool, so it's different every time.
+
+I can't fix this from my side: I don't have rights to change the registry's
+network configuration, and the VNet lives in `INFRASTRUCTURE-SVI-USE-ONLY-RG`.
+
+### Two ways forward — your call
+
+**Option 1 — temporarily allow public network access (fastest).**
+Set the registry's public network access to `Enabled` for about an hour while I
+run the build, then set it back to `Disabled`. I'll tell you the moment it
+finishes.
+
+To be clear about what this does and doesn't expose: the registry still requires
+Entra authentication throughout. Enabling public access makes the *endpoint*
+reachable from the internet; it does not make the registry anonymous or public.
+The image pull path is unaffected either way — App Service pulls over the private
+endpoint with its managed identity.
+
+**Option 2 — a dedicated ACR agent pool inside the VNet (durable).**
+This is the supported way to build against a network-restricted registry. The
+registry is already **Premium**, which supports it. It needs a delegated subnet
+in the VNet:
+
+```
+az acr agentpool create --registry rit3845neuroreconacr01     --name neuroreconpool --tier S2 --subnet-id <subnet-resource-id>
+```
+
+Then builds run with `--agent-pool neuroreconpool` and never touch the public
+endpoint. This is the better answer if we expect to rebuild the image regularly,
+at the cost of a subnet and the agent pool's own charge. (The CLI still flags
+`az acr agentpool` as preview.)
+
+I'd suggest **Option 1 to get the app deployed now**, and Option 2 later if
+rebuilds become routine — but I'm happy to go straight to Option 2 if you'd
+rather not open the endpoint at all.
+
+**A third option, which I think is worse:** I build the image locally and push it
+over the private endpoint, which works with the network exactly as it is. But
+Docker Desktop isn't installed on my workstation and I'm not a local admin, so
+that needs your help regardless — and it would mean pushing ~10 GB over the VPN
+instead of uploading a 500 KB source context. Only worth it if both options above
+are unacceptable.
+
+Thanks,
+Jeongjun
+
+---
+
+### Correction to Reply #2
+
+Reply #2 said the problem was "not a network problem, purely RBAC." That was
+right about the RBAC gap being real, but wrong to rule out the network: the
+firewall blocker was simply hidden behind the permission failure and only
+surfaced once the build got far enough to attempt a registry login. Both were
+genuine, and they are independent.
+
+The evidence that misled me — the registry resolving to `10.208.209.5` and
+data-plane reads succeeding from the workstation — was about the **workstation's**
+path to the registry, which goes through the private endpoint. It said nothing
+about the **build agent's** path, which does not.
+
+
+---
+
+## Reply #4 — 2026-09-01, agent pool is memory-starved
+
+The private agent pool works. Builds now run end to end and fail only at the last
+step, on memory. Measured, not guessed.
+
+**Subject:** re: NeuroReconstruct — private pool works; it was created S1 rather than S2
+
+The agent pool did the job — builds now reach the registry fine and get all the
+way through the frontend build, the system packages, the ODBC driver, and the
+full Python install (TensorFlow, ANTs, Open3D). Thank you.
+
+They now fail at the final step, which pre-caches the pretrained neuroimaging
+models into the image. That step runs the models once, and the S1 agent doesn't
+have the memory for it. I measured it in isolation on the pool:
+
+| Measurement | Value |
+|---|---|
+| Agent memory (`MemTotal`) | 2,993,724 kB (**2.86 GB**) |
+| Brain extraction, alone — peak RSS | 2,473,712 kB (2.36 GB) — **succeeds** |
+| DKT parcellation, alone — peak RSS | 2,785,492 kB (2.66 GB) — **exit 137, OOM-killed** |
+
+Exit 137 is the kernel's OOM killer. The second figure is a single model in a
+freshly started process, so I can't work around it by splitting the step up — one
+model on its own already exceeds what the agent has.
+
+The pool came through as **S1**; my earlier message had specified **S2** in the
+`az acr agentpool create` line, so I think the tier just got lost along the way
+rather than being a deliberate choice. (If it *was* deliberate — cost, subnet
+sizing, or anything else — just say so and I'll take the low-memory route below
+instead.)
+
+**Could you set `rit3845nracrpool01` to S2** (4 vCPU / 8 GB)? That clears the
+ceiling with plenty of headroom, and the extra cores should roughly halve build
+time as a side effect. Nothing else about the pool needs to change.
+
+I'd have adjusted it myself, but the pool is tagged `IaC: Terraform` and I didn't
+want to cause drift from your state file.
+
+**If you'd rather not resize:** I can rewrite that step to download the model
+weights without running the models, which needs very little memory. I'm proposing
+the resize first because running them is what guarantees the *right* files get
+cached — and the app can't fetch them at runtime, since outbound traffic is
+VNet-routed.
+
+For reference, the build history: `ca1` failed on the registry firewall (before
+the pool existed), `ca2`/`ca6` are the real builds that died at this warm-up step,
+and `ca4`/`ca5`/`ca7` are diagnostic runs that succeeded and produced the numbers
+above. `ca8` is the OOM measurement.
+
+Thanks,
+Jeongjun

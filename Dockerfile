@@ -22,6 +22,10 @@ FROM python:3.11-slim-bookworm AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    # pip's carriage-return progress bars never flush through the ACR
+    # log pipeline, which makes a failing build look like it froze.
+    PIP_PROGRESS_BAR=off \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     DEBIAN_FRONTEND=noninteractive \
     # ANTs/TF are CPU-only here; see services/structure_extractor.py for why GPU
     # was rejected (no speedup -- CPU preprocessing dominates).
