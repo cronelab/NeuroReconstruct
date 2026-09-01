@@ -25,25 +25,33 @@ def _azure_sql_url():
 
     auth = (os.environ.get("AZURE_SQL_AUTHENTICATION")
             or os.environ.get("DATABASE_AUTH_MODE") or "ActiveDirectoryMsi")
-    params = [
-        "driver=ODBC+Driver+18+for+SQL+Server",
+    parts = [
+        "Driver={ODBC Driver 18 for SQL Server}",
+        f"Server=tcp:{server},1433",
+        f"Database={database}",
         f"Authentication={auth}",
         "Encrypt=yes",
         "TrustServerCertificate=no",
         # The serverless tier pauses after an idle period; the connection that
         # wakes it has to sit through the resume, which busts the 15 s default.
-        "Connection+Timeout=60",
+        "Connection Timeout=60",
     ]
 
-    # Managed identity puts no credentials in the URL. Password modes do.
-    credentials = ""
+    # Managed identity carries no credentials, and must not: the driver rejects
+    # "Cannot use Authentication option with Integrated Security option".
+    # Password modes put them in the ODBC string itself.
     if not auth.lower().startswith("activedirectorymsi"):
         user = os.environ.get("AZURE_SQL_USER") or ""
         if user:
-            password = os.environ.get("AZURE_SQL_PASSWORD") or ""
-            credentials = f"{quote_plus(user)}:{quote_plus(password)}@"
+            parts.append(f"UID={user}")
+            parts.append(f"PWD={os.environ.get('AZURE_SQL_PASSWORD') or ''}")
 
-    return f"mssql+aioodbc://{credentials}{server}/{database}?" + "&".join(params)
+    # odbc_connect passes the string to the driver verbatim. Spelling the URL
+    # out the ordinary way instead makes SQLAlchemy's mssql dialect append
+    # Trusted_Connection=Yes whenever no username is present -- which is always,
+    # under managed identity -- and that is the Integrated Security the driver
+    # refuses to pair with Authentication=.
+    return "mssql+aioodbc:///?odbc_connect=" + quote_plus(";".join(parts))
 
 
 # Precedence: an explicit DATABASE_URL wins, then the Azure app settings, then
@@ -65,7 +73,11 @@ engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
-print(f"[DB] Using database: {re.sub(r'://[^@]*@', '://***@', DATABASE_URL)}")
+# Mask credentials in both spellings: user:pass@host, and the PWD= field of
+# an odbc_connect string (percent-encoded, so it survives quote_plus).
+_shown = re.sub(r'://[^@]*@', '://***@', DATABASE_URL)
+_shown = re.sub(r'(?i)(PWD(?:%3D|=))[^;%&]*', r'\1***', _shown)
+print(f"[DB] Using database: {_shown}")
 
 
 # NOTE ON STRING LENGTHS: every String column is explicitly sized. SQL Server

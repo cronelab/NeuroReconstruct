@@ -7,6 +7,10 @@
 antspyx==0.6.3
 antspynet==0.3.2
 tensorflow-cpu==2.21.0
+# services/registration.py imports this at module level; without it CT->MRI
+# coregistration fails at runtime with "No module named 'SimpleITK'", and the
+# failure is caught and logged, so the reconstruction still reports "ready".
+SimpleITK==2.5.5
 
 # Azure SQL (mssql+aioodbc), paired with ODBC Driver 18 installed in the image.
 aioodbc==0.5.0

@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from pydantic import BaseModel
 
-from database import init_db, get_db, AsyncSessionLocal, engine, User, Reconstruction, ElectrodeShaft, ElectrodeContact, SeegRecording
+from database import init_db, get_db, AsyncSessionLocal, engine, IS_SQLITE, User, Reconstruction, ElectrodeShaft, ElectrodeContact, SeegRecording
 from auth import (
     verify_password, hash_password, create_access_token,
     get_current_user, require_editor, require_admin
@@ -410,13 +410,17 @@ async def startup():
 
     # Lightweight column migration: create_all does not ALTER existing tables, so
     # add seeg_recordings.content_hash (used for upload dedup) if it's missing.
-    async with engine.begin() as conn:
-        cols = await conn.run_sync(
-            lambda c: [row[1] for row in c.exec_driver_sql("PRAGMA table_info(seeg_recordings)").fetchall()]
-        )
-        if cols and "content_hash" not in cols:
-            await conn.exec_driver_sql("ALTER TABLE seeg_recordings ADD COLUMN content_hash VARCHAR")
-            print("[STARTUP] Added seeg_recordings.content_hash column.")
+    # SQLite only -- both PRAGMA and "ADD COLUMN" are SQLite spellings, and the
+    # databases old enough to lack the column are all local files. A managed
+    # database either gets the column from create_all or from Alembic.
+    if IS_SQLITE:
+        async with engine.begin() as conn:
+            cols = await conn.run_sync(
+                lambda c: [row[1] for row in c.exec_driver_sql("PRAGMA table_info(seeg_recordings)").fetchall()]
+            )
+            if cols and "content_hash" not in cols:
+                await conn.exec_driver_sql("ALTER TABLE seeg_recordings ADD COLUMN content_hash VARCHAR")
+                print("[STARTUP] Added seeg_recordings.content_hash column.")
 
     # Backfill content_hash for legacy rows by hashing the stored file, so
     # content-based upload dedup works retroactively for recordings uploaded
