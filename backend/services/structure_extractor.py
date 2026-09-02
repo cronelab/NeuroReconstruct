@@ -326,11 +326,29 @@ _WORKER_AFFINE = None
 _WORKER_CENTER = None
 
 
+def _as_label_array(img) -> np.ndarray:
+    """A label volume in the narrowest integer type that holds it exactly.
+
+    DKT labels are small integers stored as float32. Reading them with
+    get_fdata() promotes to float64 and doubles an already large array for no
+    benefit; uint16 covers the FreeSurfer numbering (max 2035) at a quarter of
+    that. Anything unexpected falls back to the array as stored.
+    """
+    data = np.asanyarray(img.dataobj)
+    peak = float(data.max()) if data.size else 0.0
+    if peak < np.iinfo(np.uint16).max and np.array_equal(data, np.round(data)):
+        return data.astype(np.uint16)
+    return data
+
+
 def _mesh_worker_init(label_path: str, center: np.ndarray) -> None:
     """Runs once per worker process: cache the shared label volume in globals."""
     global _WORKER_LABEL_DATA, _WORKER_AFFINE, _WORKER_CENTER
     img = nib.load(label_path)
-    _WORKER_LABEL_DATA = img.get_fdata()
+    # get_fdata() would promote to float64: 1.01 GB per worker on a 126 Mvox
+    # volume, in every worker at once. These are integer labels topping out
+    # around 2035, so uint16 holds them exactly at a quarter of the size.
+    _WORKER_LABEL_DATA = _as_label_array(img)
     _WORKER_AFFINE = img.affine
     _WORKER_CENTER = center
 
@@ -348,10 +366,11 @@ def _mesh_worker_task(key: str, label_indices: list, max_faces: int):
 
 try:
     from services.worker_mem import (HEAVY_JOB_LOCK, describe_limit,
-                                 describe_outcome, run_worker)
+                                 describe_outcome, memory_available,
+                                 run_worker)
 except ImportError:
     from worker_mem import (HEAVY_JOB_LOCK, describe_limit,
-                            describe_outcome, run_worker)
+                        describe_outcome, memory_available, run_worker)
 
 _MANIFEST_NAME = "_manifest.json"
 
@@ -610,7 +629,7 @@ def extract_all_structures(mri_mesh_path: str, output_dir: str,
         print("[STRUCT] Loading cached cortical labels...")
 
     cort_img = nib.load(cortical_label_path)
-    cort_data = cort_img.get_fdata()
+    cort_data = _as_label_array(cort_img)
     cort_affine = cort_img.affine  # use label volume's own affine, not MRI affine
     unique_cort = np.unique(cort_data).astype(int)
     print(f"[STRUCT DEBUG] DKT NIfTI affine (cort_affine):\n{cort_affine}")
@@ -631,7 +650,21 @@ def extract_all_structures(mri_mesh_path: str, output_dir: str,
     pending = [(key, info) for key, info in ALL_STRUCTURES.items() if key not in results]
 
     if pending:
+        # Sizing this on CPU count alone is what killed the first cloud run: DKT
+        # had just peaked at 13.02 GB of 15.62 GB, and three pool workers each
+        # holding their own copy of the label volume did not fit. Every worker
+        # costs about one label volume plus the masks it builds, so let whatever
+        # room is actually left decide -- CPU count is only the ceiling.
         max_workers = min(len(pending), max(1, (os.cpu_count() or 2) - 1), 8)
+        headroom = memory_available()
+        if headroom is not None:
+            per_worker = int(cort_data.nbytes * 2.5) or 1
+            affordable = max(1, int(headroom * 0.7) // per_worker)
+            if affordable < max_workers:
+                print(f"[STRUCT] Limiting pool to {affordable} worker(s): "
+                      f"{headroom / 2**30:.2f} GB free, "
+                      f"~{per_worker / 2**30:.2f} GB per worker")
+                max_workers = affordable
         print(f"[STRUCT] Extracting {len(pending)} structures on {max_workers} worker(s)...")
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=max_workers,

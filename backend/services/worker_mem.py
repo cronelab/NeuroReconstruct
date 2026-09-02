@@ -66,6 +66,31 @@ def memory_limit():
     return None
 
 
+def memory_in_use():
+    """Bytes this container is currently using, or None."""
+    for path in ("/sys/fs/cgroup/memory.current",                 # cgroup v2
+                 "/sys/fs/cgroup/memory/memory.usage_in_bytes"):  # cgroup v1
+        try:
+            with open(path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def memory_available():
+    """Bytes still allocatable here, or None if it cannot be determined.
+
+    Used to size work that would otherwise be sized on CPU count alone. Cache
+    and other reclaimable pages count as in-use, so this errs low, which is the
+    right direction for a limit that is enforced by a kill.
+    """
+    limit, used = memory_limit(), memory_in_use()
+    if limit is None or used is None:
+        return None
+    return max(0, limit - used)
+
+
 def describe_limit() -> str:
     limit = memory_limit()
     return f"{limit / 2**30:.2f} GB" if limit else "unknown"
