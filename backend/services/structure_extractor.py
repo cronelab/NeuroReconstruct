@@ -469,12 +469,12 @@ def _structures_complete(output_dir: str) -> bool:
     if not all(os.path.exists(os.path.join(structures_dir, f"{k}.json"))
                for k in keys):
         return False
-    if adopted and not _plausibly_complete({k: None for k in keys}):
-        # Adopted, not written by a finished run: an earlier version of this
-        # function accepted whatever was on disk, including the leftovers of a
-        # run that lost its worker pool. Re-extract instead of trusting it.
-        print(f"[STRUCT] Ignoring adopted manifest with only {len(keys)} "
-              f"structures; re-extracting")
+    if not _plausibly_complete({k: None for k in keys}):
+        # Earlier versions wrote a manifest whatever the run produced, and
+        # adopted whatever was already on disk, so a manifest recording almost
+        # nothing is from one of those rather than from a run that finished.
+        print(f"[STRUCT] Ignoring manifest recording only {len(keys)} "
+              f"structure(s){' (adopted)' if adopted else ''}; re-extracting")
         return False
     return True
 
@@ -559,9 +559,13 @@ def extract_all_structures_isolated(mri_mesh_path: str, output_dir: str,
         raise RuntimeError(f"structure extraction {describe_outcome(returncode, peak)}")
 
     cached = _load_cached_structures(output_dir)
-    if not cached:
+    if not _plausibly_complete(cached):
+        # Exit code 0 only means the loop ran to the end. Individual structures
+        # fail on their own -- a dead pool fails all of them at once -- and
+        # returning that as a result would show a nearly empty brain.
         raise RuntimeError(
-            "structure extraction worker reported success but produced no structures")
+            f"structure extraction produced only {len(cached)}/"
+            f"{len(ALL_STRUCTURES)} structures")
     return cached
 
 
@@ -740,8 +744,17 @@ def extract_all_structures(mri_mesh_path: str, output_dir: str,
 
     # Record what this run produced so a later call can tell a finished run from
     # an interrupted one without recomputing. Written last, on purpose.
-    with open(os.path.join(structures_dir, _MANIFEST_NAME), "w") as f:
-        json.dump({"keys": sorted(results)}, f)
+    #
+    # Only for a run that actually finished. The loop above completes whether its
+    # futures returned meshes or raised, so a pool that died partway still
+    # arrives here -- and one that did, on Azure, recorded 3 of 84 as the final
+    # word and served that from cache to every later request.
+    if _plausibly_complete(results):
+        with open(os.path.join(structures_dir, _MANIFEST_NAME), "w") as f:
+            json.dump({"keys": sorted(results)}, f)
+    else:
+        print(f"[STRUCT] Only {len(results)}/{len(ALL_STRUCTURES)} structures "
+              f"extracted; not recording this run as complete")
 
     return results
 
