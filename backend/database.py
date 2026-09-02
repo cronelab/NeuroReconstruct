@@ -1,9 +1,12 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean
+from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from datetime import datetime
+import asyncio
 import os
 import re
+import time
 from urllib.parse import quote_plus
 
 _base = os.environ.get("NEURO_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
@@ -174,10 +177,43 @@ class SeegRecording(Base):
     uploaded_at = Column(DateTime, default=datetime.utcnow)
 
 
-async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    print("[DB] Tables created/verified")
+async def init_db(deadline_seconds: float = 150.0, delay: float = 8.0):
+    """Create any missing tables, waiting out a database that is still waking.
+
+    The serverless tier pauses after an idle period -- 60 minutes on this server
+    -- and the connection that wakes it has to sit through the resume. That can
+    outlast even the 60 s login timeout, and an exception here aborts startup
+    entirely: App Service restarts the container, and the site serves errors
+    until some later attempt happens to find the database already awake. This
+    has happened in production. Retrying in-process makes it a slow first start
+    instead of a failed one.
+
+    Bounded by a deadline rather than an attempt count because App Service gives
+    a container 230 s to come up (WEBSITES_CONTAINER_START_TIME_LIMIT) and kills
+    it after that, so an unbounded retry would only move the failure. SQLite
+    never fails this way, so local runs take the first attempt and return.
+    """
+    started = time.monotonic()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            if attempt > 1:
+                print(f"[DB] Connected on attempt {attempt} after "
+                      f"{time.monotonic() - started:.0f}s")
+            print("[DB] Tables created/verified")
+            return
+        except (OperationalError, InterfaceError) as e:
+            elapsed = time.monotonic() - started
+            if elapsed + delay >= deadline_seconds:
+                print(f"[DB] Giving up after {elapsed:.0f}s and {attempt} "
+                      f"attempt(s); startup will fail")
+                raise
+            print(f"[DB] Attempt {attempt} failed after {elapsed:.0f}s "
+                  f"({type(e).__name__}); retrying in {delay:.0f}s")
+            await asyncio.sleep(delay)
 
 
 async def get_db():
