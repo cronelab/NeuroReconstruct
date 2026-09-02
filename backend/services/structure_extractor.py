@@ -241,18 +241,36 @@ def _labels_to_mesh(label_data: np.ndarray, affine: np.ndarray,
     Given a label volume, extract a surface mesh for the given label indices,
     centered at `center` (brain mesh origin in world space).
     """
-    # Round to int to avoid float32 precision issues (e.g. 17.0000001 != 17)
-    label_int = np.round(label_data).astype(np.int32)
-    mask = np.zeros(label_data.shape, dtype=np.float32)
-    for idx in label_indices:
-        mask[label_int == idx] = 1.0
+    if np.issubdtype(label_data.dtype, np.floating):
+        # float32 stores 17 as 17.0000001, so compare on the rounded values.
+        hit = np.isin(np.rint(label_data).astype(np.int32), label_indices)
+    else:
+        hit = np.isin(label_data, label_indices)
 
-    if mask.sum() < 5:
+    if hit.sum() < 5:
         return None
 
     # Debug: voxel bounding box of this structure
-    nz = np.argwhere(mask > 0)
+    nz = np.argwhere(hit)
     vox_min, vox_max = nz.min(axis=0), nz.max(axis=0)
+    del nz
+
+    # Work on the structure's own bounding box, not the whole head. Every array
+    # below used to be full volume -- on a 126 Mvox scan that is 505 MB for the
+    # mask, 1.01 GB for the distance transform, and as much again for the
+    # smoothed copy, per call. Three pool workers doing that at once were killed
+    # by the OOM killer after one structure each.
+    #
+    # The crop is not an approximation. PAD clears the Gaussian's support
+    # (4 sigma, and SMOOTH_SIGMA_MAX is 0.8 voxels), leaves marching cubes a zero
+    # border to close the surface on, and keeps every interior voxel's nearest
+    # background inside the window, so the distance transform reads the same
+    # half-thickness it would have read on the full volume.
+    pad = int(np.ceil(4 * SMOOTH_SIGMA_MAX)) + 4
+    lo = np.maximum(vox_min - pad, 0)
+    hi = np.minimum(vox_max + pad + 1, hit.shape)
+    mask = hit[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]].astype(np.float32)
+    del hit
     vox_center = (vox_min + vox_max) / 2.0
     vox_center_hom = np.append(vox_center, 1.0)
     world_center = (affine @ vox_center_hom)[:3]
@@ -280,7 +298,8 @@ def _labels_to_mesh(label_data: np.ndarray, affine: np.ndarray,
     if len(faces) < 20:
         return None
 
-    # Voxel → world RAS
+    # Voxel → world RAS, undoing the crop offset first
+    verts_vox = verts_vox + lo
     verts_hom = np.hstack([verts_vox, np.ones((len(verts_vox), 1))])
     verts_world = (affine @ verts_hom.T).T[:, :3]
 
