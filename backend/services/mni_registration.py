@@ -314,8 +314,9 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
         if not os.path.exists(label_path):
             print("[MNI] Structure labels not cached - running segmentation "
                   "(first time only, this takes a few minutes)...")
-            from services.structure_extractor import extract_all_structures
-            extract_all_structures(os.path.join(recon_dir, "mesh.json"), recon_dir, mri_path)
+            from services.structure_extractor import extract_all_structures_isolated
+            extract_all_structures_isolated(
+                os.path.join(recon_dir, "mesh.json"), recon_dir, mri_path)
 
         if os.path.exists(label_path) and len(world):
             labels = label_contacts(label_path, world)

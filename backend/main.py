@@ -1862,21 +1862,32 @@ async def get_structures(
     if not mesh_abs or not os.path.exists(mesh_abs):
         raise HTTPException(status_code=404, detail="Brain mesh not ready yet")
 
-    from services.structure_extractor import extract_all_structures
+    from services.structure_extractor import (
+        extract_all_structures_isolated, _load_cached_structures)
     recon_dir = os.path.dirname(mesh_abs)
 
     loop = asyncio.get_event_loop()
+    # Runs in a child process: parcellation is large enough to be OOM-killed, and
+    # in-process that takes the whole server down with it.
+    extraction_unavailable = False
     try:
         structures = await loop.run_in_executor(
-            None, extract_all_structures, mesh_abs, recon_dir, _abs(recon.mri_path)
+            None, extract_all_structures_isolated, mesh_abs, recon_dir, _abs(recon.mri_path)
         )
-    except (ImportError, Exception) as e:
+    except ImportError as e:
         print(f"[STRUCT] Structure extraction unavailable: {e}")
         structures = {}
+        extraction_unavailable = True
+    except Exception as e:
+        # A worker that died (OOM) or failed outright. Do NOT fall through to
+        # borrowing: showing another patient's anatomy on this reconstruction
+        # would be worse than showing none.
+        print(f"[STRUCT] Structure extraction failed for recon {recon.id}: {e}")
+        structures = {}
 
-    # If no structures found, borrow from any other reconstruction that has a
-    # pre-computed structures cache (used when antspynet/tensorflow is unavailable).
-    if not structures:
+    # If antspynet/tensorflow is unavailable, borrow a pre-computed cache from
+    # another reconstruction. Cache only -- never compute another patient's scan.
+    if not structures and extraction_unavailable:
         other_result = await db.execute(
             select(Reconstruction)
             .where(Reconstruction.id != recon.id)
@@ -1889,7 +1900,7 @@ async def get_structures(
             other_dir = os.path.dirname(other_mesh_abs)
             try:
                 borrowed = await loop.run_in_executor(
-                    None, extract_all_structures, other_mesh_abs, other_dir, _abs(other.mri_path)
+                    None, _load_cached_structures, other_dir
                 )
                 if borrowed:
                     print(f"[STRUCT] Borrowed {len(borrowed)} structures from recon {other.id}")

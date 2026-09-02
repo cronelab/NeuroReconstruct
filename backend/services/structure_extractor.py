@@ -39,6 +39,9 @@ from scipy.ndimage import distance_transform_edt
 import trimesh
 import json
 import os
+import subprocess
+import sys
+import threading
 import concurrent.futures
 
 # ── Structure catalog ─────────────────────────────────────────────────────────
@@ -345,6 +348,131 @@ def _mesh_worker_task(key: str, label_indices: list, max_faces: int):
 
 # ── Main segmentation entry point ─────────────────────────────────────────────
 
+_MANIFEST_NAME = "_manifest.json"
+
+# One extraction worker at a time. A parcellation peaks near 8.9 GB, and the
+# App Service plan this runs on has 16 GB, so two at once do not fit -- two
+# clinicians opening the structures view on different reconstructions would be
+# enough to OOM. Queueing costs the second request some latency; not queueing
+# costs it the process.
+_WORKER_LOCK = threading.Lock()
+
+
+def _structures_complete(output_dir: str) -> bool:
+    """True when a previous run finished and everything it produced is still there.
+
+    Counting files cannot answer this: the smallest DKT regions fall below the
+    voxel/face guards in _labels_to_mesh and legitimately yield no mesh, so a
+    finished run leaves fewer files than ALL_STRUCTURES has entries (78 of 84 on
+    recon_fa94010a). A manifest written at the end of a successful run records
+    what that run actually produced, which is the only way to tell "finished" from
+    "interrupted".
+    """
+    manifest = os.path.join(output_dir, "structures", _MANIFEST_NAME)
+    if not os.path.exists(manifest):
+        return False
+    try:
+        with open(manifest) as f:
+            keys = json.load(f).get("keys", [])
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not keys:
+        return False
+    structures_dir = os.path.join(output_dir, "structures")
+    return all(os.path.exists(os.path.join(structures_dir, f"{k}.json"))
+               for k in keys)
+
+
+def _load_cached_structures(output_dir: str) -> dict:
+    """Structure meshes already written to disk for this reconstruction."""
+    structures_dir = os.path.join(output_dir, "structures")
+    cached = {}
+    for key in ALL_STRUCTURES:
+        out_path = os.path.join(structures_dir, f"{key}.json")
+        if os.path.exists(out_path):
+            try:
+                with open(out_path) as f:
+                    cached[key] = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                # A file half-written by a process that was killed mid-dump.
+                # Treat it as absent so it gets recomputed.
+                print(f"[STRUCT] Ignoring unreadable cache entry: {out_path}")
+    return cached
+
+
+def extract_all_structures_isolated(mri_mesh_path: str, output_dir: str,
+                                    mri_nifti_path: str = None) -> dict:
+    """extract_all_structures, run in a child process.
+
+    DKT parcellation is the largest allocation in the whole application -- 8.9 GB
+    on a 126 Mvox T1 even after the streaming-argmax rewrite, and 57 GB with stock
+    antspynet. Run in-process it takes the web server down with it: on Azure the
+    OOM killer terminated the container mid-parcellation, App Service stopped the
+    entire site, and every other user was offline until it cold-started. The
+    reconstruction meanwhile still read "ready", because the code that would have
+    recorded a failure was inside the process that died.
+
+    In a child process the same kill costs one request. The parent sees a non-zero
+    return code, raises, and the caller can report the failure honestly.
+
+    Results travel through the on-disk cache the function already maintains, so
+    nothing large is pickled back across the process boundary.
+    """
+    cached = _load_cached_structures(output_dir)
+    if _structures_complete(output_dir):
+        print(f"[STRUCT] All {len(cached)} structures loaded from cache")
+        return cached
+
+    if getattr(sys, "frozen", False):
+        # Under PyInstaller sys.executable is the bundled app, so spawning it
+        # would start a second server rather than a worker. The frozen build
+        # ships without antspynet anyway, so there is no large allocation to
+        # isolate here.
+        return extract_all_structures(mri_mesh_path, output_dir, mri_nifti_path)
+
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cmd = [sys.executable, os.path.abspath(__file__), mri_mesh_path, output_dir]
+    if mri_nifti_path:
+        cmd.append(mri_nifti_path)
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [backend_dir, env["PYTHONPATH"]] if env.get("PYTHONPATH") else [backend_dir])
+
+    if not _WORKER_LOCK.acquire(blocking=False):
+        print("[STRUCT] Another extraction is running; waiting for it to finish")
+        _WORKER_LOCK.acquire()
+    try:
+        # A worker for this same reconstruction may have finished while we
+        # queued, in which case there is nothing left to do.
+        if _structures_complete(output_dir):
+            print("[STRUCT] Completed by another worker while queued")
+            return _load_cached_structures(output_dir)
+
+        print(f"[STRUCT] Spawning extraction worker (pid parent {os.getpid()})")
+        # stdout/stderr are inherited so the worker's [STRUCT] lines land in the
+        # same log as everything else.
+        proc = subprocess.run(cmd, cwd=backend_dir, env=env)
+    finally:
+        _WORKER_LOCK.release()
+
+    if proc.returncode != 0:
+        # 137 from a shell, -9 from Python's own view of the signal: both mean
+        # the kernel killed it, which for this workload means out of memory.
+        oom = proc.returncode in (137, -9)
+        detail = (" -- killed by the OOM killer; the machine or container does "
+                  "not have enough memory for this scan"
+                  if oom else "")
+        raise RuntimeError(
+            f"structure extraction worker exited with {proc.returncode}{detail}")
+
+    cached = _load_cached_structures(output_dir)
+    if not cached:
+        raise RuntimeError(
+            "structure extraction worker reported success but produced no structures")
+    return cached
+
+
 def extract_all_structures(mri_mesh_path: str, output_dir: str,
                            mri_nifti_path: str = None) -> dict:
     """
@@ -368,13 +496,8 @@ def extract_all_structures(mri_mesh_path: str, output_dir: str,
     os.makedirs(structures_dir, exist_ok=True)
 
     # Load whatever structure files are already cached
-    cached = {}
-    for key, info in ALL_STRUCTURES.items():
-        out_path = os.path.join(structures_dir, f"{key}.json")
-        if os.path.exists(out_path):
-            with open(out_path) as f:
-                cached[key] = json.load(f)
-    if len(cached) == len(ALL_STRUCTURES):
+    cached = _load_cached_structures(output_dir)
+    if _structures_complete(output_dir):
         print(f"[STRUCT] All {len(cached)} structures loaded from cache")
         return cached
     if cached:
@@ -430,9 +553,25 @@ def extract_all_structures(mri_mesh_path: str, output_dir: str,
     cortical_label_path = os.path.join(output_dir, "structures_cortical.nii.gz")
     if not os.path.exists(cortical_label_path):
         print("[STRUCT] Running cortical parcellation (DKT)...")
-        dkt = antspynet.desikan_killiany_tourville_labeling(
-            ants_img, do_preprocessing=True, verbose=False
-        )
+        # Stock antspynet peaks at 56.96 GB resident / 158.66 GB commit on a
+        # 126 Mvox clinical T1 -- it collects all 63 native-resolution
+        # probability volumes before reducing them. dkt_lowmem streams the same
+        # argmax and peaks at 8.87 GB, verified bit-identical to upstream.
+        # Fall back to antspynet if it is ever unavailable, so a packaging
+        # mistake degrades to slow rather than broken.
+        try:
+            from services.dkt_lowmem import desikan_killiany_tourville_labeling_lowmem
+        except ImportError:
+            from dkt_lowmem import desikan_killiany_tourville_labeling_lowmem
+        try:
+            dkt = desikan_killiany_tourville_labeling_lowmem(
+                ants_img, do_preprocessing=True, verbose=False
+            )
+        except Exception as e:
+            print(f"[STRUCT] Low-memory DKT failed ({e}); falling back to antspynet")
+            dkt = antspynet.desikan_killiany_tourville_labeling(
+                ants_img, do_preprocessing=True, verbose=False
+            )
         # ants.to_filename handles the ITK LPS → NIfTI RAS conversion correctly
         dkt.to_filename(cortical_label_path)
         print(f"[STRUCT] Cortical labels saved to {cortical_label_path}")
@@ -492,4 +631,22 @@ def extract_all_structures(mri_mesh_path: str, output_dir: str,
                     print(f"[STRUCT] {info['label']}: no voxels found for labels {info['labels']}")
 
     print(f"[STRUCT] Done. {len(results)}/{len(ALL_STRUCTURES)} structures extracted.")
+
+    # Record what this run produced so a later call can tell a finished run from
+    # an interrupted one without recomputing. Written last, on purpose.
+    with open(os.path.join(structures_dir, _MANIFEST_NAME), "w") as f:
+        json.dump({"keys": sorted(results)}, f)
+
     return results
+
+
+if __name__ == "__main__":
+    # Worker entry point for extract_all_structures_isolated(). Kept deliberately
+    # thin: the parent reads results from the on-disk cache, so this only has to
+    # populate it and exit non-zero if it cannot.
+    if not 3 <= len(sys.argv) <= 4:
+        print("usage: structure_extractor.py <mesh.json> <output_dir> [mri.nii.gz]",
+              file=sys.stderr)
+        raise SystemExit(2)
+    extract_all_structures(sys.argv[1], sys.argv[2],
+                           sys.argv[3] if len(sys.argv) == 4 else None)

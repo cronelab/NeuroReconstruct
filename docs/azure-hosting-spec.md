@@ -6,7 +6,7 @@
 
 | Resource | Requested SKU / configuration | Purpose |
 |---|---|---|
-| **App Service** | Premium v3 **P2V4** (2 vCPU / 8 GB), Linux. **Always On = enabled.** Autoscale not required — please keep at **1 instance**. | Hosts FastAPI backend + serves React build |
+| **App Service** | Premium v4 **P2v4** (4 vCPU / 16 GB), Linux. **Always On = enabled.** Autoscale not required — please keep at **1 instance**. | Hosts FastAPI backend + serves React build |
 | **Azure SQL Database** | **Single database**, General Purpose **Serverless, Gen5, 1–2 vCore** (min 0.5 vCore), auto-pause enabled. *DTU-model alternative: Standard S0 (10 DTU).* Max size **10 GB**. | Application metadata only (see below) |
 | **Storage account** | Standard LRS, Hot tier. **Azure Files share** mounted to the App Service. Start ~**256 GB**, expandable. | All imaging files: source MRI/CT, processed volumes, and MNI export artifacts |
 
