@@ -401,6 +401,18 @@ _MANIFEST_NAME = "_manifest.json"
 _WORKER_LOCK = HEAVY_JOB_LOCK
 
 
+# A finished run yields fewer than ALL_STRUCTURES: the smallest DKT regions fall
+# below the voxel and face guards and legitimately produce no mesh (78 of 84 on
+# every scan processed so far). A run that died partway leaves far less than
+# that -- one that lost its worker pool left 3. Two thirds sits well below any
+# complete run and well above any broken one.
+_PLAUSIBLE_FRACTION = 2 / 3
+
+
+def _plausibly_complete(cached: dict) -> bool:
+    return len(cached) >= _PLAUSIBLE_FRACTION * len(ALL_STRUCTURES)
+
+
 def _adopt_legacy_cache(output_dir: str) -> bool:
     """Accept structures cached before manifests existed, and write one.
 
@@ -418,7 +430,7 @@ def _adopt_legacy_cache(output_dir: str) -> bool:
     if not os.path.exists(os.path.join(output_dir, "structures_cortical.nii.gz")):
         return False
     cached = _load_cached_structures(output_dir)
-    if not cached:
+    if not _plausibly_complete(cached):
         return False
     try:
         with open(os.path.join(output_dir, "structures", _MANIFEST_NAME), "w") as f:
@@ -446,14 +458,25 @@ def _structures_complete(output_dir: str) -> bool:
         return _adopt_legacy_cache(output_dir)
     try:
         with open(manifest) as f:
-            keys = json.load(f).get("keys", [])
+            recorded = json.load(f)
+        keys = recorded.get("keys", [])
+        adopted = bool(recorded.get("adopted"))
     except (json.JSONDecodeError, OSError):
         return False
     if not keys:
         return False
     structures_dir = os.path.join(output_dir, "structures")
-    return all(os.path.exists(os.path.join(structures_dir, f"{k}.json"))
-               for k in keys)
+    if not all(os.path.exists(os.path.join(structures_dir, f"{k}.json"))
+               for k in keys):
+        return False
+    if adopted and not _plausibly_complete({k: None for k in keys}):
+        # Adopted, not written by a finished run: an earlier version of this
+        # function accepted whatever was on disk, including the leftovers of a
+        # run that lost its worker pool. Re-extract instead of trusting it.
+        print(f"[STRUCT] Ignoring adopted manifest with only {len(keys)} "
+              f"structures; re-extracting")
+        return False
+    return True
 
 
 def _load_cached_structures(output_dir: str) -> dict:
