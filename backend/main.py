@@ -4,6 +4,7 @@ Handles: auth, reconstruction CRUD, NIfTI mesh extraction, electrode management
 """
 
 import os
+from collections import OrderedDict
 import sys
 import uuid
 import json
@@ -35,15 +36,111 @@ from PIL import Image
 from fastapi.responses import Response as FastAPIResponse
 
 # ── In-memory NIfTI slice cache ─────────────────────────────────────────────
-_mri_volume_cache: dict = {}  # mri_path -> {"data", "affine", "slices": {axis: [png_bytes, ...]}}
+#
+# These caches used to be plain dicts that only ever grew. Keyed by file path
+# they are shared across users, so ten people looking at one scan cost what one
+# person costs -- but ten people opening ten different scans accumulated a copy
+# of each, and nothing was ever released. get_fdata() also returns float64,
+# doubling data that is float32 on disk. Together that put roughly 13 GB of
+# volumes inside a 15.62 GB container, and the failure mode is not slowness:
+# one OOM takes out the single uvicorn worker and drops everybody at once.
+#
+# So: keep them as float32, and bound the total with an LRU. The budget is
+# deliberately modest because a parcellation child peaks near 13 GB and the
+# parent has to fit alongside it -- see BEFORE_HEAVY_JOB, which empties these
+# first.
+_VOLUME_CACHE_BYTES = int(float(os.environ.get("NEURO_VOLUME_CACHE_GB", "3.0")) * 2**30)
+
+
+class _VolumeCache:
+    """Least-recently-used cache of decoded NIfTI volumes, bounded by bytes."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self._items = OrderedDict()          # key -> entry dict (holds "data")
+
+    @staticmethod
+    def _size(entry) -> int:
+        total = entry["data"].nbytes
+        for k in ("png_cache", "fusion_png_cache"):
+            for v in entry.get(k, {}).values():
+                # cached render tuples carry the PNG bytes in position 0
+                blob = v[0] if isinstance(v, tuple) else v
+                total += len(blob) if isinstance(blob, (bytes, bytearray)) else 0
+        return total
+
+    def total_bytes(self) -> int:
+        return sum(self._size(e) for e in self._items.values())
+
+    def get(self, key):
+        entry = self._items.get(key)
+        if entry is not None:
+            self._items.move_to_end(key)     # most recently used
+        return entry
+
+    def put(self, key, entry):
+        self._items[key] = entry
+        self._items.move_to_end(key)
+        _evict_across_caches()
+        return entry
+
+    def clear(self):
+        n, mb = len(self._items), self.total_bytes() / 2**20
+        self._items.clear()
+        return n, mb
+
+    def evict_oldest(self):
+        if not self._items:
+            return None
+        key, entry = self._items.popitem(last=False)
+        return key, self._size(entry)
+
+
+_mri_volume_cache = _VolumeCache("mri")
+
+def _evict_across_caches():
+    """Trim to the byte budget, always dropping the oldest entry in whichever
+    cache currently holds the most."""
+    caches = [_mri_volume_cache, _ct_volume_cache, _struct_overlay_cache]
+    guard = 0
+    while sum(c.total_bytes() for c in caches) > _VOLUME_CACHE_BYTES and guard < 64:
+        guard += 1
+        victim = max(caches, key=lambda c: c.total_bytes())
+        dropped = victim.evict_oldest()
+        if not dropped:
+            break
+        key, size = dropped
+        # basename alone is useless here: every volume is called mri.nii.gz.
+        label = os.path.join(*str(key).replace("\\", "/").split("/")[-2:])
+        print(f"[CACHE] evicted {victim.name} {label} ({size / 2**20:.0f} MB)")
+
+
+def _drop_volume_caches():
+    """Release every cached volume. Registered as a BEFORE_HEAVY_JOB hook."""
+    freed = 0.0
+    for c in (_mri_volume_cache, _ct_volume_cache, _struct_overlay_cache):
+        _, mb = c.clear()
+        freed += mb
+    if freed:
+        print(f"[CACHE] released {freed:.0f} MB before spawning a heavy worker")
+
+
+# Parcellation runs in a child that peaks near 13 GB; the parent cannot be
+# holding gigabytes of display volumes at the same time.
+import services.worker_mem as _worker_mem  # noqa: E402
+_worker_mem.BEFORE_HEAVY_JOB.append(_drop_volume_caches)
+
 
 def _get_mri_volume(mri_path: str):
     """Load and canonicalize NIfTI once; cache the float array."""
-    if mri_path not in _mri_volume_cache:
+    cached = _mri_volume_cache.get(mri_path)
+    if cached is None:
         import nibabel as nib
         img = nib.load(mri_path)
         img_ras = nib.as_closest_canonical(img)
-        data = img_ras.get_fdata()
+        # float32, not get_fdata()'s float64: these are display slices, and the
+        # volume is float32 on disk anyway.
+        data = np.asanyarray(img_ras.dataobj, dtype=np.float32)
         # Pre-compute per-axis normalization stats (percentile over whole volume)
         axis_stats = {}
         for ax, name in [(0, "sagittal"), (1, "coronal"), (2, "axial")]:
@@ -52,13 +149,13 @@ def _get_mri_volume(mri_path: str):
             vmin = float(np.percentile(nonzero, 2)) if len(nonzero) else 0.0
             vmax = float(np.percentile(nonzero, 98)) if len(nonzero) else 1.0
             axis_stats[name] = (vmin, vmax)
-        _mri_volume_cache[mri_path] = {
+        cached = _mri_volume_cache.put(mri_path, {
             "data": data,
             "affine": img_ras.affine,
             "axis_stats": axis_stats,
             "png_cache": {},  # (axis, slice_idx) -> png_bytes
-        }
-    return _mri_volume_cache[mri_path]
+        })
+    return cached
 
 def _render_slice(mri_path: str, axis: str, slice_idx: int):
     """Return (png_bytes, shape, world_coord, voxel_size_mm, count, actual_idx,
@@ -149,21 +246,22 @@ from services.ct_electrode_extractor import build_threshold_mesh, snap_to_blob_c
 _CT_FUSION_WINDOW_MIN = -100.0
 _CT_FUSION_WINDOW_MAX = 1900.0
 
-_ct_volume_cache: dict = {}  # ct_path -> {"data", "affine", "fusion_png_cache": {(axis,idx): bytes}}
+_ct_volume_cache = _VolumeCache("ct")  # ct_path -> {"data", "affine", "fusion_png_cache"}
 
 def _get_ct_volume(ct_path: str):
     """Load and canonicalize the (masked, if available) CT NIfTI once; cache the float array."""
-    if ct_path not in _ct_volume_cache:
+    cached = _ct_volume_cache.get(ct_path)
+    if cached is None:
         import nibabel as nib
         resolved = _resolve_ct_path(ct_path)
         img = nib.load(resolved)
         img_ras = nib.as_closest_canonical(img)
-        _ct_volume_cache[ct_path] = {
-            "data": img_ras.get_fdata(),
+        cached = _ct_volume_cache.put(ct_path, {
+            "data": np.asanyarray(img_ras.dataobj, dtype=np.float32),
             "affine": img_ras.affine,
             "fusion_png_cache": {},  # (mri_path, axis, slice_idx) -> (png_bytes, actual_idx, count)
-        }
-    return _ct_volume_cache[ct_path]
+        })
+    return cached
 
 def _render_fusion_slice(mri_path: str, ct_path: str, transform: np.ndarray, axis: str, slice_idx: int):
     """
@@ -234,19 +332,23 @@ def _render_fusion_slice(mri_path: str, ct_path: str, transform: np.ndarray, axi
 
 
 # ── Structure overlay slice cache ─────────────────────────────────────────────
-_struct_overlay_cache: dict = {}  # label_path -> {"data", "affine", "png_cache": {(axis,idx): bytes}}
+_struct_overlay_cache = _VolumeCache("labels")  # label_path -> {"data", "affine"}
 
 def _get_label_volume(label_path: str):
     """Load DKT label NIfTI (RAS canonical) and cache it."""
-    if label_path not in _struct_overlay_cache:
+    cached = _struct_overlay_cache.get(label_path)
+    if cached is None:
         import nibabel as nib
         img = nib.load(label_path)
         img_ras = nib.as_closest_canonical(img)
-        _struct_overlay_cache[label_path] = {
-            "data": np.round(img_ras.get_fdata()).astype(np.int32),
+        # Read at the stored dtype and round there, rather than materialising a
+        # float64 copy of the whole volume just to throw it away.
+        raw = np.asanyarray(img_ras.dataobj)
+        cached = _struct_overlay_cache.put(label_path, {
+            "data": np.rint(raw).astype(np.int32),
             "affine": img_ras.affine,
-        }
-    return _struct_overlay_cache[label_path]
+        })
+    return cached
 
 def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx: int,
                             visible_keys: set | None = None) -> bytes | None:

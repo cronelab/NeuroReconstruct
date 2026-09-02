@@ -96,12 +96,38 @@ def describe_limit() -> str:
     return f"{limit / 2**30:.2f} GB" if limit else "unknown"
 
 
+# Called just before a heavy child is spawned, so the parent can release memory
+# it is only holding for speed. A parcellation peaks near 13 GB against a 15.62 GB
+# container, which leaves the parent almost nothing: whatever it is caching has to
+# go first. Registered by main.py; empty everywhere else.
+BEFORE_HEAVY_JOB = []
+
+
+# Called just before a heavy child is spawned, so the parent can release memory
+# it is only holding for speed. A parcellation peaks near 13 GB against a 15.62 GB
+# container, which leaves the parent almost nothing: whatever it is caching has to
+# go first. Registered by main.py; empty everywhere else.
+BEFORE_HEAVY_JOB = []
+
+
 def run_worker(cmd, cwd=None, env=None, poll: float = 1.0):
     """Run cmd to completion. Returns (returncode, peak_rss_bytes or None).
 
     stdout/stderr are inherited, so the child's log lines land in the same log
     as everything else.
     """
+    for release in BEFORE_HEAVY_JOB:
+        try:
+            release()
+        except Exception as e:                      # never block the real work
+            print(f"[MEM] pre-job release failed: {e}")
+
+    for release in BEFORE_HEAVY_JOB:
+        try:
+            release()
+        except Exception as e:                      # never block the real work
+            print(f"[MEM] pre-job release failed: {e}")
+
     proc = subprocess.Popen(cmd, cwd=cwd, env=env)
     peak = 0
     stop = threading.Event()
