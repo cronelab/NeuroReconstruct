@@ -17,6 +17,7 @@ from scipy.ndimage import binary_fill_holes, label as nd_label
 import trimesh
 import json
 import os
+import sys
 
 
 # ── Skull stripping ────────────────────────────────────────────────────────────
@@ -238,3 +239,74 @@ def world_to_voxel(world_coords: list, affine: np.ndarray) -> list:
 
 def get_nifti_affine(nifti_path: str) -> list:
     return nib.load(nifti_path).affine.tolist()
+
+
+# ── Process isolation ─────────────────────────────────────────────────────────
+
+try:
+    from services.worker_mem import (HEAVY_JOB_LOCK, describe_limit,
+                                     describe_outcome, run_worker)
+except ImportError:
+    from worker_mem import (HEAVY_JOB_LOCK, describe_limit,
+                            describe_outcome, run_worker)
+
+
+def extract_brain_mesh_isolated(nifti_path: str, output_path: str,
+                                threshold: float = None,
+                                modality: str = "t1") -> dict:
+    """extract_brain_mesh, run in a child process.
+
+    Skull stripping loads TensorFlow and runs a U-Net, and that memory is never
+    given back: on Azure the web process settled at 2.54 GB after one mesh
+    extraction, against 0.14 GB at startup. The residual is then charged against
+    every later allocation -- DKT parcellation was OOM-killed in its own child
+    while the parent still held those 2.4 GB, which was most of the shortfall.
+
+    In a child the whole cost is reclaimed on exit and the web process stays
+    where it started. The mesh comes back through the JSON the function already
+    writes, so nothing large crosses the process boundary.
+    """
+    if getattr(sys, "frozen", False):
+        # Under PyInstaller sys.executable is the bundled app, so spawning it
+        # would start a second server rather than a worker. The frozen build has
+        # no antspynet either, so the morphological fallback is all that runs and
+        # there is no TensorFlow to isolate.
+        return extract_brain_mesh(nifti_path, output_path, threshold, modality)
+
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cmd = [sys.executable, os.path.abspath(__file__), nifti_path, output_path,
+           modality, "auto" if threshold is None else repr(threshold)]
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [backend_dir, env["PYTHONPATH"]] if env.get("PYTHONPATH") else [backend_dir])
+
+    if not HEAVY_JOB_LOCK.acquire(blocking=False):
+        print("[MESH] Another heavy job is running; waiting for it to finish")
+        HEAVY_JOB_LOCK.acquire()
+    try:
+        print(f"[MESH] Spawning mesh worker (pid parent {os.getpid()}, "
+              f"container limit {describe_limit()})")
+        # stdout/stderr are inherited so the worker's [MESH] lines land in the
+        # same log as everything else.
+        returncode, peak = run_worker(cmd, cwd=backend_dir, env=env)
+    finally:
+        HEAVY_JOB_LOCK.release()
+
+    print(f"[MESH] {describe_outcome(returncode, peak)}")
+
+    if returncode != 0:
+        raise RuntimeError(f"mesh extraction {describe_outcome(returncode, peak)}")
+    if not os.path.exists(output_path):
+        raise RuntimeError("mesh worker reported success but wrote no mesh")
+    with open(output_path) as f:
+        return json.load(f)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 5:
+        print("usage: mesh_extractor.py <mri.nii.gz> <mesh.json> <modality> "
+              "<threshold|auto>", file=sys.stderr)
+        raise SystemExit(2)
+    _thr = None if sys.argv[4] == "auto" else float(sys.argv[4])
+    extract_brain_mesh(sys.argv[1], sys.argv[2], _thr, sys.argv[3])

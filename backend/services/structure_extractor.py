@@ -39,9 +39,7 @@ from scipy.ndimage import distance_transform_edt
 import trimesh
 import json
 import os
-import subprocess
 import sys
-import threading
 import concurrent.futures
 
 # ── Structure catalog ─────────────────────────────────────────────────────────
@@ -348,14 +346,51 @@ def _mesh_worker_task(key: str, label_indices: list, max_faces: int):
 
 # ── Main segmentation entry point ─────────────────────────────────────────────
 
+try:
+    from services.worker_mem import (HEAVY_JOB_LOCK, describe_limit,
+                                 describe_outcome, run_worker)
+except ImportError:
+    from worker_mem import (HEAVY_JOB_LOCK, describe_limit,
+                            describe_outcome, run_worker)
+
 _MANIFEST_NAME = "_manifest.json"
 
 # One extraction worker at a time. A parcellation peaks near 8.9 GB, and the
 # App Service plan this runs on has 16 GB, so two at once do not fit -- two
 # clinicians opening the structures view on different reconstructions would be
 # enough to OOM. Queueing costs the second request some latency; not queueing
-# costs it the process.
-_WORKER_LOCK = threading.Lock()
+# costs it the process. Shared with mesh extraction, which is just as heavy.
+_WORKER_LOCK = HEAVY_JOB_LOCK
+
+
+def _adopt_legacy_cache(output_dir: str) -> bool:
+    """Accept structures cached before manifests existed, and write one.
+
+    Manifests only start being written in this version. Without this every
+    reconstruction processed earlier -- 12 of them here, all complete -- would
+    recompute an 8.9 GB parcellation the first time anyone opened its structures
+    view. On the App Service plan that is not a slow response but an OOM kill.
+
+    structures_cortical.nii.gz is the marker: it is written when DKT finishes, so
+    its presence means the expensive stage completed. Accepting on that basis is
+    the same standard the pre-manifest code applied -- it returned whatever was
+    cached, unconditionally -- so old data keeps its old behaviour while the
+    manifest governs everything written from now on.
+    """
+    if not os.path.exists(os.path.join(output_dir, "structures_cortical.nii.gz")):
+        return False
+    cached = _load_cached_structures(output_dir)
+    if not cached:
+        return False
+    try:
+        with open(os.path.join(output_dir, "structures", _MANIFEST_NAME), "w") as f:
+            json.dump({"keys": sorted(cached), "adopted": True}, f)
+        print(f"[STRUCT] Adopted {len(cached)} structures cached before manifests")
+    except OSError as e:
+        # Read-only mount, or a race with another worker. The adoption still
+        # holds for this request; it just has to be repeated next time.
+        print(f"[STRUCT] Could not write manifest for legacy cache: {e}")
+    return True
 
 
 def _structures_complete(output_dir: str) -> bool:
@@ -370,7 +405,7 @@ def _structures_complete(output_dir: str) -> bool:
     """
     manifest = os.path.join(output_dir, "structures", _MANIFEST_NAME)
     if not os.path.exists(manifest):
-        return False
+        return _adopt_legacy_cache(output_dir)
     try:
         with open(manifest) as f:
             keys = json.load(f).get("keys", [])
@@ -449,22 +484,18 @@ def extract_all_structures_isolated(mri_mesh_path: str, output_dir: str,
             print("[STRUCT] Completed by another worker while queued")
             return _load_cached_structures(output_dir)
 
-        print(f"[STRUCT] Spawning extraction worker (pid parent {os.getpid()})")
+        print(f"[STRUCT] Spawning extraction worker (pid parent {os.getpid()}, "
+              f"container limit {describe_limit()})")
         # stdout/stderr are inherited so the worker's [STRUCT] lines land in the
         # same log as everything else.
-        proc = subprocess.run(cmd, cwd=backend_dir, env=env)
+        returncode, peak = run_worker(cmd, cwd=backend_dir, env=env)
     finally:
         _WORKER_LOCK.release()
 
-    if proc.returncode != 0:
-        # 137 from a shell, -9 from Python's own view of the signal: both mean
-        # the kernel killed it, which for this workload means out of memory.
-        oom = proc.returncode in (137, -9)
-        detail = (" -- killed by the OOM killer; the machine or container does "
-                  "not have enough memory for this scan"
-                  if oom else "")
-        raise RuntimeError(
-            f"structure extraction worker exited with {proc.returncode}{detail}")
+    print(f"[STRUCT] {describe_outcome(returncode, peak)}")
+
+    if returncode != 0:
+        raise RuntimeError(f"structure extraction {describe_outcome(returncode, peak)}")
 
     cached = _load_cached_structures(output_dir)
     if not cached:

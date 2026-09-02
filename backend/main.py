@@ -27,7 +27,9 @@ from auth import (
     verify_password, hash_password, create_access_token,
     get_current_user, require_editor, require_admin
 )
-from services.mesh_extractor import extract_brain_mesh, get_nifti_affine, voxel_to_world
+from services.mesh_extractor import (extract_brain_mesh_isolated,
+                                     get_nifti_affine, voxel_to_world)
+from services.worker_mem import describe_limit
 import numpy as np
 from PIL import Image
 from fastapi.responses import Response as FastAPIResponse
@@ -357,6 +359,9 @@ def _get_runtime_dir():
 DATA_DIR = os.path.join(os.environ.get("NEURO_DATA_DIR") or _get_runtime_dir(), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 print(f"[DATA] Using data directory: {DATA_DIR}")
+# The ceiling the heavy workers are measured against. Reported once at
+# startup so an OOM kill later can be read against a known number.
+print(f"[MEM]  Container memory limit: {describe_limit()}")
 
 
 def _rel(path: str) -> Optional[str]:
@@ -977,9 +982,9 @@ async def _extract_mesh_background(recon_id: int, mri_path: str, recon_dir: str,
                 _shutil.copy2(existing_mesh, mesh_path)
                 print(f"[MESH] Reused existing mesh from {os.path.dirname(existing_mesh)}")
             else:
-                await loop.run_in_executor(None, extract_brain_mesh, mri_path, mesh_path, None, mri_modality)
+                await loop.run_in_executor(None, extract_brain_mesh_isolated, mri_path, mesh_path, None, mri_modality)
         else:
-            await loop.run_in_executor(None, extract_brain_mesh, mri_path, mesh_path, None, mri_modality)
+            await loop.run_in_executor(None, extract_brain_mesh_isolated, mri_path, mesh_path, None, mri_modality)
         status = "ready"
     except Exception as e:
         import traceback
