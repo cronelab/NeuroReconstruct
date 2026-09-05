@@ -128,14 +128,17 @@ function ReconCard({ recon, onSelect, canEdit, onDelete }) {
   );
 }
 
-// Contrasts offered for a secondary scan. Mirrors ScanLayerBar so a scan added
-// at creation is labelled the same way as one added later from the viewer.
-const SECONDARY_MODALITIES = [
-  { value: 't2',    label: 'T2' },
-  { value: 'flair', label: 'T2 FLAIR' },
-  { value: 'pd',    label: 'PD' },
-  { value: 'other', label: 'Other' },
-];
+// A secondary scan's type is free text -- the label shown in the viewer's SCAN
+// bar is whatever the user calls it. The backend also stores a coarse modality
+// from a fixed set, so classify the typed text instead of asking twice.
+// FLAIR is tested before T2 because "T2 FLAIR" matches both.
+function inferModality(label) {
+  const t = (label || '').toLowerCase();
+  if (t.includes('flair')) return 'flair';
+  if (t.includes('t2')) return 't2';
+  if (/\bpd\b/.test(t)) return 'pd';
+  return 'other';
+}
 
 export default function ReconstructionList({ onSelect, onTrash }) {
   const { user } = useAppStore();
@@ -183,9 +186,10 @@ export default function ReconstructionList({ onSelect, onTrash }) {
       fd.append('ct_preregistered', form.ct_preregistered ? 'true' : 'false');
       // Positional: the nth label/modality describes the nth secondary file.
       secondaries.filter(sc => sc.file).forEach(sc => {
+        const label = (sc.label || '').trim() || 'Secondary';
         fd.append('secondary_files', sc.file);
-        fd.append('secondary_modalities', sc.modality);
-        fd.append('secondary_labels', SECONDARY_MODALITIES.find(m => m.value === sc.modality)?.label || sc.modality.toUpperCase());
+        fd.append('secondary_labels', label);
+        fd.append('secondary_modalities', inferModality(label));
       });
       const res = await createReconstruction(fd);
       const newRecon = res.data;
@@ -265,7 +269,9 @@ export default function ReconstructionList({ onSelect, onTrash }) {
                     value={form.mri_modality}
                     onChange={e => setForm(p => ({ ...p, mri_modality: e.target.value }))}
                     title="MRI contrast — used to select the correct skull-stripping model"
-                    style={{ padding: '2px 6px', fontSize: 11, background: '#0a0c10', color: '#c8d0da', border: '1px solid #2a3340', borderRadius: 4 }}
+                    // width:auto -- index.css sets width:100% on every input and select,
+                    // which stretches a two-character dropdown across the whole row.
+                    style={{ width: 'auto', padding: '2px 6px', fontSize: 11, background: '#0a0c10', color: '#c8d0da', border: '1px solid #2a3340', borderRadius: 4 }}
                   >
                     <option value="t1">T1</option>
                     <option value="t2">T2</option>
@@ -289,7 +295,7 @@ export default function ReconstructionList({ onSelect, onTrash }) {
                 </label>
                 <button
                   type="button"
-                  onClick={() => setSecondaries(prev => [...prev, { file: null, modality: 't2' }])}
+                  onClick={() => setSecondaries(prev => [...prev, { file: null, label: '' }])}
                   style={{ padding: '2px 10px', fontSize: 11, background: 'transparent', color: '#4a5568', border: '1px dashed #2a3340', borderRadius: 4, cursor: 'pointer' }}
                 >
                   + add
@@ -297,13 +303,15 @@ export default function ReconstructionList({ onSelect, onTrash }) {
               </div>
               {secondaries.map((sc, i) => (
                 <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <select
-                    value={sc.modality}
-                    onChange={e => setSecondaries(prev => prev.map((v, j) => j === i ? { ...v, modality: e.target.value } : v))}
-                    style={{ padding: '2px 6px', fontSize: 11, background: '#0a0c10', color: '#c8d0da', border: '1px solid #2a3340', borderRadius: 4 }}
-                  >
-                    {SECONDARY_MODALITIES.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
-                  </select>
+                  <input
+                    type="text"
+                    value={sc.label}
+                    onChange={e => setSecondaries(prev => prev.map((v, j) => j === i ? { ...v, label: e.target.value } : v))}
+                    placeholder="T2 FLAIR"
+                    title="What to call this scan in the slice viewer's SCAN bar"
+                    maxLength={64}
+                    style={{ width: 130, flex: 'none', padding: '4px 8px', fontSize: 12 }}
+                  />
                   <input
                     type="file"
                     accept=".nii,.nii.gz"
