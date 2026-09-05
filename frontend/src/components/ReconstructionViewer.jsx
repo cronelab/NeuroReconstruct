@@ -293,7 +293,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
     <div style={{ flex: 1, display: 'flex', overflow: 'hidden', minWidth: 700 }}>
 
       {/* Multi-view layout: left selector column + main view */}
-      <MultiViewLayout reconId={reconId} viewer3D={
+      <MultiViewLayout reconId={reconId} shareToken={shareToken} viewer3D={
         <div style={{ width: '100%', height: '100%', position: 'relative' }}>
           <Viewer3D
             loading={loading || meshLoading || pollingForMesh}

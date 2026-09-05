@@ -30,8 +30,29 @@ function getStructureMeshes(structuresData) {
 }
 
 export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = false, onSliceChange, locator }) {
-  const { reconstruction, meshData, structuresData, structureVisible } = useAppStore();
+  const { reconstruction, meshData, structuresData, structureVisible, activeScanId } = useAppStore();
   const canvasRef = useRef(null);
+
+  // Which volume the greyscale underneath comes from: the primary MRI, or one of
+  // the reconstruction's secondary scans. Secondaries are stored resampled into
+  // the primary's grid, so this changes the pixels and nothing else -- slice
+  // indices, plane geometry, the structure overlay and the contact positions are
+  // all identical either way.
+  //
+  // Held in a ref as well as a value because doFetch MUST keep a stable identity:
+  // processQueue closes over it once (deps []) and is what drains the prefetch
+  // queue, so a doFetch that changed with the layer would leave prefetches
+  // calling the original one forever -- fetching primary slices into the
+  // secondary's cache, and quietly showing T1 pixels under a "T2" label.
+  const scanParam = activeScanId ? `&scan_id=${activeScanId}` : '';
+  const scanParamRef = useRef(scanParam);
+  scanParamRef.current = scanParam;
+
+  // Bumped whenever the base layer changes. A request already in flight when the
+  // user switches would otherwise resolve afterwards and write another volume's
+  // bitmap into the new layer's cache, so every fetch carries the generation it
+  // was issued under and drops its result if that has moved on.
+  const layerGenRef = useRef(0);
 
   // Structure overlay cache + current bitmap
   const overlayRef = useRef(null);
@@ -305,10 +326,11 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
     }
     inFlightRef.current.add(idx);
     activeCountRef.current++;
+    const gen = layerGenRef.current;
     try {
       const token = localStorage.getItem('token');
       const res = await fetch(
-        `/api/reconstructions/${reconId}/mri-slice?axis=${axis}&slice_idx=${idx}`,
+        `/api/reconstructions/${reconId}/mri-slice?axis=${axis}&slice_idx=${idx}${scanParamRef.current}`,
         { headers: token ? { Authorization: `Bearer ${token}` } : {} }
       );
       if (!res.ok) {
@@ -338,6 +360,7 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
 
       const blob = await res.blob();
       const bitmap = await createImageBitmap(blob);
+      if (gen !== layerGenRef.current) return;   // base layer changed mid-flight
       const entry = { bitmap, planeNormal, planeOffset, voxelSize, pxWidthMm, pxHeightMm, sliceIdx: actual };
       if (actual >= 0) cacheRef.current.set(actual, entry);
       onDone?.(entry, actual);
@@ -431,7 +454,7 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
 
     // Ask backend to pre-render all slices for this axis in background
     const token = localStorage.getItem('token');
-    fetch(`/api/reconstructions/${reconId}/prerender-slices?axis=${axis}`, {
+    fetch(`/api/reconstructions/${reconId}/prerender-slices?axis=${axis}${scanParam}`, {
       method: 'POST',
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     }).catch(() => {});
@@ -450,6 +473,51 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
       processQueue();
     });
   }, [reconId, axis]); // eslint-disable-line
+
+  // Base layer changed (primary <-> secondary). Only the greyscale differs, so
+  // hold the current slice index instead of resetting to the middle -- the whole
+  // point of the switch is to see the SAME slice in another contrast. The PNG
+  // cache is per-volume, so it has to be dropped; the structure overlay is not,
+  // so it is left alone.
+  // Keyed on the previous VALUE, not on a "have I mounted yet" flag: StrictMode
+  // runs effects mount -> unmount -> mount, and a flag is already set by the
+  // second run, so the effect would fire with nothing having changed and pin the
+  // viewer to whatever slice index existed before the initial fetch resolved
+  // (slice 0). Comparing values makes a re-run with the same layer a no-op.
+  const prevScanRef = useRef(activeScanId);
+  useEffect(() => {
+    if (prevScanRef.current === activeScanId) return;
+    prevScanRef.current = activeScanId;
+    layerGenRef.current += 1;
+    cacheRef.current.clear();
+    inFlightRef.current.clear();
+    pendingCbRef.current.clear();
+    queueRef.current = [];
+    activeCountRef.current = 0;
+    currentEntryRef.current = null;
+    setStatus('loading');
+    triggerDraw();
+
+    const idx = sliceIdxRef.current;
+    if (!isThumbnail) {
+      const token = localStorage.getItem('token');
+      fetch(`/api/reconstructions/${reconId}/prerender-slices?axis=${axis}${scanParam}`, {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      }).catch(() => {});
+    }
+    doFetch(idx, (entry, actual) => {
+      if (sliceIdxRef.current !== actual) return;
+      currentEntryRef.current = entry;
+      setStatus('ok');
+      triggerDraw();
+      for (let i = 1; i <= PREFETCH_AHEAD; i++) {
+        queueRef.current.push(actual + i);
+        queueRef.current.push(actual - i);
+      }
+      processQueue();
+    });
+  }, [activeScanId]); // eslint-disable-line
 
   const handleWheel = useCallback((e) => {
     if (isThumbnail) return;

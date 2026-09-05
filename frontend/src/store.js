@@ -16,7 +16,20 @@ export const useAppStore = create((set, get) => ({
 
   // Current reconstruction
   reconstruction: null,
-  setReconstruction: (r) => set({ reconstruction: r }),
+  setReconstruction: (r) => set((s) => {
+    // The slice viewer's base-layer choice belongs to a reconstruction: scan ids
+    // are per-reconstruction, so carrying one across would have the viewer ask
+    // the new reconstruction for another one's scan and get a 404. Seed the list
+    // from the payload at the same time, so the SCAN bar is right on first paint
+    // instead of after its own fetch returns.
+    const changed = r?.id !== s.reconstruction?.id;
+    if (!changed) return { reconstruction: r };
+    return {
+      reconstruction: r,
+      secondaryScans: r?.secondary_scans || [],
+      activeScanId: null,
+    };
+  }),
 
   // Viewer state
   brainOpacity: 0.6,
@@ -48,6 +61,23 @@ export const useAppStore = create((set, get) => ({
   // in the hover modes. Toggled by the editor's "Place contacts" button.
   placeMode: false,
   setPlaceMode: (v) => set({ placeMode: v }),
+
+  // ── Slice-viewer base layer ──────────────────────────────────────────────────
+  // Which scan the 2D slice viewers render underneath the overlays: null = the
+  // primary MRI (T1), otherwise a secondary scan's id. Shared across all three
+  // axes so switching contrast switches every view at once. Secondaries are
+  // stored resampled into the primary's grid, so the slice index, structure
+  // overlay and electrode contacts are unaffected by this choice.
+  secondaryScans: [],            // [{ id, label, modality, status, ready, error }]
+  setSecondaryScans: (scans) => set((s) => ({
+    secondaryScans: scans,
+    // Never leave the viewer pointed at a scan that has gone away or stopped
+    // being renderable -- fall back to the primary.
+    activeScanId: scans.some(sc => sc.id === s.activeScanId && sc.ready)
+      ? s.activeScanId : null,
+  })),
+  activeScanId: null,
+  setActiveScanId: (id) => set({ activeScanId: id }),
 
   // Mesh data cache
   meshData: null,

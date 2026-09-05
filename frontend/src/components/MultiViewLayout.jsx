@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useRef } from 'react';
 import SliceViewer from './SliceViewer';
 import FusionSliceViewer from './FusionSliceViewer';
+import ScanLayerBar from './ScanLayerBar';
 import { useAppStore } from '../store';
 import { uploadReconstructionFiles, confirmRegistration, preciseReregister, selectRegistrationCandidate, getReconstruction } from '../api';
 
@@ -20,7 +21,7 @@ const AXIS_COLORS = {
   fusion:   '#ffab40',
 };
 
-export default function MultiViewLayout({ reconId, viewer3D }) {
+export default function MultiViewLayout({ reconId, viewer3D, shareToken }) {
   const [activeView, setActiveView] = useState('3d');
   const { reconstruction, setReconstruction } = useAppStore();
   const [confirmBusy, setConfirmBusy] = useState(false);
@@ -330,6 +331,15 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
           </div>
         )}
 
+        <div style={{
+          position: 'absolute', inset: 0,
+          display: ['sagittal', 'axial', 'coronal'].includes(activeView) ? 'flex' : 'none',
+          flexDirection: 'column',
+        }}>
+          {reconstruction?.has_mri !== false && (
+            <ScanLayerBar reconId={reconId} shareToken={shareToken} />
+          )}
+          <div style={{ flex: 1, position: 'relative', minWidth: 0, minHeight: 0 }}>
         {['sagittal', 'axial', 'coronal'].map(ax => (
           <div key={ax} style={{ position: 'absolute', inset: 0, display: activeView === ax ? 'block' : 'none' }}>
             {reconstruction?.has_mri === false ? (
@@ -377,6 +387,8 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
             )}
           </div>
         ))}
+          </div>
+        </div>
       </div>
 
     </div>

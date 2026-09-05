@@ -1,0 +1,224 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useAppStore } from '../store';
+import { listSecondaryScans, uploadSecondaryScan, deleteSecondaryScan } from '../api';
+
+/**
+ * Base-layer switcher for the 2D slice views.
+ *
+ * A reconstruction's PRIMARY MRI (normally T1) is the only scan the pipeline
+ * reads — parcellation, mesh, CT coregistration and MNI export all run off it.
+ * SECONDARY scans (T2, FLAIR, ...) exist only so structures that read better on
+ * another contrast can be looked at here. Each is registered to the primary and
+ * stored resampled into its voxel grid, so switching between them changes the
+ * greyscale and nothing else: the slice index, the structure overlay and the
+ * electrode contacts all stay exactly where they were. That is what makes
+ * flipping between layers a usable alignment check on its own — if anatomy
+ * shifts when you toggle, the registration is off.
+ */
+
+const MODALITIES = [
+  { value: 't2',    label: 'T2' },
+  { value: 'flair', label: 'T2 FLAIR' },
+  { value: 'pd',    label: 'PD' },
+  { value: 'other', label: 'Other' },
+];
+
+const STATUS_TEXT = {
+  pending:     'queued',
+  registering: 'registering…',
+  error:       'failed',
+};
+
+// Fresh uploads register in the background; poll until they settle.
+const POLL_MS = 5000;
+
+export default function ScanLayerBar({ reconId, shareToken }) {
+  const {
+    secondaryScans, setSecondaryScans,
+    activeScanId, setActiveScanId,
+    user,
+  } = useAppStore();
+  const canEdit = user && (user.role === 'editor' || user.role === 'admin');
+
+  const [adding, setAdding] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [modality, setModality] = useState('t2');
+  const fileRef = useRef(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const { data } = await listSecondaryScans(reconId, shareToken);
+      setSecondaryScans(data || []);
+      return data || [];
+    } catch (e) {
+      return null;
+    }
+  }, [reconId, shareToken, setSecondaryScans]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  // Poll only while something is still being registered.
+  const settling = secondaryScans.some(s => s.status === 'pending' || s.status === 'registering');
+  useEffect(() => {
+    if (!settling) return;
+    const t = setInterval(refresh, POLL_MS);
+    return () => clearInterval(t);
+  }, [settling, refresh]);
+
+  const handleAdd = useCallback(async () => {
+    const file = fileRef.current?.files?.[0];
+    if (!file) return;
+    setBusy(true);
+    setError('');
+    try {
+      await uploadSecondaryScan(reconId, file, {
+        modality,
+        label: MODALITIES.find(m => m.value === modality)?.label || modality.toUpperCase(),
+      });
+      if (fileRef.current) fileRef.current.value = '';
+      setAdding(false);
+      await refresh();
+    } catch (e) {
+      setError(e?.response?.data?.detail || e.message || 'Upload failed');
+    } finally {
+      setBusy(false);
+    }
+  }, [reconId, modality, refresh]);
+
+  const handleDelete = useCallback(async (scanId) => {
+    setBusy(true);
+    try {
+      await deleteSecondaryScan(reconId, scanId);
+      if (activeScanId === scanId) setActiveScanId(null);
+      await refresh();
+    } catch (e) {
+      setError(e?.response?.data?.detail || e.message || 'Delete failed');
+    } finally {
+      setBusy(false);
+    }
+  }, [reconId, activeScanId, setActiveScanId, refresh]);
+
+  // Nothing to switch between and nothing the viewer can add: stay out of the way.
+  if (!secondaryScans.length && !canEdit) return null;
+
+  const chip = (active, disabled) => ({
+    fontSize: 11,
+    fontWeight: 600,
+    fontFamily: 'IBM Plex Mono, monospace',
+    letterSpacing: '0.03em',
+    padding: '3px 10px',
+    borderRadius: 3,
+    cursor: disabled ? 'default' : 'pointer',
+    background: active ? '#00d4ff' : 'transparent',
+    color: active ? '#06121f' : (disabled ? '#3d4855' : '#7a8a99'),
+    border: `1px solid ${active ? '#00d4ff' : '#2a3340'}`,
+    opacity: disabled ? 0.6 : 1,
+  });
+
+  return (
+    <div style={{
+      flexShrink: 0,
+      display: 'flex',
+      alignItems: 'center',
+      gap: 6,
+      padding: '5px 10px',
+      background: '#0a0c10',
+      borderBottom: '1px solid #1e2530',
+      flexWrap: 'wrap',
+    }}>
+      <span style={{ fontSize: 10, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace', letterSpacing: '0.06em' }}>
+        SCAN
+      </span>
+
+      <button
+        onClick={() => setActiveScanId(null)}
+        title="Primary MRI — the scan the parcellation and coregistration are built on"
+        style={chip(activeScanId === null, false)}
+      >
+        Primary
+      </button>
+
+      {secondaryScans.map(scan => {
+        const active = activeScanId === scan.id;
+        return (
+          <span key={scan.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+            <button
+              onClick={() => scan.ready && setActiveScanId(scan.id)}
+              disabled={!scan.ready}
+              title={scan.error || scan.filename}
+              style={chip(active, !scan.ready)}
+            >
+              {scan.label}
+              {!scan.ready && (
+                <span style={{ marginLeft: 5, fontWeight: 400, color: scan.status === 'error' ? '#ff5252' : '#4a5568' }}>
+                  {STATUS_TEXT[scan.status] || scan.status}
+                </span>
+              )}
+            </button>
+            {canEdit && (
+              <button
+                onClick={() => handleDelete(scan.id)}
+                disabled={busy}
+                title={`Remove ${scan.label}`}
+                style={{ fontSize: 11, lineHeight: 1, padding: '2px 4px', background: 'transparent', color: '#3d4855', border: 'none', cursor: 'pointer' }}
+              >
+                ×
+              </button>
+            )}
+          </span>
+        );
+      })}
+
+      {canEdit && !adding && (
+        <button
+          onClick={() => { setAdding(true); setError(''); }}
+          title="Add a T2 / FLAIR scan as an extra base layer (does not affect the reconstruction)"
+          style={{ fontSize: 11, fontFamily: 'IBM Plex Mono, monospace', padding: '3px 8px', borderRadius: 3, background: 'transparent', color: '#4a5568', border: '1px dashed #2a3340', cursor: 'pointer' }}
+        >
+          + scan
+        </button>
+      )}
+
+      {canEdit && adding && (
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <select
+            value={modality}
+            onChange={e => setModality(e.target.value)}
+            style={{ fontSize: 11, background: '#0a0c10', color: '#e8edf2', border: '1px solid #2a3340', borderRadius: 3, fontFamily: 'IBM Plex Mono, monospace' }}
+          >
+            {MODALITIES.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+          </select>
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".nii,.nii.gz"
+            style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace', maxWidth: 220 }}
+          />
+          <button
+            onClick={handleAdd}
+            disabled={busy}
+            style={{ fontSize: 11, fontWeight: 600, padding: '3px 10px', borderRadius: 3, background: '#002233', color: '#00d4ff', border: '1px solid #00d4ff44', cursor: busy ? 'default' : 'pointer', fontFamily: 'IBM Plex Sans, sans-serif' }}
+          >
+            {busy ? 'Uploading…' : 'Register'}
+          </button>
+          <button
+            onClick={() => { setAdding(false); setError(''); }}
+            style={{ fontSize: 11, padding: '3px 8px', borderRadius: 3, background: 'transparent', color: '#4a5568', border: '1px solid #2a3340', cursor: 'pointer', fontFamily: 'IBM Plex Sans, sans-serif' }}
+          >
+            Cancel
+          </button>
+        </span>
+      )}
+
+      {error && (
+        <span style={{ fontSize: 11, color: '#ff5252', fontFamily: 'IBM Plex Mono, monospace' }}>{error}</span>
+      )}
+      {settling && (
+        <span style={{ fontSize: 10, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>
+          registering to primary — a few minutes
+        </span>
+      )}
+    </div>
+  );
+}

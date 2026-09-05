@@ -128,6 +128,15 @@ function ReconCard({ recon, onSelect, canEdit, onDelete }) {
   );
 }
 
+// Contrasts offered for a secondary scan. Mirrors ScanLayerBar so a scan added
+// at creation is labelled the same way as one added later from the viewer.
+const SECONDARY_MODALITIES = [
+  { value: 't2',    label: 'T2' },
+  { value: 'flair', label: 'T2 FLAIR' },
+  { value: 'pd',    label: 'PD' },
+  { value: 'other', label: 'Other' },
+];
+
 export default function ReconstructionList({ onSelect, onTrash }) {
   const { user } = useAppStore();
   const [reconstructions, setReconstructions] = useState([]);
@@ -135,6 +144,9 @@ export default function ReconstructionList({ onSelect, onTrash }) {
   const [showCreate, setShowCreate] = useState(false);
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ patient_id: '', mri_file: null, mri_modality: 't1', ct_file: null, ct_preregistered: false });
+  // Extra MRIs for the slice viewer only — see ScanLayerBar. Each is
+  // { file, modality }; the primary above stays the pipeline's single input.
+  const [secondaries, setSecondaries] = useState([]);
   const [confirmDelete, setConfirmDelete] = useState(null); // recon object pending soft delete
   const [deleting, setDeleting] = useState(false);
 
@@ -169,6 +181,12 @@ export default function ReconstructionList({ onSelect, onTrash }) {
       fd.append('mri_modality', form.mri_modality);
       if (form.ct_file) fd.append('ct_file', form.ct_file);
       fd.append('ct_preregistered', form.ct_preregistered ? 'true' : 'false');
+      // Positional: the nth label/modality describes the nth secondary file.
+      secondaries.filter(sc => sc.file).forEach(sc => {
+        fd.append('secondary_files', sc.file);
+        fd.append('secondary_modalities', sc.modality);
+        fd.append('secondary_labels', SECONDARY_MODALITIES.find(m => m.value === sc.modality)?.label || sc.modality.toUpperCase());
+      });
       const res = await createReconstruction(fd);
       const newRecon = res.data;
       // Optimistically block the card immediately on upload:
@@ -179,6 +197,7 @@ export default function ReconstructionList({ onSelect, onTrash }) {
       setReconstructions(prev => [newRecon, ...prev]);
       setShowCreate(false);
       setForm({ patient_id: '', mri_file: null, mri_modality: 't1', ct_file: null, ct_preregistered: false });
+      setSecondaries([]);
     } catch (e) {
       alert('Failed: ' + (e.response?.data?.detail || e.message));
     } finally {
@@ -241,7 +260,7 @@ export default function ReconstructionList({ onSelect, onTrash }) {
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 18 }}>
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-                  <label style={{ fontSize: 13, color: '#c8d0da', fontWeight: 600 }}>MRI NIfTI (.nii / .nii.gz) *</label>
+                  <label style={{ fontSize: 13, color: '#c8d0da', fontWeight: 600 }}>Primary MRI (.nii / .nii.gz) *</label>
                   <select
                     value={form.mri_modality}
                     onChange={e => setForm(p => ({ ...p, mri_modality: e.target.value }))}
@@ -258,6 +277,48 @@ export default function ReconstructionList({ onSelect, onTrash }) {
                 <label style={{ display: 'block', fontSize: 13, color: '#c8d0da', marginBottom: 6, fontWeight: 600 }}>CT NIfTI (.nii / .nii.gz) <span style={{ color: '#4a5568', fontWeight: 400 }}>— optional</span></label>
                 <input type="file" accept=".nii,.nii.gz" onChange={e => setForm(p => ({ ...p, ct_file: e.target.files[0] }))} style={{ padding: '4px 8px', fontSize: 12 }} />
               </div>
+            </div>
+            {/* Secondary MRIs — visualization only. They are registered to the
+                primary and shown as alternative base layers in the 2D slice
+                viewer; the parcellation, mesh, CT coregistration and MNI export
+                all continue to read the primary and only the primary. */}
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+                <label style={{ fontSize: 13, color: '#c8d0da', fontWeight: 600 }}>
+                  Secondary MRIs <span style={{ color: '#4a5568', fontWeight: 400 }}>— optional, slice viewer only</span>
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setSecondaries(prev => [...prev, { file: null, modality: 't2' }])}
+                  style={{ padding: '2px 10px', fontSize: 11, background: 'transparent', color: '#4a5568', border: '1px dashed #2a3340', borderRadius: 4, cursor: 'pointer' }}
+                >
+                  + add
+                </button>
+              </div>
+              {secondaries.map((sc, i) => (
+                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                  <select
+                    value={sc.modality}
+                    onChange={e => setSecondaries(prev => prev.map((v, j) => j === i ? { ...v, modality: e.target.value } : v))}
+                    style={{ padding: '2px 6px', fontSize: 11, background: '#0a0c10', color: '#c8d0da', border: '1px solid #2a3340', borderRadius: 4 }}
+                  >
+                    {SECONDARY_MODALITIES.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                  </select>
+                  <input
+                    type="file"
+                    accept=".nii,.nii.gz"
+                    onChange={e => setSecondaries(prev => prev.map((v, j) => j === i ? { ...v, file: e.target.files[0] } : v))}
+                    style={{ padding: '4px 8px', fontSize: 12, flex: 1 }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setSecondaries(prev => prev.filter((_, j) => j !== i))}
+                    style={{ padding: '2px 8px', fontSize: 12, background: 'transparent', color: '#4a5568', border: 'none', cursor: 'pointer' }}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
             </div>
             {form.ct_file && (
               <div style={{ marginBottom: 14, display: 'flex', alignItems: 'center', gap: 10 }}>
