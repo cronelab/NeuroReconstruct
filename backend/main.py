@@ -84,6 +84,10 @@ class _VolumeCache:
         _evict_across_caches()
         return entry
 
+    def pop(self, key, default=None):
+        """Drop one cached volume -- used when its file on disk is replaced."""
+        return self._items.pop(key, default)
+
     def clear(self):
         n, mb = len(self._items), self.total_bytes() / 2**20
         self._items.clear()
