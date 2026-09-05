@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { listReconstructions, createReconstruction, softDeleteReconstruction } from '../api';
+import { inferModality, scanLabelOrDefault, SCAN_TYPE_PLACEHOLDER } from '../scanTypes';
 import { useAppStore } from '../store';
 
 const font = 'IBM Plex Sans, sans-serif';
@@ -128,18 +129,6 @@ function ReconCard({ recon, onSelect, canEdit, onDelete }) {
   );
 }
 
-// A secondary scan's type is free text -- the label shown in the viewer's SCAN
-// bar is whatever the user calls it. The backend also stores a coarse modality
-// from a fixed set, so classify the typed text instead of asking twice.
-// FLAIR is tested before T2 because "T2 FLAIR" matches both.
-function inferModality(label) {
-  const t = (label || '').toLowerCase();
-  if (t.includes('flair')) return 'flair';
-  if (t.includes('t2')) return 't2';
-  if (/\bpd\b/.test(t)) return 'pd';
-  return 'other';
-}
-
 export default function ReconstructionList({ onSelect, onTrash }) {
   const { user } = useAppStore();
   const [reconstructions, setReconstructions] = useState([]);
@@ -148,7 +137,7 @@ export default function ReconstructionList({ onSelect, onTrash }) {
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({ patient_id: '', mri_file: null, mri_modality: 't1', ct_file: null, ct_preregistered: false });
   // Extra MRIs for the slice viewer only — see ScanLayerBar. Each is
-  // { file, modality }; the primary above stays the pipeline's single input.
+  // { file, label }; the primary above stays the pipeline's single input.
   const [secondaries, setSecondaries] = useState([]);
   const [confirmDelete, setConfirmDelete] = useState(null); // recon object pending soft delete
   const [deleting, setDeleting] = useState(false);
@@ -186,7 +175,7 @@ export default function ReconstructionList({ onSelect, onTrash }) {
       fd.append('ct_preregistered', form.ct_preregistered ? 'true' : 'false');
       // Positional: the nth label/modality describes the nth secondary file.
       secondaries.filter(sc => sc.file).forEach(sc => {
-        const label = (sc.label || '').trim() || 'Secondary';
+        const label = scanLabelOrDefault(sc.label);
         fd.append('secondary_files', sc.file);
         fd.append('secondary_labels', label);
         fd.append('secondary_modalities', inferModality(label));
@@ -307,7 +296,7 @@ export default function ReconstructionList({ onSelect, onTrash }) {
                     type="text"
                     value={sc.label}
                     onChange={e => setSecondaries(prev => prev.map((v, j) => j === i ? { ...v, label: e.target.value } : v))}
-                    placeholder="T2 FLAIR"
+                    placeholder={SCAN_TYPE_PLACEHOLDER}
                     title="What to call this scan in the slice viewer's SCAN bar"
                     maxLength={64}
                     style={{ width: 130, flex: 'none', padding: '4px 8px', fontSize: 12 }}

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store';
 import { listSecondaryScans, uploadSecondaryScan, deleteSecondaryScan } from '../api';
+import { inferModality, scanLabelOrDefault, SCAN_TYPE_PLACEHOLDER } from '../scanTypes';
 
 /**
  * Base-layer switcher for the 2D slice views.
@@ -15,13 +16,6 @@ import { listSecondaryScans, uploadSecondaryScan, deleteSecondaryScan } from '..
  * flipping between layers a usable alignment check on its own — if anatomy
  * shifts when you toggle, the registration is off.
  */
-
-const MODALITIES = [
-  { value: 't2',    label: 'T2' },
-  { value: 'flair', label: 'T2 FLAIR' },
-  { value: 'pd',    label: 'PD' },
-  { value: 'other', label: 'Other' },
-];
 
 const STATUS_TEXT = {
   pending:     'queued',
@@ -43,7 +37,7 @@ export default function ScanLayerBar({ reconId, shareToken }) {
   const [adding, setAdding] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [modality, setModality] = useState('t2');
+  const [scanType, setScanType] = useState('');
   const fileRef = useRef(null);
 
   const refresh = useCallback(async () => {
@@ -72,11 +66,10 @@ export default function ScanLayerBar({ reconId, shareToken }) {
     setBusy(true);
     setError('');
     try {
-      await uploadSecondaryScan(reconId, file, {
-        modality,
-        label: MODALITIES.find(m => m.value === modality)?.label || modality.toUpperCase(),
-      });
+      const label = scanLabelOrDefault(scanType);
+      await uploadSecondaryScan(reconId, file, { label, modality: inferModality(label) });
       if (fileRef.current) fileRef.current.value = '';
+      setScanType('');
       setAdding(false);
       await refresh();
     } catch (e) {
@@ -84,7 +77,7 @@ export default function ScanLayerBar({ reconId, shareToken }) {
     } finally {
       setBusy(false);
     }
-  }, [reconId, modality, refresh]);
+  }, [reconId, scanType, refresh]);
 
   const handleDelete = useCallback(async (scanId) => {
     setBusy(true);
@@ -182,13 +175,16 @@ export default function ScanLayerBar({ reconId, shareToken }) {
 
       {canEdit && adding && (
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-          <select
-            value={modality}
-            onChange={e => setModality(e.target.value)}
-            style={{ fontSize: 11, background: '#0a0c10', color: '#e8edf2', border: '1px solid #2a3340', borderRadius: 3, fontFamily: 'IBM Plex Mono, monospace' }}
-          >
-            {MODALITIES.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
-          </select>
+          <input
+            type="text"
+            value={scanType}
+            onChange={e => setScanType(e.target.value)}
+            placeholder={SCAN_TYPE_PLACEHOLDER}
+            title="What to call this scan in this bar"
+            maxLength={64}
+            // width is explicit because index.css sets width:100% on every input.
+            style={{ width: 110, flex: 'none', fontSize: 11, padding: '3px 8px', background: '#0a0c10', color: '#e8edf2', border: '1px solid #2a3340', borderRadius: 3, fontFamily: 'IBM Plex Mono, monospace' }}
+          />
           <input
             ref={fileRef}
             type="file"
@@ -203,7 +199,7 @@ export default function ScanLayerBar({ reconId, shareToken }) {
             {busy ? 'Uploading…' : 'Register'}
           </button>
           <button
-            onClick={() => { setAdding(false); setError(''); }}
+            onClick={() => { setAdding(false); setError(''); setScanType(''); }}
             style={{ fontSize: 11, padding: '3px 8px', borderRadius: 3, background: 'transparent', color: '#4a5568', border: '1px solid #2a3340', cursor: 'pointer', fontFamily: 'IBM Plex Sans, sans-serif' }}
           >
             Cancel
