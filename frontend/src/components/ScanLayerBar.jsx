@@ -4,17 +4,19 @@ import { listSecondaryScans, uploadSecondaryScan, deleteSecondaryScan } from '..
 import { inferModality, scanLabelOrDefault, SCAN_TYPE_PLACEHOLDER } from '../scanTypes';
 
 /**
- * Base-layer switcher for the 2D slice views.
+ * Picks which scans the 2D slice views show, as panes side by side.
  *
  * A reconstruction's PRIMARY MRI (normally T1) is the only scan the pipeline
  * reads — parcellation, mesh, CT coregistration and MNI export all run off it.
  * SECONDARY scans (T2, FLAIR, ...) exist only so structures that read better on
  * another contrast can be looked at here. Each is registered to the primary and
- * stored resampled into its voxel grid, so switching between them changes the
- * greyscale and nothing else: the slice index, the structure overlay and the
- * electrode contacts all stay exactly where they were. That is what makes
- * flipping between layers a usable alignment check on its own — if anatomy
- * shifts when you toggle, the registration is off.
+ * stored resampled into its voxel grid, so every layer shares one slice index:
+ * the panes scroll together, and the structure overlay and electrode contacts
+ * land in the same place in all of them. Comparing them in one glance is also
+ * the alignment check — anatomy that does not line up across the panes means
+ * that secondary's registration is off.
+ *
+ * Selection is multiple. At least one pane always stays on.
  */
 
 const STATUS_TEXT = {
@@ -29,7 +31,7 @@ const POLL_MS = 5000;
 export default function ScanLayerBar({ reconId, shareToken }) {
   const {
     secondaryScans, setSecondaryScans,
-    activeScanId, setActiveScanId,
+    visibleLayers, toggleLayer,
     user,
   } = useAppStore();
   const canEdit = user && (user.role === 'editor' || user.role === 'admin');
@@ -83,17 +85,22 @@ export default function ScanLayerBar({ reconId, shareToken }) {
     setBusy(true);
     try {
       await deleteSecondaryScan(reconId, scanId);
-      if (activeScanId === scanId) setActiveScanId(null);
+      // refresh() -> setSecondaryScans prunes the deleted layer from view.
       await refresh();
     } catch (e) {
       setError(e?.response?.data?.detail || e.message || 'Delete failed');
     } finally {
       setBusy(false);
     }
-  }, [reconId, activeScanId, setActiveScanId, refresh]);
+  }, [reconId, refresh]);
 
-  // Nothing to switch between and nothing the viewer can add: stay out of the way.
+  // Nothing to compare and nothing the viewer can add: stay out of the way.
   if (!secondaryScans.length && !canEdit) return null;
+
+  // Turning off the only pane showing would leave nothing to look at, so the
+  // store refuses it; say so in the tooltip rather than letting the click
+  // silently do nothing.
+  const onlyOne = (key) => visibleLayers.length === 1 && visibleLayers[0] === key;
 
   const chip = (active, disabled) => ({
     fontSize: 11,
@@ -121,25 +128,29 @@ export default function ScanLayerBar({ reconId, shareToken }) {
       flexWrap: 'wrap',
     }}>
       <span style={{ fontSize: 10, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace', letterSpacing: '0.06em' }}>
-        SCAN
+        SHOW
       </span>
 
       <button
-        onClick={() => setActiveScanId(null)}
-        title="Primary MRI — the scan the parcellation and coregistration are built on"
-        style={chip(activeScanId === null, false)}
+        onClick={() => toggleLayer('primary')}
+        title={onlyOne('primary')
+          ? 'Primary MRI — the last pane showing, so it cannot be turned off'
+          : 'Primary MRI — the scan the parcellation and coregistration are built on'}
+        style={chip(visibleLayers.includes('primary'), false)}
       >
         Primary
       </button>
 
       {secondaryScans.map(scan => {
-        const active = activeScanId === scan.id;
+        const active = visibleLayers.includes(scan.id);
         return (
           <span key={scan.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
             <button
-              onClick={() => scan.ready && setActiveScanId(scan.id)}
+              onClick={() => scan.ready && toggleLayer(scan.id)}
               disabled={!scan.ready}
-              title={scan.error || scan.filename}
+              title={scan.error || (onlyOne(scan.id)
+                ? `${scan.label} — the last pane showing, so it cannot be turned off`
+                : scan.filename)}
               style={chip(active, !scan.ready)}
             >
               {scan.label}
@@ -213,6 +224,11 @@ export default function ScanLayerBar({ reconId, shareToken }) {
       {settling && (
         <span style={{ fontSize: 10, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>
           registering to primary — a few minutes
+        </span>
+      )}
+      {visibleLayers.length > 1 && (
+        <span style={{ fontSize: 10, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace' }}>
+          {visibleLayers.length} panes · scroll together
         </span>
       )}
     </div>

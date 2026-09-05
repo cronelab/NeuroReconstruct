@@ -1,5 +1,12 @@
 import { create } from 'zustand';
 
+// Drop layers whose scan has gone away or stopped being renderable, and never
+// leave the viewer with no pane to draw.
+function pruneLayers(layers, scans) {
+  const kept = layers.filter(k => k === 'primary' || scans.some(sc => sc.id === k && sc.ready));
+  return kept.length ? kept : ['primary'];
+}
+
 export const useAppStore = create((set, get) => ({
   // Auth
   user: null,
@@ -17,9 +24,9 @@ export const useAppStore = create((set, get) => ({
   // Current reconstruction
   reconstruction: null,
   setReconstruction: (r) => set((s) => {
-    // The slice viewer's base-layer choice belongs to a reconstruction: scan ids
-    // are per-reconstruction, so carrying one across would have the viewer ask
-    // the new reconstruction for another one's scan and get a 404. Seed the list
+    // The slice viewer's layer choice belongs to a reconstruction: scan ids are
+    // per-reconstruction, so carrying one across would have the viewer ask the
+    // new reconstruction for another one's scan and get a 404. Seed the list
     // from the payload at the same time, so the SCAN bar is right on first paint
     // instead of after its own fetch returns.
     const changed = r?.id !== s.reconstruction?.id;
@@ -27,7 +34,7 @@ export const useAppStore = create((set, get) => ({
     return {
       reconstruction: r,
       secondaryScans: r?.secondary_scans || [],
-      activeScanId: null,
+      visibleLayers: ['primary'],
     };
   }),
 
@@ -62,22 +69,30 @@ export const useAppStore = create((set, get) => ({
   placeMode: false,
   setPlaceMode: (v) => set({ placeMode: v }),
 
-  // ── Slice-viewer base layer ──────────────────────────────────────────────────
-  // Which scan the 2D slice viewers render underneath the overlays: null = the
-  // primary MRI (T1), otherwise a secondary scan's id. Shared across all three
-  // axes so switching contrast switches every view at once. Secondaries are
-  // stored resampled into the primary's grid, so the slice index, structure
-  // overlay and electrode contacts are unaffected by this choice.
+  // ── Slice-viewer layers ──────────────────────────────────────────────────────
+  // Which scans the 2D slice views draw, as panes side by side: 'primary' for
+  // the primary MRI, otherwise a secondary scan's id. Shared across all three
+  // axes, so a choice made once applies to sagittal, axial and coronal alike.
+  //
+  // This is membership, not order -- MultiViewLayout lays the panes out
+  // primary-first and then in scan order, so toggling one off and back on does
+  // not shuffle the others. Every layer is stored resampled into the primary's
+  // grid, so one slice index means the same anatomy in all of them, which is
+  // what lets the panes scroll together and share one structure overlay.
   secondaryScans: [],            // [{ id, label, modality, status, ready, error }]
   setSecondaryScans: (scans) => set((s) => ({
     secondaryScans: scans,
-    // Never leave the viewer pointed at a scan that has gone away or stopped
-    // being renderable -- fall back to the primary.
-    activeScanId: scans.some(sc => sc.id === s.activeScanId && sc.ready)
-      ? s.activeScanId : null,
+    visibleLayers: pruneLayers(s.visibleLayers, scans),
   })),
-  activeScanId: null,
-  setActiveScanId: (id) => set({ activeScanId: id }),
+  visibleLayers: ['primary'],
+  setVisibleLayers: (layers) => set({ visibleLayers: layers.length ? layers : ['primary'] }),
+  toggleLayer: (key) => set((s) => {
+    const next = s.visibleLayers.includes(key)
+      ? s.visibleLayers.filter(k => k !== key)
+      : [...s.visibleLayers, key];
+    // Turning off the last pane would leave nothing to look at; keep it on.
+    return { visibleLayers: next.length ? next : s.visibleLayers };
+  }),
 
   // Mesh data cache
   meshData: null,

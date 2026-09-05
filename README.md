@@ -170,10 +170,12 @@ kept, capped at 512 MB total. Override with `NEURO_CT_CACHE_MAX_FILES` and
 8. Load brain substructures to visualize hippocampus, amygdala, thalamus, etc.
 9. Mark as Complete → switches to MRI view with electrode overlay
 
-In the slice views, the **SCAN** bar switches the base layer between the primary
-MRI and any secondary scans. Overlays and contacts stay put across the switch, so
-flipping between layers is also the alignment check: if anatomy moves, that
-secondary's registration is off.
+In the slice views, the **SHOW** bar picks which scans are drawn, as panes side
+by side — primary, any secondary, or several at once. The panes scroll together
+and share one structure overlay and one set of contacts, because every layer sits
+on the primary's grid. Seeing them together is also the alignment check: anatomy
+that does not line up across the panes means that secondary's registration is
+off. At least one pane always stays on.
 
 ---
 
@@ -240,11 +242,11 @@ normalization (`mni_registration.py`) and contact-to-structure labeling
 | `ReconstructionList.jsx` | Home page. Two-column layout: In Progress (left) and Completed (right). Shows shaft/contact counts. Upload form for MRI+CT. Polls status every 10s. |
 | `Header.jsx` | Top bar. Logo → home. Mark Complete / Unlock toggle. Edit button (disabled when locked). |
 | `ReconstructionViewer.jsx` | Main viewer shell. Owns CT mesh loading, MRI visibility toggle, CT threshold slider with 400ms debounce, undo stack, lock/complete state. Wraps content in MultiViewLayout. Draggable right-panel resizer. Auto-enters edit mode for in-progress reconstructions. |
-| `MultiViewLayout.jsx` | Four-panel layout: column of view-selector buttons (3D + sagittal / axial / coronal) on left, main view area on right. Manages shared `slicePositions` for cross-view locator lines. |
+| `MultiViewLayout.jsx` | Four-panel layout: column of view-selector buttons (3D + sagittal / axial / coronal) on left, main view area on right. Manages shared `slicePositions`, which drive both the cross-view locator lines and the slice synchronisation between side-by-side scan panes. Lays those panes out primary-first, then in scan order, so toggling one does not shuffle the rest. |
 | `Viewer3D.jsx` | Three.js canvas. Renders brain mesh, CT artifact mesh, electrode shafts / contacts / lines. OrbitControls (rotate / pan / zoom). Renders structure meshes when loaded. |
 | `CTArtifactMesh.jsx` | Renders CT threshold mesh as white semi-transparent surface. Handles click-to-place contacts (only when `activeContactNumber != null`). |
-| `SliceViewer.jsx` | MRI slice viewer for sagittal / axial / coronal planes. Client-side cache + prefetch (10 ahead, 4 behind, 6 concurrent requests). Scroll wheel + scrollbar navigation. Depth-filtered electrode dot projection (±4mm). LocatorOverlay corner thumbnail. Renders whichever base layer `activeScanId` selects, holding the current slice across a switch. |
-| `ScanLayerBar.jsx` | The **SCAN** bar above the slice views: switches the base layer between the primary MRI and each ready secondary, and (for editors) adds or removes secondaries. Polls while a scan is still registering. |
+| `SliceViewer.jsx` | One slice pane. Client-side cache + prefetch (10 ahead, 4 behind, 6 concurrent requests). Scroll wheel + scrollbar navigation. Depth-filtered electrode dot projection (±4mm). LocatorOverlay corner thumbnail. Draws the scan given by its `scanId` prop, and follows `syncSliceIdx` so sibling panes stay on the same slice. |
+| `ScanLayerBar.jsx` | The **SHOW** bar above the slice views: selects which scans are drawn as side-by-side panes (multiple; at least one always on), and (for editors) adds or removes secondaries. Polls while a scan is still registering. |
 | `ElectrodeEditor.jsx` | Right panel in edit mode. CT threshold slider, MRI toggle/opacity, shaft list (draggable divider between shaft list and contact grid), contact selector grid, autofill bar. Contains ColorPicker (50 named colors) and ContactSelector sub-components. |
 | `SeegViewer.jsx` | sEEG functional-mapping view. Control panel (recording upload/select, band, mapping mode, **trial alignment + display window + baseline**, color scale, brain/structure opacity, coverage), the 3D brain, and the trace panel. Holds a client-side LRU cache of computed results so switching band/alignment/baseline/window back to a viewed setting loads instantly. |
 | `SeegViewer3D.jsx` | Three.js canvas for the mapping view: native brain surface + contacts colored by the current-frame activation value (diverging z-score colormap), with structure overlays and hover tooltips. |
@@ -275,7 +277,9 @@ User uploads a T2 / FLAIR alongside (or after) the primary
 Storing the alignment as a resampled volume rather than a transform is what keeps
 this additive: the stored file has the primary's shape and affine, so the ordinary
 slice renderer serves it with identical slice indices and plane geometry, and the
-structure overlay and electrode contacts need no adjustment. Replacing the primary
+structure overlay and electrode contacts need no adjustment. It is also what makes
+the side-by-side panes cheap — one slice index means the same anatomy in every
+pane, so synchronising them is just passing that index around. Replacing the primary
 MRI re-registers every secondary automatically (the original uploads are kept for
 this). Secondaries are excluded from parcellation, mesh extraction, CT
 coregistration and MNI export by design.

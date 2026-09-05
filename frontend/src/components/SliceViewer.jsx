@@ -29,22 +29,36 @@ function getStructureMeshes(structuresData) {
   return _structMeshes;
 }
 
-export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = false, onSliceChange, locator }) {
-  const { reconstruction, meshData, structuresData, structureVisible, activeScanId } = useAppStore();
+export default function SliceViewer({
+  reconId, axis = 'axial', isThumbnail = false, onSliceChange, locator,
+  // Which volume to draw: null for the primary MRI, otherwise a secondary
+  // scan's id. A prop rather than store state because several of these are
+  // mounted at once, one per pane, when scans are compared side by side.
+  scanId = null,
+  // Slice index to follow, so sibling panes stay on the same anatomy. Every
+  // layer shares the primary's grid, so one index means one slice everywhere.
+  syncSliceIdx = null,
+  // Shown in the corner when more than one pane is up, to say which is which.
+  layerLabel = null,
+}) {
+  const { reconstruction, meshData, structuresData, structureVisible } = useAppStore();
   const canvasRef = useRef(null);
 
-  // Which volume the greyscale underneath comes from: the primary MRI, or one of
-  // the reconstruction's secondary scans. Secondaries are stored resampled into
-  // the primary's grid, so this changes the pixels and nothing else -- slice
-  // indices, plane geometry, the structure overlay and the contact positions are
-  // all identical either way.
+  // Secondaries are stored resampled into the primary's grid, so this changes
+  // the pixels and nothing else -- slice indices, plane geometry, the structure
+  // overlay and the contact positions are all identical either way.
   //
   // Held in a ref as well as a value because doFetch MUST keep a stable identity:
   // processQueue closes over it once (deps []) and is what drains the prefetch
   // queue, so a doFetch that changed with the layer would leave prefetches
   // calling the original one forever -- fetching primary slices into the
   // secondary's cache, and quietly showing T1 pixels under a "T2" label.
-  const scanParam = activeScanId ? `&scan_id=${activeScanId}` : '';
+  const scanParam = scanId ? `&scan_id=${scanId}` : '';
+
+  // The shared position, readable from the mount effect without joining its
+  // deps -- that effect must run once per reconId/axis, not on every scroll.
+  const syncIdxRef = useRef(syncSliceIdx);
+  syncIdxRef.current = syncSliceIdx;
   const scanParamRef = useRef(scanParam);
   scanParamRef.current = scanParam;
 
@@ -459,7 +473,11 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     }).catch(() => {});
 
-    doFetch(-1, (entry, actual) => {
+    // -1 asks the backend for the middle slice. But a pane added to a
+    // comparison already in progress must open where its siblings are: it
+    // reports its landing index back to them, so opening on the middle would
+    // drag every other pane there.
+    doFetch(syncIdxRef.current ?? -1, (entry, actual) => {
       sliceIdxRef.current = actual;
       currentEntryRef.current = entry;
       setSliceLabel({ idx: actual, count: sliceCountRef.current });
@@ -471,6 +489,13 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
         queueRef.current.push(actual - i);
       }
       processQueue();
+      // Structures can already be loaded when this pane mounts -- adding a pane
+      // to a running comparison does exactly that. The overlay effect below has
+      // then already fired, but it fired before this fetch resolved, so it asked
+      // for slice 0 rather than the slice we actually landed on. Ask again now
+      // that the index is known, or the pane draws bare greyscale next to
+      // siblings that have the parcellation on them.
+      if (useAppStore.getState().structuresData) fetchOverlay(actual);
     });
   }, [reconId, axis]); // eslint-disable-line
 
@@ -484,10 +509,10 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
   // second run, so the effect would fire with nothing having changed and pin the
   // viewer to whatever slice index existed before the initial fetch resolved
   // (slice 0). Comparing values makes a re-run with the same layer a no-op.
-  const prevScanRef = useRef(activeScanId);
+  const prevScanRef = useRef(scanId);
   useEffect(() => {
-    if (prevScanRef.current === activeScanId) return;
-    prevScanRef.current = activeScanId;
+    if (prevScanRef.current === scanId) return;
+    prevScanRef.current = scanId;
     layerGenRef.current += 1;
     cacheRef.current.clear();
     inFlightRef.current.clear();
@@ -517,7 +542,23 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
       }
       processQueue();
     });
-  }, [activeScanId]); // eslint-disable-line
+  }, [scanId]); // eslint-disable-line
+
+  // Follow the shared slice position when panes are shown side by side. The
+  // pane the user actually scrolled is already there, so its own echo is a
+  // no-op; the others catch up. goToSlice is deliberately out of the deps: it
+  // is rebuilt on every render (onSliceChange is an inline arrow upstream), and
+  // re-running this effect that often would fight an in-flight scroll.
+  useEffect(() => {
+    if (syncSliceIdx == null) return;
+    // Before the first slice lands, sliceCountRef is still 1 and goToSlice would
+    // clamp any index to 0 -- and then report that 0 back, dragging every other
+    // pane to the bottom of the volume. Until the count is known, the mount
+    // fetch above is already aiming at the right slice.
+    if (sliceCountRef.current <= 1) return;
+    if (syncSliceIdx === sliceIdxRef.current) return;
+    goToSlice(syncSliceIdx);
+  }, [syncSliceIdx]); // eslint-disable-line
 
   const handleWheel = useCallback((e) => {
     if (isThumbnail) return;
@@ -620,6 +661,17 @@ export default function SliceViewer({ reconId, axis = 'axial', isThumbnail = fal
       {status === 'ok' && !isThumbnail && (
         <div style={{ position: 'absolute', bottom: 8, right: 8, fontSize: 10, color: '#2a3340', fontFamily: 'IBM Plex Mono, monospace' }}>
           scroll · {sliceLabel.idx + 1} / {sliceLabel.count}
+        </div>
+      )}
+      {!isThumbnail && layerLabel && (
+        <div style={{
+          position: 'absolute', top: 6, right: 24,
+          fontSize: 10, fontWeight: 600, letterSpacing: '0.06em',
+          fontFamily: 'IBM Plex Mono, monospace', color: '#00d4ff',
+          background: 'rgba(10,12,16,0.82)', border: '1px solid #00d4ff44',
+          borderRadius: 3, padding: '2px 7px', pointerEvents: 'none',
+        }}>
+          {layerLabel}
         </div>
       )}
       {!isThumbnail && hoveredContact && (
