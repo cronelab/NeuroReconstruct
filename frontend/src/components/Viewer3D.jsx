@@ -168,7 +168,8 @@ function StructureMesh({ meshData, color, structKey, structLabel, opacity = 0.45
       onPointerOver={interactive && visible ? (e) => { e.stopPropagation(); onHover?.(structKey, color, structLabel, meshRef.current); } : undefined}
       onPointerOut={interactive && visible ? (e) => { e.stopPropagation(); onUnhover?.(); } : undefined}
     >
-      <meshPhongMaterial color={color} transparent opacity={opacity} side={THREE.DoubleSide} depthWrite={false} />
+      <meshPhongMaterial color={color} transparent={opacity < 1} opacity={opacity}
+        side={THREE.DoubleSide} depthWrite={opacity >= 1} />
     </mesh>
   );
 }
