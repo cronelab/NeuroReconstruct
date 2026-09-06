@@ -1,6 +1,7 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useMemo } from 'react';
 import SliceViewer from './SliceViewer';
 import FusionSliceViewer from './FusionSliceViewer';
+import ScanLayerBar from './ScanLayerBar';
 import { useAppStore } from '../store';
 import { uploadReconstructionFiles, confirmRegistration, preciseReregister, selectRegistrationCandidate, getReconstruction } from '../api';
 
@@ -20,9 +21,22 @@ const AXIS_COLORS = {
   fusion:   '#ffab40',
 };
 
-export default function MultiViewLayout({ reconId, viewer3D }) {
+export default function MultiViewLayout({ reconId, viewer3D, shareToken }) {
   const [activeView, setActiveView] = useState('3d');
-  const { reconstruction, setReconstruction } = useAppStore();
+  const { reconstruction, setReconstruction, secondaryScans, visibleLayers } = useAppStore();
+
+  // The panes to draw, left to right. Order is fixed here rather than by the
+  // order the user ticked things on, so toggling a layer off and back on does
+  // not shuffle the panes beside it. Only ready scans can be shown -- one still
+  // registering has no resampled volume to render.
+  const layers = useMemo(() => {
+    const all = [
+      { key: 'primary', scanId: null, label: 'Primary' },
+      ...secondaryScans.filter(sc => sc.ready).map(sc => ({ key: sc.id, scanId: sc.id, label: sc.label })),
+    ];
+    const shown = all.filter(l => visibleLayers.includes(l.key));
+    return shown.length ? shown : [all[0]];
+  }, [secondaryScans, visibleLayers]);
   const [confirmBusy, setConfirmBusy] = useState(false);
   const [reRegBusy, setReRegBusy] = useState(false);
   const [reRegError, setReRegError] = useState('');
@@ -132,11 +146,15 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
     coronal:  { idx: 0, count: 1 },
   });
 
+  // Returning `prev` unchanged makes React bail out of the re-render. That
+  // matters now that several panes report the same position back on every
+  // scroll tick: without it each echo would re-render the whole layout.
   const handleSliceChange = useCallback((axis, idx, count) => {
-    setSlicePositions(prev => ({
-      ...prev,
-      [axis]: { idx, count },
-    }));
+    setSlicePositions(prev => (
+      prev[axis].idx === idx && prev[axis].count === count
+        ? prev
+        : { ...prev, [axis]: { idx, count } }
+    ));
   }, []);
 
   // Locator config for each axis:
@@ -215,7 +233,7 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
                     {view.icon}
                   </div>
                 ) : (
-                  <SliceViewer reconId={reconId} axis={view.id} isThumbnail />
+                  <SliceViewer reconId={reconId} axis={view.id} isThumbnail scanId={layers[0].scanId} />
                 )}
                 {view.id === 'fusion' && !regConfirmed && (
                   <div style={{ position: 'absolute', top: 3, right: 3, width: 8, height: 8, borderRadius: '50%', background: '#ffab40', boxShadow: '0 0 4px #ffab40' }} title="Registration not yet reviewed" />
@@ -330,6 +348,15 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
           </div>
         )}
 
+        <div style={{
+          position: 'absolute', inset: 0,
+          display: ['sagittal', 'axial', 'coronal'].includes(activeView) ? 'flex' : 'none',
+          flexDirection: 'column',
+        }}>
+          {reconstruction?.has_mri !== false && (
+            <ScanLayerBar reconId={reconId} shareToken={shareToken} />
+          )}
+          <div style={{ flex: 1, position: 'relative', minWidth: 0, minHeight: 0 }}>
         {['sagittal', 'axial', 'coronal'].map(ax => (
           <div key={ax} style={{ position: 'absolute', inset: 0, display: activeView === ax ? 'block' : 'none' }}>
             {reconstruction?.has_mri === false ? (
@@ -368,15 +395,38 @@ export default function MultiViewLayout({ reconId, viewer3D }) {
                 )}
               </div>
             ) : (
-              <SliceViewer
-                reconId={reconId}
-                axis={ax}
-                onSliceChange={(idx, count) => handleSliceChange(ax, idx, count)}
-                locator={locators[ax]}
-              />
+              /* One pane per selected scan, sharing a slice index. Every layer
+                 sits on the primary's grid, so the same index is the same
+                 anatomy in each -- which is what makes the comparison honest,
+                 and what lets one structure overlay serve all of them. */
+              <div style={{ width: '100%', height: '100%', display: 'flex', minWidth: 0 }}>
+                {layers.map((layer, i) => (
+                  <div
+                    key={layer.key}
+                    style={{
+                      flex: 1, minWidth: 0, height: '100%', position: 'relative',
+                      borderLeft: i > 0 ? '1px solid #1e2530' : 'none',
+                    }}
+                  >
+                    <SliceViewer
+                      reconId={reconId}
+                      axis={ax}
+                      scanId={layer.scanId}
+                      layerLabel={layers.length > 1 ? layer.label : null}
+                      syncSliceIdx={slicePositions[ax].count > 1 ? slicePositions[ax].idx : null}
+                      onSliceChange={(idx, count) => handleSliceChange(ax, idx, count)}
+                      /* The locator is a position readout, not per-layer, so it
+                         goes on the leftmost pane only rather than N times. */
+                      locator={i === 0 ? locators[ax] : undefined}
+                    />
+                  </div>
+                ))}
+              </div>
             )}
           </div>
         ))}
+          </div>
+        </div>
       </div>
 
     </div>

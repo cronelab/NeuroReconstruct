@@ -159,7 +159,9 @@ kept, capped at 512 MB total. Override with `NEURO_CT_CACHE_MAX_FILES` and
 ## Workflow
 
 1. Log in and click **New Reconstruction**
-2. Upload a de-identified T1 MRI (`.nii` or `.nii.gz`) and post-implant CT
+2. Upload a de-identified T1 MRI (`.nii` or `.nii.gz`) and post-implant CT.
+   Optionally add **secondary MRIs** (T2, FLAIR, PD) — extra base layers for the
+   2D slice viewer only; the T1 stays the single input to everything else
 3. Brain mesh and CT-to-MRI co-registration run automatically in the background (~2–5 min)
 4. Open the reconstruction → CT artifact mesh appears in the 3D viewer
 5. Create an electrode shaft (name, type, number of contacts, spacing)
@@ -167,6 +169,13 @@ kept, capped at 512 MB total. Override with `NEURO_CT_CACHE_MAX_FILES` and
 7. Place 2+ contacts → use **Autofill** to interpolate the remaining contacts via spline fit
 8. Load brain substructures to visualize hippocampus, amygdala, thalamus, etc.
 9. Mark as Complete → switches to MRI view with electrode overlay
+
+In the slice views, the **SHOW** bar picks which scans are drawn, as panes side
+by side — primary, any secondary, or several at once. The panes scroll together
+and share one structure overlay and one set of contacts, because every layer sits
+on the primary's grid. Seeing them together is also the alignment check: anatomy
+that does not line up across the panes means that secondary's registration is
+off. At least one pane always stays on.
 
 ---
 
@@ -187,7 +196,7 @@ kept, capped at 512 MB total. Override with `NEURO_CT_CACHE_MAX_FILES` and
 | File | Purpose |
 |---|---|
 | `mesh_extractor.py` | Extracts brain surface mesh from T1 MRI NIfTI. Uses **antspynet** for deep-learning skull stripping when available; falls back to morphological thresholding (erosion r=8mm, Gaussian σ=0.5, parenchyma refinement). Mesh produced via marching cubes, returned as vertices/faces in world RAS coords centered at origin. |
-| `registration.py` | CT-to-MRI rigid registration via **SimpleITK**. Mattes mutual information optimizer, REGULAR (deterministic) sampling, 4-resolution pyramid, GEOMETRY centroid initialization. Saves result as `ct_to_mri.npy` (4×4 affine matrix). Single-threaded for reproducibility. |
+| `registration.py` | CT-to-MRI rigid registration via **SimpleITK**. Mattes mutual information optimizer, REGULAR (deterministic) sampling, 4-resolution pyramid, GEOMETRY centroid initialization. Saves result as `ct_to_mri.npy` (4×4 affine matrix). Single-threaded for reproducibility. Also holds `register_secondary_to_primary`, which uses a **separate** MRI→MRI configuration (`_make_mri_registration_method`: 50 bins, RANDOM sampling, relaxing step size, 3-level pyramid, intensity-normalized inputs) — the CT settings do not transfer to same-modality data and drift several mm on it. |
 | `structure_extractor.py` | Patient-specific brain structure segmentation via **antspynet**. Segments hippocampus, amygdala, thalamus, putamen, caudate, pallidum, and cortical parcellation. Results cached as `structures.json` + `structures_cortical.nii.gz`. Falls back to borrowing cached structures from any other reconstruction if antspynet is unavailable. |
 | `ct_electrode_extractor.py` | CT mesh generation (HU threshold + marching cubes). `snap_to_blob_centroid()` snaps a clicked world position to the nearest bright CT blob centroid within 8mm. |
 | `electrode_service.py` | Autofill: cubic spline fit parameterized by contact number. Interpolates between placed contacts, linear extrapolation beyond the manual range. Blob-snap applied to interpolated contacts only. |
@@ -233,10 +242,11 @@ normalization (`mni_registration.py`) and contact-to-structure labeling
 | `ReconstructionList.jsx` | Home page. Two-column layout: In Progress (left) and Completed (right). Shows shaft/contact counts. Upload form for MRI+CT. Polls status every 10s. |
 | `Header.jsx` | Top bar. Logo → home. Mark Complete / Unlock toggle. Edit button (disabled when locked). |
 | `ReconstructionViewer.jsx` | Main viewer shell. Owns CT mesh loading, MRI visibility toggle, CT threshold slider with 400ms debounce, undo stack, lock/complete state. Wraps content in MultiViewLayout. Draggable right-panel resizer. Auto-enters edit mode for in-progress reconstructions. |
-| `MultiViewLayout.jsx` | Four-panel layout: column of view-selector buttons (3D + sagittal / axial / coronal) on left, main view area on right. Manages shared `slicePositions` for cross-view locator lines. |
+| `MultiViewLayout.jsx` | Four-panel layout: column of view-selector buttons (3D + sagittal / axial / coronal) on left, main view area on right. Manages shared `slicePositions`, which drive both the cross-view locator lines and the slice synchronisation between side-by-side scan panes. Lays those panes out primary-first, then in scan order, so toggling one does not shuffle the rest. |
 | `Viewer3D.jsx` | Three.js canvas. Renders brain mesh, CT artifact mesh, electrode shafts / contacts / lines. OrbitControls (rotate / pan / zoom). Renders structure meshes when loaded. |
 | `CTArtifactMesh.jsx` | Renders CT threshold mesh as white semi-transparent surface. Handles click-to-place contacts (only when `activeContactNumber != null`). |
-| `SliceViewer.jsx` | MRI slice viewer for sagittal / axial / coronal planes. Client-side cache + prefetch (10 ahead, 4 behind, 6 concurrent requests). Scroll wheel + scrollbar navigation. Depth-filtered electrode dot projection (±4mm). LocatorOverlay corner thumbnail. |
+| `SliceViewer.jsx` | One slice pane. Client-side cache + prefetch (10 ahead, 4 behind, 6 concurrent requests). Scroll wheel + scrollbar navigation. Depth-filtered electrode dot projection (±4mm). LocatorOverlay corner thumbnail. Draws the scan given by its `scanId` prop, and follows `syncSliceIdx` so sibling panes stay on the same slice. |
+| `ScanLayerBar.jsx` | The **SHOW** bar above the slice views: selects which scans are drawn as side-by-side panes (multiple; at least one always on), and (for editors) adds or removes secondaries. Polls while a scan is still registering. |
 | `ElectrodeEditor.jsx` | Right panel in edit mode. CT threshold slider, MRI toggle/opacity, shaft list (draggable divider between shaft list and contact grid), contact selector grid, autofill bar. Contains ColorPicker (50 named colors) and ContactSelector sub-components. |
 | `SeegViewer.jsx` | sEEG functional-mapping view. Control panel (recording upload/select, band, mapping mode, **trial alignment + display window + baseline**, color scale, brain/structure opacity, coverage), the 3D brain, and the trace panel. Holds a client-side LRU cache of computed results so switching band/alignment/baseline/window back to a viewed setting loads instantly. |
 | `SeegViewer3D.jsx` | Three.js canvas for the mapping view: native brain surface + contacts colored by the current-frame activation value (diverging z-score colormap), with structure overlays and hover tooltips. |
@@ -255,6 +265,24 @@ User uploads MRI + CT
   → Background task 3: CT preprocessing (HU masking) → ct_masked.nii.gz
   → status set to "ready"
 ```
+
+### Secondary MRI scans (slice-viewer base layers)
+```
+User uploads a T2 / FLAIR alongside (or after) the primary
+  → saved to data/recon_<hash>/secondary/<uid>.nii.gz
+  → background: rigid MRI→MRI registration to the primary, then resampled
+    INTO THE PRIMARY'S VOXEL GRID → <uid>_in_primary.nii.gz
+  → scan status "ready"; GET /mri-slice?scan_id=<id> renders it
+```
+Storing the alignment as a resampled volume rather than a transform is what keeps
+this additive: the stored file has the primary's shape and affine, so the ordinary
+slice renderer serves it with identical slice indices and plane geometry, and the
+structure overlay and electrode contacts need no adjustment. It is also what makes
+the side-by-side panes cheap — one slice index means the same anatomy in every
+pane, so synchronising them is just passing that index around. Replacing the primary
+MRI re-registers every secondary automatically (the original uploads are kept for
+this). Secondaries are excluded from parcellation, mesh extraction, CT
+coregistration and MNI export by design.
 
 ### Electrode Placement
 ```
@@ -363,7 +391,14 @@ electrode_shafts:   id, reconstruction_id, name, label,
 
 electrode_contacts: id, shaft_id, contact_number, x, y, z,
                     x_mm, y_mm, z_mm, is_manual
+
+secondary_scans:    id, reconstruction_id, label, modality, filename,
+                    stored_path, resampled_path, status, error, created_at
 ```
+
+> `secondary_scans.resampled_path` is the file the viewer renders — the upload
+> resampled into the primary's grid. `stored_path` is the original, kept so the
+> scan can be re-registered if the primary MRI is ever replaced.
 
 > Contacts with `x_mm = NULL` are unplaced placeholders. Always filter `c.x_mm != null` before using coordinates.
 

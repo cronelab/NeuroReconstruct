@@ -53,7 +53,8 @@ function StructureMesh({ meshData, color, opacity }) {
   if (!geo) return null;
   return (
     <mesh geometry={geo}>
-      <meshPhongMaterial color={color} transparent opacity={opacity} side={THREE.DoubleSide} depthWrite={false} />
+      <meshPhongMaterial color={color} transparent={opacity < 1} opacity={opacity}
+        side={THREE.DoubleSide} depthWrite={opacity >= 1} />
     </mesh>
   );
 }

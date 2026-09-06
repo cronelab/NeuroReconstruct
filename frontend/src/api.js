@@ -110,6 +110,27 @@ export const uploadReconstructionFiles = (reconId, formData) =>
     timeout: 600000,
   });
 
+// ── Secondary MRI scans (extra slice-viewer base layers) ────────────────────────
+// A secondary (T2, FLAIR, ...) is registered to the primary MRI and stored
+// resampled into its grid, so the slice viewer renders it through the ordinary
+// /mri-slice route with a scan_id. Nothing else in the pipeline sees it.
+export const listSecondaryScans = (reconId, token) =>
+  api.get(`/reconstructions/${reconId}/secondary-scans${token ? `?token=${token}` : ''}`);
+
+export const uploadSecondaryScan = (reconId, file, { label, modality } = {}) => {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('label', label || '');
+  form.append('modality', modality || 't2');
+  return api.post(`/reconstructions/${reconId}/secondary-scans`, form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 600000,
+  });
+};
+
+export const deleteSecondaryScan = (reconId, scanId) =>
+  api.delete(`/reconstructions/${reconId}/secondary-scans/${scanId}`);
+
 // ── sEEG functional mapping ─────────────────────────────────────────────────────
 export const uploadSeeg = (reconId, file) => {
   const form = new FormData();

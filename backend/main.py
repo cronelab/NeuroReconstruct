@@ -23,7 +23,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from pydantic import BaseModel
 
-from database import init_db, get_db, AsyncSessionLocal, engine, IS_SQLITE, User, Reconstruction, ElectrodeShaft, ElectrodeContact, SeegRecording
+from database import (init_db, get_db, AsyncSessionLocal, engine, IS_SQLITE, User,
+                      Reconstruction, ElectrodeShaft, ElectrodeContact, SeegRecording,
+                      SecondaryScan)
 from auth import (
     verify_password, hash_password, create_access_token,
     get_current_user, require_editor, require_admin
@@ -35,7 +37,7 @@ import numpy as np
 from PIL import Image
 from fastapi.responses import Response as FastAPIResponse
 
-# ── In-memory NIfTI slice cache ─────────────────────────────────────────────
+# â”€â”€ In-memory NIfTI slice cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #
 # These caches used to be plain dicts that only ever grew. Keyed by file path
 # they are shared across users, so ten people looking at one scan cost what one
@@ -83,6 +85,10 @@ class _VolumeCache:
         self._items.move_to_end(key)
         _evict_across_caches()
         return entry
+
+    def pop(self, key, default=None):
+        """Drop one cached volume -- used when its file on disk is replaced."""
+        return self._items.pop(key, default)
 
     def clear(self):
         n, mb = len(self._items), self.total_bytes() / 2**20
@@ -162,7 +168,7 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
     inv_affine, vol_shape, px_w_mm, px_h_mm, plane_normal, plane_offset), cached.
     px_w_mm/px_h_mm are the physical mm-per-pixel along the displayed width/height,
     for aspect-correct rendering of anisotropic voxels. plane_normal/plane_offset
-    define the slice plane exactly — see the comment on their computation below."""
+    define the slice plane exactly â€” see the comment on their computation below."""
     vol = _get_mri_volume(mri_path)
     data = vol["data"]
     affine = vol["affine"]
@@ -193,25 +199,25 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
     voxel_size_mm = float(voxel_sizes[ax])
     inv_affine = np.linalg.inv(affine)
 
-    # ── Slice plane geometry in world RAS ─────────────────────────────────────
+    # â”€â”€ Slice plane geometry in world RAS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # A constant-voxel-index plane is perpendicular to a world axis only when the
     # affine is axis-aligned. Oblique acquisitions (AC-PC tilt and friends) are
-    # rotated, so "the world coordinate of this slice" is not one number — it
+    # rotated, so "the world coordinate of this slice" is not one number â€” it
     # varies across the plane. On this project's own data a constant-index axial
     # plane sweeps ~18 mm of world z, i.e. ~31 slices. Hence two values:
     #
-    #   world_coord  — the value at the CENTRE of the plane. A representative
+    #   world_coord  â€” the value at the CENTRE of the plane. A representative
     #                  figure for labels and readouts, and identical to the old
     #                  corner-voxel formula whenever the affine is axis-aligned.
     #
-    #   plane_normal / plane_offset — the plane itself, as  normal · P = offset
-    #                  with |normal| == 1. So |normal · P - offset| is the exact
+    #   plane_normal / plane_offset â€” the plane itself, as  normal Â· P = offset
+    #                  with |normal| == 1. So |normal Â· P - offset| is the exact
     #                  perpendicular distance in mm from any world point P to
     #                  this slice, for any affine.
     #
     # To test whether a point lies on this slice, use plane_normal/plane_offset.
     # Never compare a point's world x/y/z against world_coord.
-    row = inv_affine[ax, :3]                  # ∇(voxel index `ax`) w.r.t. world
+    row = inv_affine[ax, :3]                  # âˆ‡(voxel index `ax`) w.r.t. world
     row_norm = float(np.linalg.norm(row))
     plane_normal = (row / row_norm).tolist()
     plane_offset = float((slice_idx - inv_affine[ax, 3]) / row_norm)
@@ -238,8 +244,8 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
 from services.electrode_service import autofill_contacts
 from services.ct_electrode_extractor import build_threshold_mesh, snap_to_blob_centroid, _resolve_ct_path, compute_ct_histogram
 
-# ── Fusion (CT-in-MRI-space) slice cache ──────────────────────────────────────
-# Fixed bone/metal window for the registration-QA fusion view — this is for
+# â”€â”€ Fusion (CT-in-MRI-space) slice cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Fixed bone/metal window for the registration-QA fusion view â€” this is for
 # visually checking alignment (skull outline, ventricles), not diagnostic
 # reading, so a fixed window is simpler and more consistent across patients
 # than a per-volume percentile (which metal artifacts would skew).
@@ -268,7 +274,7 @@ def _render_fusion_slice(mri_path: str, ct_path: str, transform: np.ndarray, axi
     Resample the CT onto the exact MRI slice plane at (axis, slice_idx) and render
     as a grayscale PNG that is pixel-for-pixel aligned with /mri-slice's output.
 
-    Unlike the structure overlay (which picks the nearest same-axis slice — a valid
+    Unlike the structure overlay (which picks the nearest same-axis slice â€” a valid
     shortcut only because DKT labels share the MRI's own axes), the CT is related to
     the MRI by an arbitrary rigid rotation, so an MRI slice plane generally maps to
     an OBLIQUE plane through the CT volume. This does true 3D trilinear resampling
@@ -331,7 +337,7 @@ def _render_fusion_slice(mri_path: str, ct_path: str, transform: np.ndarray, axi
     return result
 
 
-# ── Structure overlay slice cache ─────────────────────────────────────────────
+# â”€â”€ Structure overlay slice cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _struct_overlay_cache = _VolumeCache("labels")  # label_path -> {"data", "affine"}
 
 def _get_label_volume(label_path: str):
@@ -362,7 +368,7 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
 
     from services.structure_extractor import ALL_STRUCTURES
 
-    # Build label index → RGBA lookup filtered by visibility
+    # Build label index â†’ RGBA lookup filtered by visibility
     label_rgba: dict[int, tuple] = {}
     for key, info in ALL_STRUCTURES.items():
         if visible_keys is not None and key not in visible_keys:
@@ -370,13 +376,13 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
         h = info["color"].lstrip("#")
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         for lbl in info["labels"]:
-            label_rgba[lbl] = (r, g, b, 180)  # 180/255 ≈ 70% opacity in the overlay layer
+            label_rgba[lbl] = (r, g, b, 180)  # 180/255 â‰ˆ 70% opacity in the overlay layer
 
     vol = _get_label_volume(label_path)
     ldata  = vol["data"]
     laff   = vol["affine"]
 
-    # Map axis name → array axis index
+    # Map axis name â†’ array axis index
     ax = {"sagittal": 0, "coronal": 1, "axial": 2}[axis]
 
     # Get MRI slice world coordinate for alignment
@@ -388,7 +394,7 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
         slice_idx = n_mri // 2
 
     # Find the DKT voxel index matching this MRI slice. Go through world space with
-    # the full affines rather than each volume's [ax, ax] diagonal term — the
+    # the full affines rather than each volume's [ax, ax] diagonal term â€” the
     # diagonal shortcut silently assumes both grids are axis-aligned, which oblique
     # acquisitions are not. In practice the DKT labels are resampled onto the MRI's
     # own grid, so this resolves to dkt_idx == slice_idx; doing it properly just
@@ -430,7 +436,7 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
     pil.save(buf, format="PNG", optimize=False, compress_level=1)
     return buf.getvalue()
 
-# ─── App Setup ───────────────────────────────────────────────────────────────
+# â”€â”€â”€ App Setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 app = FastAPI(title="Brain Reconstruction Viewer", version="0.1.0")
 
@@ -447,7 +453,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Path helper: works in both normal dev mode and PyInstaller frozen mode ────
+# â”€â”€ Path helper: works in both normal dev mode and PyInstaller frozen mode â”€â”€â”€â”€
 def _get_runtime_dir():
     """Returns the directory next to the .exe (frozen) or next to main.py (dev)."""
     if getattr(sys, 'frozen', False):
@@ -590,7 +596,7 @@ async def startup():
             print("[STARTUP] Created default admin user.")
 
 
-# ─── Pydantic Schemas ─────────────────────────────────────────────────────────
+# â”€â”€â”€ Pydantic Schemas â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -658,7 +664,7 @@ class AutofillRequest(BaseModel):
     hu_threshold: Optional[float] = None  # if set, snap autofilled contacts to CT blobs
 
 
-# ─── Auth Routes ──────────────────────────────────────────────────────────────
+# â”€â”€â”€ Auth Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(form: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
@@ -688,7 +694,7 @@ async def me(current_user: User = Depends(get_current_user)):
     return {"username": current_user.username, "role": current_user.role}
 
 
-# ─── Reconstruction Routes ────────────────────────────────────────────────────
+# â”€â”€â”€ Reconstruction Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.get("/api/reconstructions")
 async def list_reconstructions(
@@ -779,11 +785,22 @@ async def create_reconstruction(
     mri_modality: str = Form("t1"),
     ct_file: Optional[UploadFile] = File(None),
     ct_preregistered: bool = Form(False),
+    # Optional extra MRIs (T2, FLAIR, ...) for the slice viewer only. Positional:
+    # the nth label/modality describes the nth file.
+    secondary_files: List[UploadFile] = File([]),
+    secondary_labels: List[str] = Form([]),
+    secondary_modalities: List[str] = Form([]),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upload NIfTI files and kick off mesh extraction in background."""
+    """Upload NIfTI files and kick off mesh extraction in background.
+
+    mri_file is the PRIMARY scan and the only one the pipeline reads. Any
+    secondary_files are registered to it afterwards, purely as slice-viewer base
+    layers -- they are queued behind the pipeline on HEAVY_JOB_LOCK rather than
+    competing with the parcellation for memory.
+    """
     mri_modality = mri_modality.lower()
     if mri_modality not in ("t1", "t2"):
         raise HTTPException(status_code=400, detail="mri_modality must be 't1' or 't2'")
@@ -814,8 +831,23 @@ async def create_reconstruction(
     await db.commit()
     await db.refresh(recon)
 
+    secondary_ids = []
+    for i, upload in enumerate(secondary_files or []):
+        if not upload or not upload.filename:
+            continue  # an empty file input still arrives as a part
+        scan = await _create_secondary_scan(
+            db, recon.id, recon_dir, upload,
+            secondary_labels[i] if i < len(secondary_labels) else "",
+            secondary_modalities[i] if i < len(secondary_modalities) else "t2",
+        )
+        await db.commit()
+        await db.refresh(scan)
+        secondary_ids.append(scan.id)
+
     # Run mesh extraction in background
     background_tasks.add_task(_extract_mesh_background, recon.id, mri_path, recon_dir, ct_path, ct_preregistered, mri_modality)
+    for scan_id in secondary_ids:
+        background_tasks.add_task(_register_secondary_background, scan_id)
 
     return recon
 
@@ -851,12 +883,35 @@ async def upload_reconstruction_files(
     mri_path = _abs(recon.mri_path) if recon.mri_path else None
     ct_path  = _abs(recon.ct_path)  if recon.ct_path  else None
 
+    stale_secondary_ids = []
     if mri_file:
         mri_path = os.path.join(recon_dir, "mri.nii.gz")
         with open(mri_path, "wb") as f:
             f.write(await mri_file.read())
         # Invalidate MRI volume cache so new file is loaded
         _mri_volume_cache.pop(mri_path, None)
+
+        # Every secondary is stored resampled into the grid of the MRI it was
+        # registered against. A replacement generally has a different shape, so
+        # those copies are not merely misaligned -- their slice count no longer
+        # matches, and the viewer would ask for indices that do not exist. Send
+        # them back through registration against the new primary; each one's
+        # original upload was kept for exactly this.
+        stale = (await db.execute(
+            select(SecondaryScan).where(SecondaryScan.reconstruction_id == recon_id)
+        )).scalars().all()
+        for scan in stale:
+            if scan.resampled_path:
+                _mri_volume_cache.pop(_abs(scan.resampled_path), None)
+            stale_secondary_ids.append(scan.id)
+        if stale_secondary_ids:
+            await db.execute(
+                update(SecondaryScan)
+                .where(SecondaryScan.id.in_(stale_secondary_ids))
+                .values(status="pending", resampled_path=None, error=None)
+            )
+            print(f"[SEC REG] primary MRI replaced -- re-registering "
+                  f"{len(stale_secondary_ids)} secondary scan(s)")
 
     if ct_file:
         ct_path = os.path.join(recon_dir, "ct.nii.gz")
@@ -877,11 +932,13 @@ async def upload_reconstruction_files(
 
     if mri_path:
         background_tasks.add_task(_extract_mesh_background, recon_id, mri_path, recon_dir, ct_path, ct_preregistered, mri_modality)
+    for scan_id in stale_secondary_ids:
+        background_tasks.add_task(_register_secondary_background, scan_id)
 
     return {"status": "processing"}
 
 
-# ── Registration mode metadata (sidecar next to ct_to_mri.npy) ──────────────────
+# â”€â”€ Registration mode metadata (sidecar next to ct_to_mri.npy) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # We record whether the stored transform came from the fast multithreaded path or
 # the deterministic single-threaded path. A JSON sidecar avoids a DB migration
 # (the app uses SQLAlchemy create_all, no Alembic) and travels with the transform.
@@ -904,7 +961,7 @@ def _write_reg_meta(ct_abs: str, threads: int, deterministic: bool) -> None:
 
 
 def _read_reg_deterministic(ct_abs: Optional[str]) -> bool:
-    """True if the stored transform is deterministic (or unknown/legacy → assume
+    """True if the stored transform is deterministic (or unknown/legacy â†’ assume
     deterministic, since the historical default was single-threaded)."""
     if not ct_abs:
         return True
@@ -920,9 +977,9 @@ def _read_reg_deterministic(ct_abs: Optional[str]) -> bool:
 
 async def _run_registration(recon_id: int, mri_path: str, ct_abs: str,
                             ct_preregistered: bool, threads: int):
-    """Register CT→MRI for a recon, write the mode sidecar, and (re)generate the
+    """Register CTâ†’MRI for a recon, write the mode sidecar, and (re)generate the
     masked CT. Shared by the initial pipeline (fast, multithreaded) and the
-    deterministic re-run endpoint (threads=1). Manages the 'registering'→'ready'
+    deterministic re-run endpoint (threads=1). Manages the 'registering'â†’'ready'
     status transition and resets any prior manual confirmation."""
     from database import AsyncSessionLocal
 
@@ -942,7 +999,7 @@ async def _run_registration(recon_id: int, mri_path: str, ct_abs: str,
         if ct_preregistered:
             np.save(transform_path, np.eye(4))
             _write_reg_meta(ct_abs, threads=1, deterministic=True)  # identity is trivially reproducible
-            print(f"[REG] CT pre-registered — identity transform saved for recon {recon_id}")
+            print(f"[REG] CT pre-registered â€” identity transform saved for recon {recon_id}")
         else:
             # threads passed positionally (4th arg) to avoid functools.partial
             await loop.run_in_executor(
@@ -965,7 +1022,7 @@ async def _run_registration(recon_id: int, mri_path: str, ct_abs: str,
             await db2.commit()
 
 
-# ── Multi-start "precise" registration: candidate-basin storage ─────────────────
+# â”€â”€ Multi-start "precise" registration: candidate-basin storage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # The precise re-run enumerates the distinct MI basins (no metric can rank them)
 # and stores one candidate transform per basin as sidecar files next to
 # ct_to_mri.npy, plus a candidates.json summary, for the reviewer to pick from.
@@ -1010,7 +1067,7 @@ async def _run_multistart_registration(recon_id: int, mri_path: str, ct_abs: str
     """Precise re-run: run the jittered multi-start, cluster into <=2 basins, and
     store one candidate transform per basin for human selection. If only one basin
     is found, apply it directly (like a normal registration). Never auto-picks
-    between multiple basins — the reviewer chooses in the fusion viewer."""
+    between multiple basins â€” the reviewer chooses in the fusion viewer."""
     from database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
@@ -1027,12 +1084,12 @@ async def _run_multistart_registration(recon_id: int, mri_path: str, ct_abs: str
         basins = await loop.run_in_executor(None, run_multistart, mri_path, ct_abs)
 
         if len(basins) <= 1:
-            # Single basin — apply directly, no picker needed.
+            # Single basin â€” apply directly, no picker needed.
             np.save(transform_path, basins[0]["transform"])
             _write_reg_meta(ct_abs, threads=8, deterministic=False)
             print(f"[MULTISTART] recon {recon_id}: single basin, applied directly")
         else:
-            # Multiple basins — persist candidates for the reviewer to choose.
+            # Multiple basins â€” persist candidates for the reviewer to choose.
             cdir = _candidates_dir(ct_abs)
             os.makedirs(cdir, exist_ok=True)
             summary = []
@@ -1226,6 +1283,7 @@ async def get_reconstruction(
         "registration_confirmed": getattr(recon, "registration_confirmed", False) or False,
         "export_status": getattr(recon, "export_status", "none") or "none",
         "exported_at": getattr(recon, "exported_at", None),
+        "secondary_scans": await _list_secondary_payloads(db, recon_id),
         "electrode_shafts": shafts_data,
     }
 
@@ -1293,7 +1351,7 @@ async def reregister(
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db),
 ):
-    """Re-run CT→MRI registration when a reviewer judges the fast result poor.
+    """Re-run CTâ†’MRI registration when a reviewer judges the fast result poor.
 
     mode='precise' (default): jittered multi-start, enumerate the distinct MI basins
       into up to 2 candidates for the reviewer to choose (see /registration-candidates).
@@ -1363,7 +1421,7 @@ async def select_registration_candidate(
     return {"selected": idx, "awaiting_basin_selection": False}
 
 
-# ── MNI export pipeline ─────────────────────────────────────────────────────────
+# â”€â”€ MNI export pipeline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.post("/api/reconstructions/{recon_id}/export")
 async def start_mni_export(
@@ -1373,7 +1431,7 @@ async def start_mni_export(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Kick off the MNI152 export pipeline (MRI/CT/electrodes → MNI space).
+    Kick off the MNI152 export pipeline (MRI/CT/electrodes â†’ MNI space).
     Only available once the reconstruction is marked complete. Re-runnable.
     """
     result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
@@ -1481,7 +1539,7 @@ async def download_mni_export(
         raise HTTPException(status_code=404, detail="No export available")
     export_dir = os.path.join(os.path.dirname(_abs(recon.mesh_path)), "export")
     if not os.path.isdir(export_dir):
-        raise HTTPException(status_code=404, detail="No export available — run the export first")
+        raise HTTPException(status_code=404, detail="No export available â€” run the export first")
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1500,7 +1558,7 @@ async def download_mni_export(
     )
 
 
-# ── sEEG functional mapping ─────────────────────────────────────────────────
+# â”€â”€ sEEG functional mapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Upload NeurosEEGRead h5 files and render per-electrode band activity on a
 # brain surface. Fully parallel to the reconstruction pipeline: activity comes
 # from the h5, coordinates from this reconstruction (joined to channels by name).
@@ -1771,25 +1829,294 @@ async def compute_seeg_activity(
     }
 
 
+# -- Secondary MRI scans (extra slice-viewer base layers) ----------------------
+#
+# A reconstruction has exactly one PRIMARY MRI -- Reconstruction.mri_path, normally
+# a T1 -- and that is the only scan the pipeline touches: DKT parcellation, mesh
+# extraction, CT coregistration and MNI export all read it and nothing else. A
+# SECONDARY scan (T2, FLAIR, PD) is a display layer and nothing more.
+#
+# The trick that keeps it that cheap is where the alignment is stored. Instead of
+# keeping a transform and resampling on every slice request (what the CT fusion
+# view has to do, because the CT keeps its own grid), a secondary is resampled
+# into the primary's voxel grid once, at upload. The stored volume then has the
+# primary's shape and affine, so /mri-slice renders it through the same
+# _render_slice path, with the same slice indices and the same plane geometry.
+# Structure overlays and electrode contacts therefore need no adjustment at all:
+# switching base layers changes the pixels underneath them and nothing else.
+
+_SECONDARY_MODALITIES = ("t2", "flair", "pd", "other")
+
+
+def _nifti_suffix(filename: str) -> str:
+    """Preserve .nii vs .nii.gz -- SimpleITK picks its reader by extension."""
+    return ".nii" if (filename or "").lower().endswith(".nii") else ".nii.gz"
+
+
+def _secondary_dir(recon_dir: str) -> str:
+    return os.path.join(recon_dir, "secondary")
+
+
+def _secondary_payload(scan: SecondaryScan) -> dict:
+    """API shape for one secondary scan. `ready` is what the viewer keys off."""
+    return {
+        "id": scan.id,
+        "label": scan.label,
+        "modality": scan.modality,
+        "filename": scan.filename,
+        "status": scan.status,
+        "error": scan.error,
+        "ready": scan.status == "ready" and bool(scan.resampled_path),
+        "created_at": scan.created_at,
+    }
+
+
+async def _list_secondary_payloads(db: AsyncSession, recon_id: int) -> list:
+    result = await db.execute(
+        select(SecondaryScan)
+        .where(SecondaryScan.reconstruction_id == recon_id)
+        .order_by(SecondaryScan.id)
+    )
+    return [_secondary_payload(sc) for sc in result.scalars().all()]
+
+
+async def _finish_secondary(scan_id: int, status: str, resampled_rel, error):
+    """Write a secondary scan's terminal state."""
+    from database import AsyncSessionLocal
+    async with AsyncSessionLocal() as db:
+        values = {"status": status, "error": error}
+        if resampled_rel is not None:
+            values["resampled_path"] = resampled_rel
+        await db.execute(
+            update(SecondaryScan).where(SecondaryScan.id == scan_id).values(**values)
+        )
+        await db.commit()
+
+
+async def _register_secondary_background(scan_id: int):
+    """Register one secondary MRI to its reconstruction's primary and store the
+    result resampled into the primary's grid.
+
+    Serialised on HEAVY_JOB_LOCK. The registration itself is modest, but it runs
+    in the web process, and a parcellation child peaks near 13 GB of a 15.62 GB
+    container -- the parent has to stay small for the duration, so a secondary
+    uploaded mid-pipeline waits rather than competing with it.
+    """
+    from database import AsyncSessionLocal
+    from services.worker_mem import HEAVY_JOB_LOCK
+
+    async with AsyncSessionLocal() as db:
+        scan = (await db.execute(
+            select(SecondaryScan).where(SecondaryScan.id == scan_id)
+        )).scalar_one_or_none()
+        if not scan:
+            return
+        recon = (await db.execute(
+            select(Reconstruction).where(Reconstruction.id == scan.reconstruction_id)
+        )).scalar_one_or_none()
+        primary_abs = _abs(recon.mri_path) if recon and recon.mri_path else None
+        secondary_abs = _abs(scan.stored_path)
+
+    if not primary_abs or not os.path.exists(primary_abs):
+        await _finish_secondary(scan_id, "error", None, "Primary MRI is not available")
+        return
+    if not secondary_abs or not os.path.exists(secondary_abs):
+        await _finish_secondary(scan_id, "error", None, "Uploaded file is missing on disk")
+        return
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            update(SecondaryScan).where(SecondaryScan.id == scan_id)
+            .values(status="registering", error=None)
+        )
+        await db.commit()
+
+    stem = os.path.basename(secondary_abs).split(".")[0]
+    out_abs = os.path.join(_secondary_dir(os.path.dirname(primary_abs)),
+                           f"{stem}_in_primary.nii.gz")
+    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+
+    def _run():
+        from services.registration import register_secondary_to_primary
+        with HEAVY_JOB_LOCK:
+            register_secondary_to_primary(primary_abs, secondary_abs, out_abs,
+                                          threads=min(8, os.cpu_count() or 1))
+
+    try:
+        await asyncio.get_event_loop().run_in_executor(None, _run)
+    except Exception as e:
+        print(f"[SEC REG] Registration failed for secondary scan {scan_id}: {e}")
+        await _finish_secondary(scan_id, "error", None, str(e)[:500])
+        return
+
+    # A re-registration overwrites a file that earlier renders may still be
+    # cached against; the cache is keyed by path, so it has to be told.
+    _mri_volume_cache.pop(out_abs, None)
+    await _finish_secondary(scan_id, "ready", _rel(out_abs), None)
+    print(f"[SEC REG] Secondary scan {scan_id} ready")
+
+
+async def _create_secondary_scan(db: AsyncSession, recon_id: int, recon_dir: str,
+                                 upload: UploadFile, label: str, modality: str) -> SecondaryScan:
+    """Persist one uploaded secondary scan. Does NOT start registration -- the
+    caller schedules _register_secondary_background once the row is committed."""
+    modality = (modality or "t2").lower()
+    if modality not in _SECONDARY_MODALITIES:
+        modality = "other"
+    filename = upload.filename or f"{modality}.nii.gz"
+    dest_dir = _secondary_dir(recon_dir)
+    os.makedirs(dest_dir, exist_ok=True)
+    stored_abs = os.path.join(dest_dir, f"{uuid.uuid4().hex[:8]}{_nifti_suffix(filename)}")
+    with open(stored_abs, "wb") as f:
+        f.write(await upload.read())
+
+    scan = SecondaryScan(
+        reconstruction_id=recon_id,
+        label=(label or modality.upper())[:64],
+        modality=modality,
+        filename=filename[:255],
+        stored_path=_rel(stored_abs),
+        status="pending",
+    )
+    db.add(scan)
+    return scan
+
+
+async def _resolve_slice_source(db: AsyncSession, recon: Reconstruction,
+                                scan_id: Optional[int]) -> str:
+    """Absolute path of the volume a slice request should render.
+
+    Without a scan_id this is the primary MRI. With one it is that secondary's
+    resampled copy, which shares the primary's grid -- so every caller downstream
+    is unaffected by which of the two it got.
+    """
+    primary_abs = _abs(recon.mri_path) if recon.mri_path else None
+    if not primary_abs or not os.path.exists(primary_abs):
+        raise HTTPException(status_code=404, detail="MRI not uploaded yet")
+    if not scan_id:
+        return primary_abs
+
+    scan = (await db.execute(
+        select(SecondaryScan)
+        .where(SecondaryScan.id == scan_id,
+               SecondaryScan.reconstruction_id == recon.id)
+    )).scalar_one_or_none()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Secondary scan not found")
+    if scan.status != "ready" or not scan.resampled_path:
+        raise HTTPException(status_code=409,
+                            detail=f"Secondary scan is not ready (status: {scan.status})")
+    scan_abs = _abs(scan.resampled_path)
+    if not scan_abs or not os.path.exists(scan_abs):
+        raise HTTPException(status_code=404, detail="Secondary scan file missing on disk")
+    return scan_abs
+
+
+@app.get("/api/reconstructions/{recon_id}/secondary-scans")
+async def list_secondary_scans(
+    recon_id: int,
+    token: Optional[str] = None,
+    current_user: Optional[User] = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List a reconstruction's secondary scans. Polled by the viewer while one is
+    still registering."""
+    recon = (await db.execute(
+        select(Reconstruction).where(Reconstruction.id == recon_id)
+    )).scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not current_user and recon.share_token != token:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return await _list_secondary_payloads(db, recon_id)
+
+
+@app.post("/api/reconstructions/{recon_id}/secondary-scans")
+async def upload_secondary_scan(
+    recon_id: int,
+    file: UploadFile = File(...),
+    label: str = Form(""),
+    modality: str = Form("t2"),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Add one secondary MRI and register it to the primary in the background.
+
+    Nothing about the reconstruction itself changes: no status transition, no
+    re-parcellation, and no effect on an existing CT registration or MNI export.
+    """
+    recon = (await db.execute(
+        select(Reconstruction).where(Reconstruction.id == recon_id)
+    )).scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Not found")
+    primary_abs = _abs(recon.mri_path) if recon.mri_path else None
+    if not primary_abs or not os.path.exists(primary_abs):
+        raise HTTPException(status_code=400,
+                            detail="Upload the primary MRI before adding secondary scans")
+
+    scan = await _create_secondary_scan(db, recon_id, os.path.dirname(primary_abs),
+                                        file, label, modality)
+    await db.commit()
+    await db.refresh(scan)
+    background_tasks.add_task(_register_secondary_background, scan.id)
+    return _secondary_payload(scan)
+
+
+@app.delete("/api/reconstructions/{recon_id}/secondary-scans/{scan_id}")
+async def delete_secondary_scan(
+    recon_id: int,
+    scan_id: int,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove a secondary scan and both of its files."""
+    scan = (await db.execute(
+        select(SecondaryScan)
+        .where(SecondaryScan.id == scan_id, SecondaryScan.reconstruction_id == recon_id)
+    )).scalar_one_or_none()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Secondary scan not found")
+
+    for rel in (scan.stored_path, scan.resampled_path):
+        path = _abs(rel) if rel else None
+        if not path:
+            continue
+        _mri_volume_cache.pop(path, None)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            print(f"[SEC REG] could not delete {path}: {e}")
+
+    await db.delete(scan)
+    await db.commit()
+    return {"status": "deleted", "id": scan_id}
+
+
 @app.get("/api/reconstructions/{recon_id}/mri-slice")
 async def get_mri_slice(
     recon_id: int,
     axis: str = "axial",       # axial | sagittal | coronal
     slice_idx: int = -1,       # -1 = auto middle
+    scan_id: Optional[int] = None,  # secondary scan to render instead of the primary
     token: Optional[str] = None,
     current_user: Optional[User] = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return a single MRI slice as a PNG image, plus metadata."""
+    """Return a single MRI slice as a PNG image, plus metadata.
+
+    `scan_id` selects one of the reconstruction's secondary scans as the base
+    layer; omitting it renders the primary. Because a secondary is stored already
+    resampled into the primary's grid, both answers share slice indices, plane
+    geometry and every header below -- the caller can swap between them freely.
+    """
     result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
     recon = result.scalar_one_or_none()
     if not recon:
         raise HTTPException(status_code=404, detail="Not found")
-    if not recon.mri_path:
-        raise HTTPException(status_code=404, detail="MRI not uploaded yet")
-    mri_abs = _abs(recon.mri_path)
-    if not os.path.exists(mri_abs):
-        raise HTTPException(status_code=404, detail="MRI not uploaded yet")
+    mri_abs = await _resolve_slice_source(db, recon, scan_id)
 
     import asyncio
     loop = asyncio.get_event_loop()
@@ -1807,11 +2134,11 @@ async def get_mri_slice(
             "X-Slice-Count": str(count),
             "X-Slice-Width": str(shape[1]),
             "X-Slice-Height": str(shape[0]),
-            # Plane centre — for display only. To test whether a world point is on
+            # Plane centre â€” for display only. To test whether a world point is on
             # this slice, use the plane headers below; on an oblique volume this
             # value is only correct at the middle of the image.
             "X-Slice-World-Coord": str(world_coord),
-            # Exact slice plane: |normal · P - offset| = mm from P to this slice.
+            # Exact slice plane: |normal Â· P - offset| = mm from P to this slice.
             "X-Slice-Plane-Normal": json.dumps(plane_normal),
             "X-Slice-Plane-Offset": str(plane_offset),
             "X-Voxel-Size-Mm": str(voxel_size_mm),
@@ -1869,7 +2196,7 @@ async def get_fusion_slice(
 ):
     """
     Return a grayscale PNG of the CT resampled into the MRI slice plane, for
-    visual registration QA. Pixel-aligned with /mri-slice at the same axis/slice_idx —
+    visual registration QA. Pixel-aligned with /mri-slice at the same axis/slice_idx â€”
     the frontend composites the two directly on top of each other.
 
     When `candidate` is set, render that precise-mode candidate basin
@@ -1923,6 +2250,7 @@ async def get_fusion_slice(
 async def prerender_slices(
     recon_id: int,
     axis: str = "axial",
+    scan_id: Optional[int] = None,  # secondary scan to warm instead of the primary
     token: Optional[str] = None,
     current_user: Optional[User] = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -1931,11 +2259,12 @@ async def prerender_slices(
     import asyncio
     result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
     recon = result.scalar_one_or_none()
-    mri_abs = _abs(recon.mri_path) if recon and recon.mri_path else None
-    if not mri_abs or not os.path.exists(mri_abs):
+    if not recon:
         return {"status": "skipped"}
-
-    mri_path = mri_abs
+    try:
+        mri_path = await _resolve_slice_source(db, recon, scan_id)
+    except HTTPException:
+        return {"status": "skipped"}
 
     async def _prerender():
         loop = asyncio.get_event_loop()
@@ -1948,7 +2277,7 @@ async def prerender_slices(
                 await loop.run_in_executor(None, _render_slice, mri_path, axis, i)
 
     asyncio.create_task(_prerender())
-    return {"status": "started", "axis": axis}
+    return {"status": "started", "axis": axis, "scan_id": scan_id}
 
 
 @app.get("/api/reconstructions/{recon_id}/structures")
@@ -2053,7 +2382,7 @@ async def get_share_link(
     return {"share_url": f"/view/{recon_id}?token={recon.share_token}"}
 
 
-# ─── Electrode Routes ─────────────────────────────────────────────────────────
+# â”€â”€â”€ Electrode Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.post("/api/reconstructions/{recon_id}/shafts")
 async def create_shaft(
@@ -2104,7 +2433,7 @@ async def add_contact(
     x_mm, y_mm, z_mm = data.x, data.y, data.z  # fallback
 
     if data.is_world_mm:
-        # Coords already in world mm — use directly
+        # Coords already in world mm â€” use directly
         x_mm, y_mm, z_mm = data.x, data.y, data.z
     elif recon and recon.ct_path and os.path.exists(_abs(recon.ct_path)):
         import nibabel as nib
@@ -2213,7 +2542,7 @@ async def init_contacts(
 ):
     """
     Create empty placeholder contacts for all N slots on a shaft.
-    Contacts have no position yet (x_mm=None) — they get positions
+    Contacts have no position yet (x_mm=None) â€” they get positions
     as the fellow clicks on the CT.
     """
     result = await db.execute(select(ElectrodeShaft).where(ElectrodeShaft.id == shaft_id))
@@ -2270,7 +2599,7 @@ async def autofill_shaft(
         grid_cols=data.grid_cols or 1,
     )
 
-    # Track range of manually placed contacts — only snap interpolated contacts,
+    # Track range of manually placed contacts â€” only snap interpolated contacts,
     # not extrapolated ones beyond the manual range (those may be in the bolt)
     manual_numbers = {c.contact_number for c in data.manual_contacts}
     manual_min = min(manual_numbers)
@@ -2384,7 +2713,7 @@ async def delete_contact(
     return {"message": "Deleted"}
 
 
-# ─── Delete / Trash Routes ────────────────────────────────────────────────────
+# â”€â”€â”€ Delete / Trash Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.patch("/api/reconstructions/{recon_id}/soft-delete")
 async def soft_delete_reconstruction(
@@ -2470,7 +2799,7 @@ async def permanently_delete_reconstruction(
                     shutil.rmtree(recon_dir)
                 except Exception as e:
                     print(f"[DELETE] Could not remove dir {recon_dir}: {e}")
-            break  # All files are in the same folder — only need to delete once
+            break  # All files are in the same folder â€” only need to delete once
 
     await db.delete(recon)
     await db.commit()
@@ -2490,7 +2819,7 @@ async def get_ct_threshold_mesh(
 ):
     """
     Return a surface mesh of CT voxels within the HU window (`threshold`,
-    `ceiling`]. `ceiling` is optional — omit it for a floor-only (open-top)
+    `ceiling`]. `ceiling` is optional â€” omit it for a floor-only (open-top)
     threshold. The user adjusts the window interactively until only electrode
     metal is visible, then clicks on the mesh to place contacts.
     Results are cached per (threshold, ceiling) value to avoid redundant work.
@@ -2569,7 +2898,7 @@ async def get_ct_histogram(
     return JSONResponse(hist)
 
 
-# ─── Serve React frontend (added for standalone .exe build) ──────────────────
+# â”€â”€â”€ Serve React frontend (added for standalone .exe build) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # This block serves the React build folder when running as a PyInstaller bundle.
 # In normal dev mode (npm start on port 3000), this folder won't exist and the
 # block is safely skipped.

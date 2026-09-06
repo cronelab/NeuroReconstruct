@@ -121,6 +121,7 @@ class Reconstruction(Base):
     deleted_at = Column(DateTime, nullable=True)
     created_by_user = relationship("User", back_populates="reconstructions")
     electrode_shafts = relationship("ElectrodeShaft", back_populates="reconstruction", cascade="all, delete-orphan")
+    secondary_scans = relationship("SecondaryScan", back_populates="reconstruction", cascade="all, delete-orphan")
 
 
 class ElectrodeShaft(Base):
@@ -157,6 +158,37 @@ class ElectrodeContact(Base):
     z_mm = Column(Float, nullable=True)
     is_manual = Column(Boolean, default=True)
     shaft = relationship("ElectrodeShaft", back_populates="contacts")
+
+
+class SecondaryScan(Base):
+    """
+    An additional MRI of the same patient -- T2, FLAIR, PD -- offered as an
+    alternative base layer in the 2D slice viewer.
+
+    Deliberately outside the reconstruction pipeline. The primary scan
+    (Reconstruction.mri_path, normally T1) remains the only input to DKT
+    parcellation, mesh extraction, CT coregistration and MNI export. A secondary
+    is registered rigidly to the primary and RESAMPLED INTO THE PRIMARY'S VOXEL
+    GRID, so `resampled_path` has geometry identical to mri.nii.gz. That is what
+    lets the slice viewer swap base layers without disturbing anything drawn on
+    top: structure overlays, electrode contacts and slice indices all stay valid
+    because the grid never changed.
+
+    `stored_path` keeps the original upload; only `resampled_path` is rendered.
+    """
+    __tablename__ = "secondary_scans"
+    id = Column(Integer, primary_key=True)
+    reconstruction_id = Column(Integer, ForeignKey("reconstructions.id"))
+    label = Column(String(64), nullable=False)          # display name, e.g. "T2 FLAIR"
+    modality = Column(String(32), default="t2")         # t2 | flair | pd | other
+    filename = Column(String(255), nullable=False)      # original upload filename
+    stored_path = Column(String(512), nullable=False)   # raw upload, relative to DATA_DIR
+    resampled_path = Column(String(512), nullable=True) # in primary-MRI grid, relative to DATA_DIR
+    # pending | registering | ready | error
+    status = Column(String(32), default="pending")
+    error = Column(String(512), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    reconstruction = relationship("Reconstruction", back_populates="secondary_scans")
 
 
 class SeegRecording(Base):

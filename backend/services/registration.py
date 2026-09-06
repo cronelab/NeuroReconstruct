@@ -284,6 +284,126 @@ def run_multistart(mri_path: str, ct_path: str, k: int = 11, threads: int = 8,
     return basins
 
 
+# -- Secondary MRI -> primary MRI (additional slice-viewer base layers) --------
+# A secondary scan (T2, FLAIR, PD) never enters the reconstruction pipeline: it is
+# registered to the primary MRI purely so it can be displayed in the 2D slice
+# viewer. Rather than keep a transform and resample on every slice request (what
+# the CT fusion view does), we resample ONCE into the primary's voxel grid and
+# store the result. The output volume is then indistinguishable from mri.nii.gz
+# as far as the slice renderer is concerned -- same shape, same affine, same
+# slice count -- so structure overlays and electrode contacts drawn on top of a
+# secondary slice land exactly where they do on the primary.
+
+
+def _make_mri_registration_method():
+    """Registration settings for intra-subject MRI -> MRI.
+
+    Deliberately NOT _make_registration_method(). Those settings are tuned for
+    CT -> MRI, where mutual information has a sharp optimum because bone and soft
+    tissue map to very different intensities, and they are validated in
+    production for that job -- but they do not transfer. Measured on a real T1:
+    with 100 histogram bins and REGULAR 50%-sampling, MI between two same-subject
+    MRIs is flat enough that plain gradient descent takes a random walk and the
+    convergence window closes on it. Registering a volume to ITSELF ended 13 mm
+    away and reported success. Three changes fix that:
+
+      * 50 bins instead of 100. The same number of samples spread over half as
+        many bins gives each one enough counts to produce a usable gradient.
+      * RANDOM sampling instead of a REGULAR grid. Two MRIs of one patient nearly
+        share a voxel lattice, and a regular sample grid aliases against it,
+        which puts ripples in the metric at exactly the sub-voxel scale the
+        optimizer is trying to resolve. The seed keeps it reproducible.
+      * A relaxing step size (RegularStepGradientDescent) instead of a fixed one.
+        When the gradient reverses, the step halves; the optimizer settles at the
+        optimum instead of oscillating past it until the window declares victory.
+
+    The pyramid is also shorter -- 3 levels, not 5. The extra-coarse levels exist
+    to escape distant local minima in CT -> MRI; two MRIs from the same session
+    start close enough that they only cost time.
+    """
+    reg = sitk.ImageRegistrationMethod()
+    reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+    reg.SetMetricSamplingStrategy(reg.RANDOM)
+    reg.SetMetricSamplingPercentage(0.20, seed=1234)   # seeded => reproducible
+    reg.SetInterpolator(sitk.sitkLinear)
+    reg.SetOptimizerAsRegularStepGradientDescent(
+        learningRate=2.0, minStep=1e-4, numberOfIterations=300,
+        relaxationFactor=0.5, gradientMagnitudeTolerance=1e-6,
+    )
+    reg.SetOptimizerScalesFromPhysicalShift()
+    reg.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
+    reg.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
+    reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+    return reg
+
+
+def register_secondary_to_primary(primary_path: str, secondary_path: str,
+                                  out_path: str, threads: int = 8) -> np.ndarray:
+    """
+    Rigidly register a secondary MRI to the primary MRI and write it resampled
+    into the primary's voxel grid.
+
+    Args:
+        primary_path:   the reconstruction's primary MRI (fixed image)
+        secondary_path: the uploaded secondary MRI (moving image)
+        out_path:       where to write the resampled NIfTI
+        threads:        ITK worker threads. Multithreading makes the optimizer
+                        non-deterministic, which for CT->MRI matters enough to
+                        warrant a review workflow. It matters less here: same-
+                        subject MRI->MRI is a far better-conditioned problem, and
+                        the result is a display layer whose alignment the reviewer
+                        checks by toggling between base layers -- if the anatomy
+                        moves when you flip, the registration is off.
+
+    Returns:
+        (4, 4) numpy array: secondary world RAS -> primary world RAS. Returned for
+        logging and diagnostics only; nothing persists it, because the resampled
+        volume already carries the alignment.
+    """
+    threads = max(1, int(threads))
+    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
+    try:
+        fixed_raw = sitk.ReadImage(primary_path, sitk.sitkFloat32)
+        moving_raw = sitk.ReadImage(secondary_path, sitk.sitkFloat32)
+        print(f"[SEC REG] primary size: {fixed_raw.GetSize()}, "
+              f"spacing: {[round(v, 2) for v in fixed_raw.GetSpacing()]}")
+        print(f"[SEC REG] secondary size: {moving_raw.GetSize()}, "
+              f"spacing: {[round(v, 2) for v in moving_raw.GetSpacing()]}")
+
+        # Register on zero-mean/unit-variance copies. MRI intensities carry no
+        # absolute meaning -- the same sequence on the same scanner can differ by
+        # an order of magnitude between sessions -- so without this the fixed
+        # 50-bin histogram lands mostly empty for one of the two volumes. The
+        # transform is a geometric result and applies unchanged to the originals,
+        # which is what gets resampled below, so the stored voxel values are the
+        # real ones.
+        fixed = sitk.Normalize(fixed_raw)
+        moving = sitk.Normalize(moving_raw)
+
+        reg = _make_mri_registration_method()
+        reg.SetInitialTransform(_build_initial_transform(fixed, moving), inPlace=False)
+
+        _t0 = time.perf_counter()
+        final_transform = reg.Execute(fixed, moving)
+        print(f"[SEC REG] Done in {time.perf_counter() - _t0:.1f} s. "
+              f"Metric: {reg.GetMetricValue():.4f}, "
+              f"Stop: {reg.GetOptimizerStopConditionDescription()}")
+
+        # Execute returns fixed->moving, which is exactly the direction Resample
+        # wants: for each output (primary) voxel it maps back into the secondary.
+        # No inversion here, unlike the CT path, which needs a CT->MRI matrix.
+        resampled = sitk.Resample(
+            moving_raw, fixed_raw, final_transform, sitk.sitkLinear, 0.0,
+            moving_raw.GetPixelID(),
+        )
+        sitk.WriteImage(resampled, out_path)
+        print(f"[SEC REG] Resampled secondary written to {out_path}")
+
+        return np.linalg.inv(_sitk_transform_to_ras_matrix(final_transform))
+    finally:
+        sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
+
+
 def load_transform(transform_path: str) -> np.ndarray:
     """Load a saved 4x4 CT->MRI transform matrix."""
     return np.load(transform_path)
