@@ -1735,15 +1735,48 @@ async def list_seeg(
         .where(SeegRecording.reconstruction_id == recon_id)
         .order_by(SeegRecording.uploaded_at.desc())
     )
-    return [
-        {"id": r.id, "task": r.task, "filename": r.filename,
-         "uploaded_at": r.uploaded_at.isoformat() if r.uploaded_at else None}
-        for r in result.scalars().all()
-    ]
+    from services.seeg_service import default_band_for
+
+    def _kind(rec):
+        """Recording kind + its default band, read from the h5 root attrs.
+
+        A header-only read, so listing a handful of recordings stays cheap. A file
+        that has gone missing or will not open is reported as an unknown kind rather
+        than failing the whole listing.
+        """
+        path = _abs(rec.stored_path)
+        if not path or not os.path.exists(path):
+            return None, None
+        try:
+            import h5py
+
+            with h5py.File(path, "r") as f:
+                v = f.attrs.get("recording_kind")
+            if isinstance(v, bytes):
+                v = v.decode("utf-8")
+            kind = str(v) if v is not None else None
+            return kind, default_band_for({"attrs": {"recording_kind": kind}})
+        except Exception:
+            return None, None
+
+    out = []
+    for r in result.scalars().all():
+        kind, band = _kind(r)
+        out.append({"id": r.id, "task": r.task, "filename": r.filename,
+                    "recording_kind": kind, "default_band": band,
+                    "uploaded_at": r.uploaded_at.isoformat() if r.uploaded_at else None})
+    return out
 
 
 class SeegActivityRequest(BaseModel):
-    band: str = "high_gamma"
+    # A preset name ("high_gamma", "review", ...) or a custom "<highpass>-<lowpass>"
+    # in Hz. None picks the default for the recording kind: 1-70 Hz review for
+    # clinical/EDF recordings, high gamma for task recordings.
+    band: Optional[str] = None
+    # Explicit cutoffs in Hz. When both are given they define the band and override
+    # `band`, so a caller can pass numbers without formatting a spec string.
+    highpass: Optional[float] = None
+    lowpass: Optional[float] = None
     mode: str = "trial"                              # 'trial' | 'scroll'
     # Alignment event for trial epochs: 'stimulus' (start_time) | 'response' (response_onset).
     align: str = "stimulus"
@@ -1753,6 +1786,9 @@ class SeegActivityRequest(BaseModel):
     baseline_ms: Optional[List[float]] = None
     # False = activation map only (skip the slow raw-voltage read; ``raw`` empty).
     include_raw: bool = True
+    # Continuous mode: bandpass the displayed voltage trace to the selected band.
+    # On by default -- the trace then matches the band it is labelled with.
+    filter_raw: bool = True
 
 
 @app.post("/api/reconstructions/{recon_id}/seeg/{rec_id}/activity")
@@ -1782,12 +1818,28 @@ async def compute_seeg_activity(
 
     from services.seeg_service import (
         compute_activity, parse_seeg_h5, join_channels_to_contacts,
-        BANDS, DEFAULT_WINDOW_MS,
+        DEFAULT_WINDOW_MS, default_band_for, resolve_band,
     )
-    if req.band not in BANDS:
-        raise HTTPException(status_code=400, detail=f"band must be one of {sorted(BANDS)}")
     if req.mode not in ("trial", "scroll"):
         raise HTTPException(status_code=400, detail="mode must be 'trial' or 'scroll'")
+
+    # Signal processing is CPU-bound; keep the event loop responsive.
+    loop = asyncio.get_event_loop()
+    # Header-only read, so it is cheap enough to do before the band is resolved --
+    # the recording kind decides the default band.
+    meta = await loop.run_in_executor(None, parse_seeg_h5, h5_path)
+
+    if req.highpass is not None and req.lowpass is not None:
+        band_spec = (req.highpass, req.lowpass)
+    elif req.highpass is not None or req.lowpass is not None:
+        raise HTTPException(status_code=400,
+                            detail="highpass and lowpass must be given together")
+    else:
+        band_spec = req.band or default_band_for(meta)
+    try:
+        band_key, _ = resolve_band(band_spec)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     window = None
     baseline = None
@@ -1804,18 +1856,16 @@ async def compute_seeg_activity(
                 raise HTTPException(status_code=400,
                                     detail="baseline_ms must be [start, end] with start < end <= 0")
 
-    # Signal processing is CPU-bound; keep the event loop responsive.
-    loop = asyncio.get_event_loop()
     try:
         activity = await loop.run_in_executor(
             None, lambda: compute_activity(
-                h5_path, mode=req.mode, band=req.band, window_ms=window,
-                baseline_ms=baseline, align=req.align, include_raw=req.include_raw)
+                h5_path, mode=req.mode, band=band_key, window_ms=window,
+                baseline_ms=baseline, align=req.align, include_raw=req.include_raw,
+                filter_raw=req.filter_raw)
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    meta = await loop.run_in_executor(None, parse_seeg_h5, h5_path)
     native = await _gather_native_contacts(db, recon_id)
     join = join_channels_to_contacts(meta["channels"], native, None)
 

@@ -44,8 +44,11 @@ def _dbg(msg: str):
 # Channel types we map onto the brain. Micro-wire and EKG are excluded.
 MAPPABLE_TYPES = {"seeg", "scalp_eeg"}
 
-# Frequency bands (Hz). "high_gamma" is the standard functional-mapping band.
+# Frequency bands (Hz). "high_gamma" is the standard functional-mapping band for
+# task recordings; "review" is the clinical wideband a seizure is read at, where the
+# narrow physiological presets hide the morphology the reader is actually looking for.
 BANDS = {
+    "review":     (1.0, 70.0),
     "delta":      (1.0, 4.0),
     "theta":      (4.0, 8.0),
     "alpha":      (8.0, 13.0),
@@ -55,6 +58,49 @@ BANDS = {
 }
 
 DEFAULT_BAND = "high_gamma"
+# Clinical (EDF-derived) recordings default to the 1-70 Hz review band instead.
+CLINICAL_BAND = "review"
+
+# A caller-supplied band: "<highpass>-<lowpass>" in Hz, e.g. "1-70" or "0.5-40".
+_CUSTOM_BAND_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$")
+
+
+def _band_key(lo: float, hi: float) -> str:
+    """Canonical cache-safe key for a numeric band: (1.0, 70.0) -> '1-70'."""
+    return f"{lo:g}-{hi:g}"
+
+
+def resolve_band(spec) -> tuple:
+    """
+    Resolve a band spec to ``(canonical_key, (lo_hz, hi_hz))``.
+
+    Accepts a preset name from ``BANDS``, a ``"<highpass>-<lowpass>"`` string, or a
+    2-tuple. The returned key is what the envelope disk cache is filenamed by, so a
+    custom band caches independently of the presets.
+    """
+    if isinstance(spec, (tuple, list)) and len(spec) == 2:
+        lo, hi = float(spec[0]), float(spec[1])
+    else:
+        key = str(spec).strip()
+        if key in BANDS:
+            return key, BANDS[key]
+        m = _CUSTOM_BAND_RE.match(key)
+        if not m:
+            raise ValueError(
+                f"unknown band {spec!r}; use a preset {sorted(BANDS)} "
+                f"or a custom '<highpass>-<lowpass>' in Hz, e.g. '1-70'")
+        lo, hi = float(m.group(1)), float(m.group(2))
+    if not 0 < lo < hi:
+        raise ValueError(f"invalid band {lo:g}-{hi:g} Hz: need 0 < highpass < lowpass")
+    return _band_key(lo, hi), (lo, hi)
+
+
+def default_band_for(meta: dict) -> str:
+    """Band to use when the caller did not choose one, given a parsed h5's metadata."""
+    return CLINICAL_BAND if meta.get("attrs", {}).get("recording_kind") == "clinical" \
+        else DEFAULT_BAND
+
+
 DEFAULT_WINDOW_MS = (-500.0, 2000.0)  # peri-stimulus window (relative to onset)
 MAX_OUTPUT_FRAMES = 1500              # cap frames sent to the client per request
 
@@ -104,6 +150,7 @@ def parse_seeg_h5(path: str) -> dict:
       rate_hz, group_name, n_samples,
       channels: [{name, type, group, col}]  (mappable channels only, col into data)
       trials:   [{stimulus, start_time, stop_time}]
+      annotations: [{onset, duration, text, category, channels}]  (clinical files only)
       attrs:    {subject, task, task_title, block, segment_duration_s}
     Does NOT load the full signal array (that happens in compute_band_activity).
     """
@@ -154,6 +201,26 @@ def parse_seeg_h5(path: str) -> dict:
                     "response_onset": (r if np.isfinite(r) else None),
                 })
 
+        # Clinical (EDF-derived) recordings carry a reviewer marker track instead of
+        # trials. Absent from research task files, which yield an empty list.
+        annotations = []
+        if "annotations" in h5:
+            ag = h5["annotations"]
+            a_text = _decode(ag["text"]) if "text" in ag else []
+            a_cat = _decode(ag["category"]) if "category" in ag else []
+            a_chan = _decode(ag["channels"]) if "channels" in ag else []
+            a_on = ag["onset"][:] if "onset" in ag else np.array([])
+            a_dur = ag["duration"][:] if "duration" in ag else np.array([])
+            for i in range(len(a_on)):
+                raw = a_chan[i] if i < len(a_chan) else ""
+                annotations.append({
+                    "onset": round(float(a_on[i]), 4),
+                    "duration": round(float(a_dur[i]), 4) if i < len(a_dur) else 0.0,
+                    "text": a_text[i] if i < len(a_text) else "",
+                    "category": a_cat[i] if i < len(a_cat) else "note",
+                    "channels": [c for c in raw.split(";") if c],
+                })
+
         def _attr(key, default=None):
             v = h5.attrs.get(key, default)
             if isinstance(v, bytes):
@@ -168,6 +235,8 @@ def parse_seeg_h5(path: str) -> dict:
             "task_title": _attr("task_title"),
             "block": _attr("block"),
             "segment_duration_s": _attr("segment_duration_s"),
+            # "clinical" for EDF-derived recordings; absent (None) on task files.
+            "recording_kind": _attr("recording_kind"),
         }
 
     return {
@@ -176,11 +245,43 @@ def parse_seeg_h5(path: str) -> dict:
         "n_samples": n_samples,
         "channels": channels,
         "trials": trials,
+        "annotations": annotations,
         "attrs": attrs,
     }
 
 
 # ── Signal processing ────────────────────────────────────────────────────────
+
+def bandpass(sig: np.ndarray, fs: float, band: tuple):
+    """
+    Zero-phase 4th-order Butterworth bandpass of ``sig`` (n_samples, n_channels).
+
+    Returns the filtered signal, or ``None`` when the band is degenerate for this
+    sampling rate (so the caller can decide what to fall back to).
+
+    Uses second-order sections rather than transfer-function ``(b, a)`` coefficients.
+    That is not a style preference: at 2 kHz a 4th-order Butterworth over a narrow
+    low band has poles so close to z=1 that the ``(b, a)`` form loses all precision --
+    1-4 Hz returns NaN outright, and 4-8 Hz returns values around 1e140. Both look
+    like ordinary arrays to a caller, so the failure is silent. SOS is stable for
+    every band we offer, including custom ones the user can type.
+    """
+    from scipy.signal import butter, sosfiltfilt
+
+    lo, hi = band
+    nyq = fs / 2.0
+    hi = min(hi, nyq * 0.99)
+    lo = max(lo, 0.1)
+    if lo >= hi:
+        return None
+    sos = butter(4, [lo / nyq, hi / nyq], btype="band", output="sos")
+    # sosfiltfilt operates along axis 0 (time).
+    t0 = time.perf_counter()
+    out = sosfiltfilt(sos, sig, axis=0)
+    _dbg(f"[SEEG] bandpass {lo:g}-{hi:g}Hz: filtfilt {time.perf_counter() - t0:.2f}s "
+         f"(n={sig.shape[0]}, {sig.shape[1]} ch)")
+    return out
+
 
 def _band_envelope(sig: np.ndarray, fs: float, band: tuple) -> np.ndarray:
     """
@@ -188,27 +289,18 @@ def _band_envelope(sig: np.ndarray, fs: float, band: tuple) -> np.ndarray:
 
     sig: (n_samples, n_channels) float. Returns same shape, non-negative envelope.
     """
-    from scipy.signal import butter, filtfilt, hilbert
+    from scipy.signal import hilbert
 
-    lo, hi = band
-    nyq = fs / 2.0
-    hi = min(hi, nyq * 0.99)
-    lo = max(lo, 0.1)
-    if lo >= hi:
+    filtered = bandpass(sig, fs, band)
+    if filtered is None:
         # Degenerate band for this sampling rate -> fall back to |signal|.
         return np.abs(sig).astype(np.float32)
-
-    b, a = butter(4, [lo / nyq, hi / nyq], btype="band")
-    # filtfilt/hilbert operate along axis 0 (time). hilbert FFTs at exactly
-    # n_samples; padding to a fast length was measured to perturb the displayed
-    # z-score by up to ~0.9 near recording edges, so we keep the exact length.
-    t0 = time.perf_counter()
-    filtered = filtfilt(b, a, sig, axis=0)
+    # hilbert FFTs at exactly n_samples; padding to a fast length was measured to
+    # perturb the displayed z-score by up to ~0.9 near recording edges, so we keep
+    # the exact length.
     t1 = time.perf_counter()
     env = np.abs(hilbert(filtered, axis=0))
-    t2 = time.perf_counter()
-    _dbg(f"[SEEG] band envelope: filtfilt {t1 - t0:.2f}s + hilbert {t2 - t1:.2f}s "
-          f"(n={filtered.shape[0]}, {sig.shape[1]} ch)")
+    _dbg(f"[SEEG] band envelope: hilbert {time.perf_counter() - t1:.2f}s")
     return env.astype(np.float32)
 
 
@@ -216,6 +308,10 @@ def _band_envelope(sig: np.ndarray, fs: float, band: tuple) -> np.ndarray:
 # depends only on (h5 file, band) -- not on the peri-stimulus window or trial/scroll
 # mode -- so it is cached on disk next to the recording and reused across requests.
 ENV_CACHE_DIRNAME = ".envcache"
+# Bumped when the filter maths changes, so caches written by an older (and, before
+# the SOS fix, numerically broken for low narrow bands) build are discarded rather
+# than served. Size/mtime alone cannot catch a change on our side.
+ENV_CACHE_VERSION = 2
 
 
 def _env_cache_path(h5_path: str, band: str) -> str:
@@ -246,6 +342,7 @@ def _load_or_compute_envelope(h5_path: str, band: str, meta: dict):
             with np.load(cache, allow_pickle=False) as d:
                 if (int(d["src_size"]) == st.st_size
                         and abs(float(d["src_mtime"]) - st.st_mtime) < 1e-3
+                        and int(d["algo_version"]) == ENV_CACHE_VERSION
                         and tuple(d["shape"]) == shape):
                     env = d["env"]
                     _dbg(f"[SEEG] env cache hit ({band}): loaded in {time.perf_counter() - t0:.2f}s")
@@ -255,11 +352,12 @@ def _load_or_compute_envelope(h5_path: str, band: str, meta: dict):
 
     _dbg(f"[SEEG] env cache miss ({band}): reading full signal + computing envelope")
     sig = _read_full_signal(h5_path, meta)
-    env = _band_envelope(sig, meta["rate_hz"], BANDS[band])
+    env = _band_envelope(sig, meta["rate_hz"], resolve_band(band)[1])
     try:
         os.makedirs(os.path.dirname(cache), exist_ok=True)
         st = os.stat(h5_path)
         np.savez(cache, env=env, shape=np.array(sig.shape, dtype=np.int64),
+                 algo_version=np.int64(ENV_CACHE_VERSION),
                  src_size=np.int64(st.st_size), src_mtime=np.float64(st.st_mtime))
     except Exception as e:
         _dbg(f"[SEEG] env cache write failed ({band}): {e}")
@@ -349,8 +447,9 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
       raw:      [[uV, ...], ...]         trial-averaged, baseline-corrected ERP (uV)
       mode ('trial'), time_unit ('ms'), band, align, n_trials, n_no_response
     """
-    if band not in BANDS:
-        raise ValueError(f"unknown band {band!r}; options: {sorted(BANDS)}")
+    # Normalise a preset name or a custom "<highpass>-<lowpass>" spec to its canonical
+    # key, so the envelope cache and the echoed `band` field agree. Raises on a bad spec.
+    band, band_hz = resolve_band(band)
     if align not in ("stimulus", "response"):
         raise ValueError(f"unknown align {align!r}; options: ['stimulus', 'response']")
     if baseline_ms is None:
@@ -361,7 +460,7 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
     groups = [c["group"] for c in meta["channels"]]
     if not meta["channels"]:
         return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
-                "mode": "trial", "time_unit": "ms", "band": band, "align": align,
+                "mode": "trial", "time_unit": "ms", "band": band, "band_hz": list(band_hz), "align": align,
                 "n_trials": 0, "n_no_response": 0}
 
     if not meta["trials"]:
@@ -459,32 +558,39 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
         "times": [round(float(t), 2) for t in pst_times_ms],
         "activity": np.round(avg, 3).tolist(),
         "raw": np.round(avg_raw, 2).tolist() if include_raw else [],
-        "mode": "trial", "time_unit": "ms", "band": band, "align": align,
+        "mode": "trial", "time_unit": "ms", "band": band, "band_hz": list(band_hz), "align": align,
         "n_trials": used, "n_no_response": n_no_response,
     }
 
 
 def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
                               max_frames: int = 2500,
-                              include_raw: bool = True) -> dict:
+                              include_raw: bool = True,
+                              filter_raw: bool = True) -> dict:
     """
     Continuous (scrollable) traces over the whole recording.
 
     Returns per-channel band-power z-score (normalized to the whole-recording
-    envelope mean/SD) and raw voltage, both decimated to <= max_frames.
+    envelope mean/SD) and voltage, both decimated to <= max_frames. The voltage is
+    bandpassed to ``band`` when ``filter_raw`` (the default) and is reduced by
+    per-bin min/max, returned alongside as ``raw_min``/``raw_max``.
 
     Returns the same shape as compute_band_activity with mode='scroll',
     time_unit='s', and n_trials=0.
     """
-    if band not in BANDS:
-        raise ValueError(f"unknown band {band!r}; options: {sorted(BANDS)}")
+    # Normalise a preset name or a custom "<highpass>-<lowpass>" spec to its canonical
+    # key, so the envelope cache and the echoed `band` field agree. Raises on a bad spec.
+    band, band_hz = resolve_band(band)
     meta = parse_seeg_h5(path)
     fs = meta["rate_hz"]
     names = [c["name"] for c in meta["channels"]]
     groups = [c["group"] for c in meta["channels"]]
     if not meta["channels"]:
         return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
-                "mode": "scroll", "time_unit": "s", "band": band, "n_trials": 0}
+                "raw_min": [], "raw_max": [], "raw_filtered": False,
+                "raw_decimation": "none",
+                "mode": "scroll", "time_unit": "s", "band": band, "band_hz": list(band_hz), "n_trials": 0,
+                "annotations": meta.get("annotations", [])}
 
     t_env = time.perf_counter()
     env, full_sig = _load_or_compute_envelope(path, band, meta)
@@ -498,19 +604,56 @@ def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
     idx = np.arange(0, n, step)
     times_s = idx / fs
 
-    # Decimated raw voltage (trace panel only). Skipped when the caller wants just
-    # the activation map (include_raw False). Otherwise reuse the full signal if the
-    # env miss already read it, else a strided lazy read.
-    raw = None
+    # Decimated voltage for the trace panel. Skipped when the caller wants only the
+    # activation map (include_raw False).
+    #
+    # Two things happen here, and they are related. `filter_raw` applies the same
+    # bandpass the envelope uses, so the trace shown is the one the band names --
+    # a clinical 1-70 Hz montage rather than the broadband signal with its DC drift.
+    # And the reduction to `idx` is min/max per bin rather than plain striding.
+    #
+    # Striding is what aliases: 600k samples into ~2.5k frames is a factor of ~240,
+    # putting the display Nyquist near 4 Hz, so *no* bandpass wide enough to be
+    # clinically useful can serve as the anti-alias filter -- every spike between
+    # 4 Hz and the low-pass corner folds down or is missed entirely, depending on
+    # where the stride happens to land. Min/max per bin instead reports the extremes
+    # the bin actually spans, so a spike is drawn at its true height at any zoom.
+    raw = raw_min = raw_max = None
+    # How the trace was reduced: "minmax" carries real per-bin extremes, "strided"
+    # (or "none", when no reduction was needed) means raw_min == raw == raw_max, and a
+    # consumer must not try to draw a min..max band from them -- it would be empty.
+    raw_decimation = "none"
     if include_raw:
         t_raw = time.perf_counter()
         if full_sig is not None:
-            raw = full_sig[idx]
-            raw_src = "reused full signal"
+            sig, raw_src = full_sig, "reused full signal"
+        elif filter_raw:
+            # Filtering is only meaningful at the native rate, so a strided read
+            # cannot serve it; pay for the full read.
+            sig, raw_src = _read_full_signal(path, meta), "full read for filter"
         else:
-            raw = _read_strided(path, meta, step)[:len(idx)]
-            raw_src = "strided lazy read"
-        _dbg(f"[SEEG] scroll: decimated raw via {raw_src} in {time.perf_counter() - t_raw:.2f}s")
+            sig, raw_src = None, "strided lazy read"
+
+        if sig is None:
+            strided = _read_strided(path, meta, step)[:len(idx)]
+            raw = raw_min = raw_max = strided
+            raw_decimation = "strided" if step > 1 else "none"
+        else:
+            if filter_raw:
+                filtered = bandpass(sig, fs, band_hz)
+                if filtered is not None:
+                    sig = filtered
+            if step > 1:
+                bins = idx.astype(np.int64)
+                raw_min = np.minimum.reduceat(sig, bins, axis=0)
+                raw_max = np.maximum.reduceat(sig, bins, axis=0)
+                # Midpoint keeps a single-valued series for consumers drawing a line.
+                raw = (raw_min + raw_max) * 0.5
+                raw_decimation = "minmax"
+            else:
+                raw = raw_min = raw_max = sig[idx]
+        _dbg(f"[SEEG] scroll: decimated raw via {raw_src} "
+             f"(filter_raw={filter_raw}) in {time.perf_counter() - t_raw:.2f}s")
 
     return {
         "channels": names,
@@ -518,7 +661,15 @@ def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
         "times": [round(float(t), 4) for t in times_s],
         "activity": np.round(z[idx], 3).tolist(),
         "raw": np.round(raw * 1e6, 2).tolist() if include_raw else [],   # uV
-        "mode": "scroll", "time_unit": "s", "band": band, "n_trials": 0,
+        # Per-bin extremes of the same series, so the panel can draw the true spike
+        # envelope instead of a strided sample. Equal to `raw` when no reduction ran.
+        "raw_min": np.round(raw_min * 1e6, 2).tolist() if include_raw else [],
+        "raw_max": np.round(raw_max * 1e6, 2).tolist() if include_raw else [],
+        "raw_filtered": bool(include_raw and filter_raw),
+        "raw_decimation": raw_decimation,
+        "mode": "scroll", "time_unit": "s", "band": band, "band_hz": list(band_hz), "n_trials": 0,
+        # Reviewer markers on the same clock as `times` (clinical recordings only).
+        "annotations": meta.get("annotations", []),
     }
 
 
@@ -561,7 +712,8 @@ def clear_result_cache():
 
 def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND,
                      window_ms=None, baseline_ms=None, align: str = "stimulus",
-                     include_raw: bool = True, max_frames: int = None) -> dict:
+                     include_raw: bool = True, max_frames: int = None,
+                     filter_raw: bool = True) -> dict:
     """
     Cached dispatch for trial/scroll activity.
 
@@ -573,8 +725,9 @@ def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND
     """
     if mode not in ("trial", "scroll"):
         raise ValueError(f"unknown mode {mode!r}; options: ['trial', 'scroll']")
-    if band not in BANDS:
-        raise ValueError(f"unknown band {band!r}; options: {sorted(BANDS)}")
+    # Normalise a preset name or a custom "<highpass>-<lowpass>" spec to its canonical
+    # key, so the envelope cache and the echoed `band` field agree. Raises on a bad spec.
+    band, band_hz = resolve_band(band)
 
     ident = _file_identity(path)
     if mode == "trial":
@@ -584,7 +737,7 @@ def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND
         base = (os.path.abspath(path), ident, "trial", band, window, baseline, align, mf)
     else:
         mf = max_frames if max_frames is not None else 2500
-        base = (os.path.abspath(path), ident, "scroll", band, mf)
+        base = (os.path.abspath(path), ident, "scroll", band, mf, filter_raw)
 
     hit = _cache_get(base + (include_raw,))
     if hit is not None:
@@ -601,7 +754,8 @@ def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND
         result = compute_band_activity(path, band, window, baseline_ms=baseline,
                                        align=align, max_frames=mf, include_raw=include_raw)
     else:
-        result = compute_continuous_traces(path, band, max_frames=mf, include_raw=include_raw)
+        result = compute_continuous_traces(path, band, max_frames=mf,
+                                           include_raw=include_raw, filter_raw=filter_raw)
     _cache_put(base + (include_raw,), result)
     return result
 
