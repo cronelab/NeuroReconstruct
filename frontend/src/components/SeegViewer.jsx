@@ -8,12 +8,22 @@ import SeegViewer3D, { activityColor } from './SeegViewer3D';
 import SeegTracePanel from './SeegTracePanel';
 import StructurePanel from './StructurePanel';
 import { buildShaftColorMap } from '../seegColors';
+import { activeMarksAt, buildMarks } from '../seegAnnotations';
 import { isInsideMesh } from '../anatomy';
 
 const BANDS = [
+  ['review', 'Review 1–70 (clinical)'],
   ['delta', 'Delta 1–4'], ['theta', 'Theta 4–8'], ['alpha', 'Alpha 8–13'],
   ['beta', 'Beta 13–30'], ['gamma', 'Gamma 30–70'], ['high_gamma', 'High-γ 70–150'],
 ];
+const BAND_KEYS = new Set(BANDS.map(([k]) => k));
+const CUSTOM_BAND = '__custom__';
+// A custom band travels as "<highpass>-<lowpass>" in Hz, which is what the API takes.
+const isCustomBand = (b) => !!b && !BAND_KEYS.has(b);
+const parseCustomBand = (b) => {
+  const m = /^(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)$/.exec(b || '');
+  return m ? [m[1], m[2]] : ['1', '70'];
+};
 
 const panel = {
   width: 380, flexShrink: 0, background: '#0d1015', borderRight: '1px solid #1e2530',
@@ -21,6 +31,11 @@ const panel = {
   fontFamily: 'IBM Plex Sans, sans-serif', color: '#c8d4e0',
 };
 const label = { fontSize: 10, letterSpacing: '0.08em', textTransform: 'uppercase', color: '#7a8a99', marginBottom: 6 };
+const numInput = {
+  width: 62, padding: '4px 6px', background: '#111418', color: '#e8edf2',
+  border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, textAlign: 'right',
+  fontFamily: 'IBM Plex Mono, monospace',
+};
 const seg = (active) => ({
   padding: '5px 10px', fontSize: 11, fontFamily: 'IBM Plex Mono, monospace', cursor: 'pointer',
   border: `1px solid ${active ? '#00d4ff55' : '#2a3340'}`, borderRadius: 4,
@@ -59,7 +74,7 @@ const DEFAULT_WINDOW = {
 const RESULT_CACHE = new Map();
 const RESULT_CACHE_MAX = 24;
 const cacheKey = (recId, p) => [
-  recId, p.mode, p.band, p.align,
+  recId, p.mode, p.band, p.align, p.filter_raw,
   p.window_ms?.[0], p.window_ms?.[1], p.baseline_ms?.[0], p.baseline_ms?.[1],
 ].join('|');
 function cacheGet(key) {
@@ -99,6 +114,52 @@ export default function SeegViewer({ reconId, onBack }) {
   const [error, setError] = useState(null);
   const fileRef = useRef(null);
   const reqSeqRef = useRef(0);   // guards against stale two-phase responses
+
+  // Custom bandpass cutoffs. Held as drafts and committed on blur/Enter so typing
+  // "1" on the way to "15" doesn't kick off a recompute per keystroke.
+  const [hpDraft, setHpDraft] = useState(() => parseCustomBand(seegBand)[0]);
+  const [lpDraft, setLpDraft] = useState(() => parseCustomBand(seegBand)[1]);
+  const [bandError, setBandError] = useState(null);
+
+  const commitCustomBand = () => {
+    const hp = parseFloat(hpDraft), lp = parseFloat(lpDraft);
+    if (!Number.isFinite(hp) || !Number.isFinite(lp) || !(hp > 0 && hp < lp)) {
+      setBandError('Need 0 < high-pass < low-pass.');
+      return;
+    }
+    setBandError(null);
+    const spec = `${hp}-${lp}`;
+    if (spec !== seegBand) setSeegBand(spec);
+  };
+
+  // Adopt a recording's natural defaults when the *kind* of recording changes, so a
+  // clinical EDF opens at 1-70 Hz in Continuous mode rather than inheriting a task
+  // recording's high-gamma / trial settings (a clinical file has no trials at all, so
+  // trial mode would simply error). An explicitly-typed custom band is left alone.
+  const lastKindRef = useRef(null);
+  useEffect(() => {
+    const rec = seegRecordings.find((r) => r.id === seegRecordingId);
+    if (!rec) return;
+    const kind = rec.recording_kind || 'task';
+    if (lastKindRef.current === kind) return;
+    lastKindRef.current = kind;
+    if (rec.default_band && !isCustomBand(seegBand)) setSeegBand(rec.default_band);
+    // A clinical recording is one continuous event with no trials to average; a task
+    // recording is the opposite, so each opens in the mode that actually fits it.
+    setSeegMode(kind === 'clinical' ? 'scroll' : 'trial');
+  }, [seegRecordingId, seegRecordings, seegBand, setSeegBand, setSeegMode]);
+
+  // Reviewer annotations, and the one in effect at the cursor. Placed on frames by
+  // the same helper the trace panel uses, so the brain readout and the trace ruler can
+  // never disagree about which frame a marker belongs to.
+  const annMarks = useMemo(
+    () => buildMarks(seegActivity?.times, seegActivity?.annotations, seegActivity?.time_unit),
+    [seegActivity],
+  );
+  const activeMarks = useMemo(
+    () => activeMarksAt(annMarks, seegTimeIndex),
+    [annMarks, seegTimeIndex],
+  );
 
   // Draft window inputs — applied to the store (which triggers recompute) only on
   // commit, so typing doesn't fire a recompute on every keystroke.
@@ -165,7 +226,10 @@ export default function SeegViewer({ reconId, onBack }) {
     if (!reconId || !seegRecordingId) return undefined;
     const seq = ++reqSeqRef.current;
     const params = {
+      // Only the 'raw' signal wants the unfiltered trace; 'z' and 'filtered' both
+      // use the band, so switching between those two hits the same cache entry.
       band: seegBand, mode: seegMode, align: seegAlign,
+      filter_raw: seegTraceSignal !== 'raw',
       window_ms: [-seegPre, seegPost],
       baseline_ms: [seegBaseStart, seegBaseEnd],
     };
@@ -196,7 +260,16 @@ export default function SeegViewer({ reconId, onBack }) {
             if (seq !== reqSeqRef.current) return;
             // setSeegActivity has no functional-updater form; read latest from the store.
             const cur = useAppStore.getState().seegActivity;
-            const full = cur ? { ...cur, raw: r2.data.raw } : r2.data;
+            // Phase 2 carries the voltage trace: the series plus its per-bin extremes
+            // (continuous mode) — all of which the panel needs to draw the envelope.
+            const full = cur ? {
+              ...cur,
+              raw: r2.data.raw,
+              raw_min: r2.data.raw_min,
+              raw_max: r2.data.raw_max,
+              raw_filtered: r2.data.raw_filtered,
+              raw_decimation: r2.data.raw_decimation,
+            } : r2.data;
             setSeegActivity(full);
             if (key) cachePut(key, full);   // cache the full result for instant re-switch
           })
@@ -209,7 +282,7 @@ export default function SeegViewer({ reconId, onBack }) {
         setComputing(false);
       });
     return undefined;
-  }, [reconId, seegRecordingId, seegBand, seegMode, seegAlign, seegPre, seegPost,
+  }, [reconId, seegRecordingId, seegBand, seegTraceSignal, seegMode, seegAlign, seegPre, seegPost,
       seegBaseStart, seegBaseEnd]);
 
   // ── Playback ──────────────────────────────────────────────────────────────────
@@ -353,11 +426,37 @@ export default function SeegViewer({ reconId, onBack }) {
         {/* Band */}
         <div>
           <div style={label}>Frequency band</div>
-          <select value={seegBand} onChange={(e) => setSeegBand(e.target.value)}
+          <select value={isCustomBand(seegBand) ? CUSTOM_BAND : seegBand}
+            onChange={(e) => {
+              const v = e.target.value;
+              setSeegBand(v === CUSTOM_BAND ? `${hpDraft}-${lpDraft}` : v);
+            }}
             style={{ width: '100%', padding: '6px 8px', background: '#111418', color: '#c8d4e0',
               border: '1px solid #2a3340', borderRadius: 4, fontSize: 12, fontFamily: 'IBM Plex Mono, monospace' }}>
             {BANDS.map(([key, txt]) => <option key={key} value={key}>{txt}</option>)}
+            <option value={CUSTOM_BAND}>Custom bandpass…</option>
           </select>
+
+          {isCustomBand(seegBand) && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
+              <input type="number" min={0.1} step={0.5} value={hpDraft}
+                onChange={(e) => setHpDraft(e.target.value)} onBlur={commitCustomBand}
+                onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+                title="High-pass cutoff (Hz)"
+                style={numInput} />
+              <span style={{ fontSize: 11, color: '#7a8a99' }}>–</span>
+              <input type="number" min={0.2} step={5} value={lpDraft}
+                onChange={(e) => setLpDraft(e.target.value)} onBlur={commitCustomBand}
+                onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+                title="Low-pass cutoff (Hz)"
+                style={numInput} />
+              <span style={{ fontSize: 11, color: '#7a8a99' }}>Hz</span>
+            </div>
+          )}
+          {bandError && (
+            <div style={{ fontSize: 10, color: '#ff8a80', marginTop: 6 }}>{bandError}</div>
+          )}
+
         </div>
 
         {/* Mapping mode */}
@@ -370,7 +469,10 @@ export default function SeegViewer({ reconId, onBack }) {
 
           {seegMode === 'scroll' ? (
             <div style={{ fontSize: 10, color: '#7a8a99' }}>
-              Continuous recording · band-power z-score over the whole session.
+              Continuous recording · band-power z-score over the whole session
+              {seegActivity?.band_hz
+                ? `, ${seegActivity.band_hz[0]}–${seegActivity.band_hz[1]} Hz.`
+                : '.'}
             </div>
           ) : (<>
           {/* Alignment event */}
@@ -543,9 +645,32 @@ export default function SeegViewer({ reconId, onBack }) {
           loadingMessage={computing ? 'Computing band activity…' : 'Loading surface…'}
         />
         {seegActivity && (
-          <div style={{ position: 'absolute', top: 12, left: 12, fontSize: 10, color: '#7a8a99',
-            fontFamily: 'IBM Plex Mono, monospace', background: '#0d1015aa', padding: '4px 8px', borderRadius: 3 }}>
-            Native brain · {seegActivity.band}
+          <div style={{ position: 'absolute', top: 12, left: 12, display: 'flex',
+            flexDirection: 'column', gap: 6, alignItems: 'flex-start',
+            maxWidth: 'calc(100% - 24px)', pointerEvents: 'none' }}>
+            <div style={{ fontSize: 10, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace',
+              background: '#0d1015aa', padding: '4px 8px', borderRadius: 3 }}>
+              Native brain · {seegActivity.band_hz
+                ? `${seegActivity.band_hz[0]}–${seegActivity.band_hz[1]} Hz`
+                : seegActivity.band}
+            </div>
+            {/* The reviewer's annotation currently in effect. Held until the next one
+                takes over, so scrubbing through a seizure reads as a running commentary
+                rather than a label that blinks past on one frame. */}
+            {activeMarks.map((m, i) => (
+              <div key={`am${i}`} style={{ display: 'flex', alignItems: 'baseline', gap: 8,
+                background: '#0d1015e6', borderLeft: `3px solid ${m.color}`,
+                padding: '5px 10px', borderRadius: 3 }}>
+                <span style={{ fontSize: 10, color: '#7a8a99',
+                  fontFamily: 'IBM Plex Mono, monospace' }}>{m.onset.toFixed(0)}s</span>
+                <span style={{ fontSize: 13, color: m.color, fontWeight: 500,
+                  fontFamily: 'IBM Plex Mono, monospace' }}>{m.text}</span>
+                {m.channels?.length > 0 && (
+                  <span style={{ fontSize: 10, color: '#8a97a6',
+                    fontFamily: 'IBM Plex Mono, monospace' }}>{m.channels.join(' ')}</span>
+                )}
+              </div>
+            ))}
           </div>
         )}
       </div>

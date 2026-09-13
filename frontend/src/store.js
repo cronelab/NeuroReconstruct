@@ -131,7 +131,9 @@ export const useAppStore = create((set, get) => ({
   setSeegBaseEnd: (v) => set({ seegBaseEnd: v }),
   seegMode: 'trial',             // 'trial' (trial-averaged) | 'scroll' (continuous)
   setSeegMode: (m) => set({ seegMode: m }),
-  seegTraceSignal: 'z',          // 'z' (band-power z) | 'raw' (voltage)
+  // 'z' band-power z-score | 'filtered' voltage bandpassed to the selected band |
+  // 'raw' voltage as recorded. The last two differ only by the server-side filter.
+  seegTraceSignal: 'z',
   setSeegTraceSignal: (s) => set({ seegTraceSignal: s }),
   seegTraceScope: 'all',         // 'all' | 'shaft'
   setSeegTraceScope: (s) => set({ seegTraceScope: s }),

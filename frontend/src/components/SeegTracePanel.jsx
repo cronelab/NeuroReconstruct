@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { shaftColorOf as shaftColor } from '../seegColors';
+import { ANN_EMPHASIS, buildMarks, nearestIndex as nearestFrame } from '../seegAnnotations';
 
 const seg = (active) => ({
   padding: '3px 9px', fontSize: 10, fontFamily: 'IBM Plex Mono, monospace', cursor: 'pointer',
@@ -9,6 +10,7 @@ const seg = (active) => ({
 
 const ROW_H = 22;
 const GUTTER = 68;
+const RULER_H = 15;
 
 // Numeric contact index within a shaft, for natural ordering (E1, E2, ... E10 —
 // not E1, E10, E2). Strips the shaft prefix (handles digit-ending shafts like
@@ -74,27 +76,46 @@ export default function SeegTracePanel({
   }, [data.channels, data.groups, mappedSet, scope, shaft, shafts]);
 
   const nT = data.times.length;
-  const isRaw = signal === 'raw';
+  // Either voltage view ('filtered' or 'raw') draws from data.raw; they differ only
+  // in whether the server bandpassed it, which the fetch layer decides.
+  const isVoltage = signal !== 'z';
   // The two-phase fetch fills raw voltages (phase 2) after the activation map
   // (phase 1); until then data.raw is empty. Guard so voltage mode doesn't index
   // into a missing array.
-  const rawReady = !isRaw || (Array.isArray(data.raw) && data.raw.length === nT);
+  const rawReady = !isVoltage || (Array.isArray(data.raw) && data.raw.length === nT);
+
+  // Per-bin extremes of the voltage trace (continuous mode): when present the trace
+  // is drawn as a filled min..max envelope rather than a polyline through one sample
+  // per bin, so a spike keeps its true height at any decimation. Gate on the server's
+  // own report, not just array presence -- when the trace was strided (or not reduced
+  // at all) raw_min === raw === raw_max, and filling between them would paint a
+  // zero-height band, i.e. an invisible trace.
+  const hasEnvelope = isVoltage && data.raw_decimation === 'minmax'
+    && Array.isArray(data.raw_min) && data.raw_min.length === nT
+    && Array.isArray(data.raw_max) && data.raw_max.length === nT;
 
   // Common gain (shared across channels so amplitudes stay comparable): the largest
   // |value| across shown rows for the active signal. Deliberately the data's own
   // peak rather than the colorbar's robust z limit -- tying the traces to `domain`
   // clipped the biggest deflections at the map scale; this shows them in full.
   const traceScale = useMemo(() => {
-    if (isRaw && !rawReady) return 1;
-    const arr = isRaw ? data.raw : data.activity;
+    if (isVoltage && !rawReady) return 1;
+    const arr = isVoltage ? data.raw : data.activity;
     if (!arr || !arr.length) return 1;
-    let m = isRaw ? 1e-6 : 1;   // floor so a flat/quiet block doesn't over-amplify
+    let m = isVoltage ? 1e-6 : 1;   // floor so a flat/quiet block doesn't over-amplify
     const step = Math.max(1, Math.floor(nT / 400));
+    // Scale to the extremes actually drawn, or the envelope clips at the midpoint scale.
+    const lo = hasEnvelope ? data.raw_min : null;
+    const hi = hasEnvelope ? data.raw_max : null;
     for (const r of rows) for (let k = 0; k < nT; k += step) {
-      const v = Math.abs(arr[k][r.ci]); if (v > m) m = v;
+      const v = hasEnvelope
+        ? Math.max(Math.abs(lo[k][r.ci]), Math.abs(hi[k][r.ci]))
+        : Math.abs(arr[k][r.ci]);
+      if (v > m) m = v;
     }
     return m;
-  }, [isRaw, rawReady, rows, data.raw, data.activity, nT]);
+  }, [isVoltage, rawReady, rows, data.raw, data.activity, data.raw_min, data.raw_max,
+      hasEnvelope, nT]);
 
   // ── Track width ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -138,27 +159,46 @@ export default function SeegTracePanel({
       ctx.fillStyle = hot ? '#e8edf2' : '#8a97a6';
       ctx.fillText(r.name, 6, yc);
       // trace (voltage traces are skipped until phase 2 fills data.raw)
-      if (!(isRaw && !rawReady)) {
-        ctx.strokeStyle = shaftColor(r.group, shaftColors); ctx.lineWidth = hot ? 1.6 : 1;
-        ctx.globalAlpha = hot ? 1 : 0.85;
-        ctx.beginPath();
-        let started = false;
-        for (let k = 0; k < nT; k += step) {
-          const v = isRaw ? data.raw[k][r.ci] : data.activity[k][r.ci];
-          const x = GUTTER + (nT > 1 ? (k / (nT - 1)) * plotW : 0);
-          const y = yc - Math.max(-1, Math.min(1, v / amp)) * (rowH * 0.8);
-          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      if (!(isVoltage && !rawReady)) {
+        const color = shaftColor(r.group, shaftColors);
+        const xAt = (k) => GUTTER + (nT > 1 ? (k / (nT - 1)) * plotW : 0);
+        const yAt = (v) => yc - Math.max(-1, Math.min(1, v / amp)) * (rowH * 0.8);
+
+        if (hasEnvelope) {
+          // Filled min..max envelope: the upper bound left-to-right, the lower bound
+          // back again. Shows the full excursion each pixel column spans.
+          ctx.fillStyle = color;
+          ctx.globalAlpha = hot ? 0.95 : 0.75;
+          ctx.beginPath();
+          for (let k = 0; k < nT; k += step) ctx.lineTo(xAt(k), yAt(data.raw_max[k][r.ci]));
+          for (let k = nT - 1 - ((nT - 1) % step); k >= 0; k -= step) {
+            ctx.lineTo(xAt(k), yAt(data.raw_min[k][r.ci]));
+          }
+          ctx.closePath();
+          ctx.fill();
+        } else {
+          ctx.strokeStyle = color; ctx.lineWidth = hot ? 1.6 : 1;
+          ctx.globalAlpha = hot ? 1 : 0.85;
+          ctx.beginPath();
+          let started = false;
+          for (let k = 0; k < nT; k += step) {
+            const v = isVoltage ? data.raw[k][r.ci] : data.activity[k][r.ci];
+            const x = xAt(k);
+            const y = yAt(v);
+            if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
         }
-        ctx.stroke();
         ctx.globalAlpha = 1;
       }
     });
 
-    if (isRaw && !rawReady) {
+    if (isVoltage && !rawReady) {
       ctx.fillStyle = '#7a8a99'; ctx.font = '11px IBM Plex Sans, sans-serif';
       ctx.fillText('Loading voltages…', GUTTER + 8, 12);
     }
-  }, [data, rows, signal, hoveredChannel, width, canvasH, rowH, nT, isRaw, rawReady, traceScale, shaftColors]);
+  }, [data, rows, signal, hoveredChannel, width, canvasH, rowH, nT, isVoltage, rawReady,
+      hasEnvelope, traceScale, shaftColors]);
 
   // ── Cursor + interaction ───────────────────────────────────────────────────
   const plotW = width - GUTTER;
@@ -216,19 +256,42 @@ export default function SeegTracePanel({
   const tDisplay = typeof tVal !== 'number' ? `${tVal}`
     : tUnit === 's' ? tVal.toFixed(1) : tVal.toFixed(0);
 
+  // Reviewer markers placed on frames by the shared helper, then given an x here --
+  // the frame mapping must match the brain view's exactly, the pixel position is ours.
+  const marks = useMemo(() => (
+    buildMarks(data.times, data.annotations, tUnit)
+      .map((m) => ({ ...m, x: GUTTER + (nT > 1 ? (m.idx / (nT - 1)) * plotW : 0) }))
+  ), [data.annotations, data.times, tUnit, nT, plotW]);
+
+  const [showEvents, setShowEvents] = useState(true);
+  // Height of the event list. Draggable divider, so a long marker track can be opened
+  // up without giving up the traces.
+  const [eventsH, setEventsH] = useState(150);
+  const jumpTo = useCallback((idx) => { setPlaying(false); setTimeIndex(idx); },
+    [setPlaying, setTimeIndex]);
+
+  const onEventsResizeDown = (e) => {
+    e.preventDefault();
+    const startY = e.clientY; const startH = eventsH;
+    // Cap against what the split actually has to share, so dragging up cannot collapse
+    // the traces to nothing: the list may take everything above a 90px trace floor.
+    const available = (wrapRef.current?.clientHeight ?? 0) + startH;
+    const maxH = Math.max(48, available - 90);
+    const move = (ev) => setEventsH(Math.max(48, Math.min(maxH, startH + (startY - ev.clientY))));
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+
   // Editable current-time field: type a timestamp and jump to the nearest frame.
   const [editingTime, setEditingTime] = useState(false);
   const [timeDraft, setTimeDraft] = useState('');
   const commitTime = () => {
     const v = parseFloat(timeDraft);
-    if (!isNaN(v) && nT > 0) {
-      let best = 0, bd = Infinity;
-      for (let i = 0; i < nT; i++) {
-        const d = Math.abs(data.times[i] - v);
-        if (d < bd) { bd = d; best = i; }
-      }
-      setPlaying(false); setTimeIndex(best);
-    }
+    if (!isNaN(v) && nT > 0) { setPlaying(false); setTimeIndex(nearestFrame(data.times, v)); }
     setEditingTime(false);
   };
 
@@ -246,8 +309,12 @@ export default function SeegTracePanel({
           {playing ? '❚❚' : '▶'}
         </button>
         <div style={{ display: 'flex', gap: 4 }}>
-          <div onClick={() => setSignal('z')} style={seg(signal === 'z')}>z-score</div>
-          <div onClick={() => setSignal('raw')} style={seg(signal === 'raw')}>voltage</div>
+          <div onClick={() => setSignal('z')} style={seg(signal === 'z')}
+            title="Band-power z-score over the whole recording">z-score</div>
+          <div onClick={() => setSignal('filtered')} style={seg(signal === 'filtered')}
+            title="Voltage bandpassed to the selected frequency band">filtered</div>
+          <div onClick={() => setSignal('raw')} style={seg(signal === 'raw')}
+            title="Voltage as recorded, no bandpass">raw</div>
         </div>
         <div style={{ width: 1, height: 16, background: '#1e2530' }} />
         <div style={{ display: 'flex', gap: 4 }}>
@@ -275,6 +342,15 @@ export default function SeegTracePanel({
               fontFamily: 'IBM Plex Mono, monospace' }} />
           <span style={{ fontSize: 10, color: '#7a8a99' }}>×</span>
         </div>
+        {marks.length > 0 && (
+          <>
+            <div style={{ width: 1, height: 16, background: '#1e2530' }} />
+            <div onClick={() => setShowEvents(!showEvents)} style={seg(showEvents)}
+              title="Show the reviewer's marker list">
+              events {marks.length}
+            </div>
+          </>
+        )}
         <div style={{ flex: 1 }} />
         <input
           value={editingTime ? timeDraft : tDisplay}
@@ -292,6 +368,25 @@ export default function SeegTracePanel({
         <span style={{ fontSize: 10, color: '#7a8a99' }}>{rows.length} ch</span>
       </div>
 
+      {/* annotation ruler: a clickable tick per reviewer marker, aligned to the plot.
+          A sibling of the scroll area rather than an overlay, so it never covers a
+          trace row and never swallows a scrub drag. */}
+      {marks.length > 0 && (
+        <div style={{ height: RULER_H, position: 'relative', flexShrink: 0,
+          background: '#0a0d11', borderBottom: '1px solid #161b22' }}>
+          {marks.map((m, i) => (
+            <div key={`t${i}`} onClick={() => jumpTo(m.idx)}
+              title={`${m.onset.toFixed(1)}s — ${m.text}`
+                + (m.channels?.length ? `  [${m.channels.join(', ')}]` : '')}
+              style={{ position: 'absolute', left: m.x - 4, top: 0, width: 9, height: RULER_H,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}>
+              <div style={{ width: 0, height: 0, borderLeft: '4px solid transparent',
+                borderRight: '4px solid transparent', borderTop: `6px solid ${m.color}` }} />
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* trace body: vertically-scrolling canvas + fixed cursor overlay */}
       <div ref={wrapRef} style={{ flex: 1, position: 'relative', minHeight: 0 }}>
         <div ref={scrollRef} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp}
@@ -299,6 +394,14 @@ export default function SeegTracePanel({
           style={{ position: 'absolute', inset: 0, overflowY: 'auto', overflowX: 'hidden', cursor: 'crosshair' }}>
           <canvas ref={canvasRef} style={{ display: 'block' }} />
         </div>
+        {/* marker lines: faint for context, emphasised + labelled for seizure onset/end */}
+        {marks.map((m, i) => (
+          <div key={`m${i}`} style={{ position: 'absolute', top: 0, bottom: 0, left: m.x, width: 1,
+            background: m.color, opacity: ANN_EMPHASIS.has(m.category) ? 0.6 : 0.16,
+            pointerEvents: 'none' }} />
+        ))}
+        {/* The annotation currently in effect is shown over the 3D brain view, not
+            here -- see SeegViewer. */}
         {/* t=0 event marker (overlay, not scrolled) — stimulus/response onset */}
         {zeroX >= 0 && (
           <>
@@ -313,6 +416,50 @@ export default function SeegTracePanel({
         <div style={{ position: 'absolute', top: 0, bottom: 0, left: cursorX, width: 1,
           background: '#00d4ff', pointerEvents: 'none', boxShadow: '0 0 6px #00d4ff88' }} />
       </div>
+
+      {/* draggable divider between the traces and the event list */}
+      {showEvents && marks.length > 0 && (
+        <div onPointerDown={onEventsResizeDown}
+          title="Drag to resize the event list"
+          style={{ height: 6, flexShrink: 0, cursor: 'ns-resize', background: '#0d1015',
+            borderTop: '1px solid #1e2530', display: 'flex', alignItems: 'center',
+            justifyContent: 'center' }}>
+          <div style={{ width: 28, height: 2, borderRadius: 1, background: '#2a3340' }} />
+        </div>
+      )}
+
+      {/* jump list: click a marker to move the cursor there */}
+      {showEvents && marks.length > 0 && (
+        <div style={{ height: eventsH, overflowY: 'auto', flexShrink: 0,
+          background: '#0a0d11' }}>
+          {marks.map((m, i) => {
+            const active = m.idx === timeIndex;
+            return (
+              <div key={`e${i}`} onClick={() => jumpTo(m.idx)}
+                onMouseEnter={() => m.channels?.length && setHoveredChannel(m.channels[0])}
+                onMouseLeave={() => setHoveredChannel(null)}
+                title={m.text}
+                style={{ display: 'flex', alignItems: 'baseline', gap: 7, padding: '3px 10px',
+                  cursor: 'pointer', fontSize: 10.5, fontFamily: 'IBM Plex Mono, monospace',
+                  background: active ? '#00d4ff14' : 'transparent',
+                  borderLeft: `2px solid ${active ? '#00d4ff' : 'transparent'}` }}>
+                <span style={{ color: '#7a8a99', width: 40, textAlign: 'right', flexShrink: 0 }}>
+                  {m.onset.toFixed(0)}s
+                </span>
+                <span style={{ width: 6, height: 6, borderRadius: 3, background: m.color,
+                  flexShrink: 0, alignSelf: 'center' }} />
+                <span style={{ color: active ? '#e8edf2' : '#c8d4e0', whiteSpace: 'nowrap',
+                  overflow: 'hidden', textOverflow: 'ellipsis' }}>{m.text}</span>
+                {m.channels?.length > 0 && (
+                  <span style={{ color: '#7a8a99', flexShrink: 0, marginLeft: 'auto' }}>
+                    {m.channels.join(' ')}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
