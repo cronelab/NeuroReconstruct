@@ -1786,6 +1786,9 @@ class SeegActivityRequest(BaseModel):
     baseline_ms: Optional[List[float]] = None
     # False = activation map only (skip the slow raw-voltage read; ``raw`` empty).
     include_raw: bool = True
+    # False = omit the activation map. The viewer's second fetch only wants the traces,
+    # and the map is the large part of the payload, so it should not travel twice.
+    include_activity: bool = True
     # Continuous mode: bandpass the displayed voltage trace to the selected band.
     # On by default -- the trace then matches the band it is labelled with.
     filter_raw: bool = True
@@ -1818,7 +1821,7 @@ async def compute_seeg_activity(
 
     from services.seeg_service import (
         compute_activity, parse_seeg_h5, join_channels_to_contacts,
-        DEFAULT_WINDOW_MS, default_band_for, resolve_band,
+        DEFAULT_WINDOW_MS, default_band_for, resolve_band, encode_activity_response,
     )
     if req.mode not in ("trial", "scroll"):
         raise HTTPException(status_code=400, detail="mode must be 'trial' or 'scroll'")
@@ -1869,14 +1872,20 @@ async def compute_seeg_activity(
     native = await _gather_native_contacts(db, recon_id)
     join = join_channels_to_contacts(meta["channels"], native, None)
 
-    return {
-        **activity,
+    # Encoding the traces to lists is CPU work too; keep it off the event loop.
+    payload = await loop.run_in_executor(
+        None, lambda: encode_activity_response(
+            activity, include_activity=req.include_activity, include_raw=req.include_raw))
+    # Already JSON-safe, so a JSONResponse skips FastAPI's per-element jsonable_encoder
+    # walk, which on hundreds of thousands of trace values is the slow part.
+    return JSONResponse({
+        **payload,
         "coords_native": join["coords_native"],
         "matched": join["matched"],
         "unmatched_channels": join["unmatched_channels"],
         "unmatched_contacts": join["unmatched_contacts"],
         "attrs": meta["attrs"],
-    }
+    })
 
 
 # -- Secondary MRI scans (extra slice-viewer base layers) ----------------------

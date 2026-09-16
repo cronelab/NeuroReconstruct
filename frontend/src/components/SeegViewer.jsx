@@ -101,6 +101,7 @@ export default function SeegViewer({ reconId, onBack }) {
     seegBrainOpacity, setSeegBrainOpacity, seegStructureOpacity, setSeegStructureOpacity,
     seegIgnoreOutside, setSeegIgnoreOutside, seegColorLimit, setSeegColorLimit,
     seegTimeIndex, setSeegTimeIndex, seegPlaying, setSeegPlaying,
+    seegPlaySpeed, setSeegPlaySpeed, seegLiveValues, setSeegPlayhead,
     // Structures live in the global store so the shared StructurePanel (master
     // toggle + hierarchical tri-state + opacity) drives both this view and the
     // main reconstruction viewer consistently.
@@ -256,22 +257,26 @@ export default function SeegViewer({ reconId, onBack }) {
         if (seq !== reqSeqRef.current) return;                 // superseded
         setSeegActivity(r.data);
         setComputing(false);                                   // map is ready
-        // Phase 2: raw voltages for the trace panel (map stays put on failure).
-        computeSeegActivity(reconId, seegRecordingId, { ...params, include_raw: true })
+        // Phase 2: raw voltages for the trace panel (map stays put on failure). The map
+        // is already here and is the bulk of the payload, so this asks for traces only.
+        computeSeegActivity(reconId, seegRecordingId,
+          { ...params, include_raw: true, include_activity: false })
           .then((r2) => {
             if (seq !== reqSeqRef.current) return;
             // setSeegActivity has no functional-updater form; read latest from the store.
             const cur = useAppStore.getState().seegActivity;
-            // Phase 2 carries the voltage trace: the series plus its per-bin extremes
-            // (continuous mode) — all of which the panel needs to draw the envelope.
-            const full = cur ? {
+            if (!cur) return;
+            // Phase 2 carries the voltage trace on its own display axis: the series plus
+            // its per-bin extremes (continuous mode) — all of which the panel needs.
+            const full = {
               ...cur,
+              trace_times: r2.data.trace_times,
               raw: r2.data.raw,
               raw_min: r2.data.raw_min,
               raw_max: r2.data.raw_max,
               raw_filtered: r2.data.raw_filtered,
               raw_decimation: r2.data.raw_decimation,
-            } : r2.data;
+            };
             setSeegActivity(full);
             if (key) cachePut(key, full);   // cache the full result for instant re-switch
           })
@@ -288,15 +293,75 @@ export default function SeegViewer({ reconId, onBack }) {
       seegBaseStart, seegBaseEnd]);
 
   // ── Playback ──────────────────────────────────────────────────────────────────
+  // Playback runs on the recording's clock, not the frame count: a playhead advances by
+  // wall time x speed, once per displayed frame, and the brain shows the value AT the
+  // playhead -- not merely the nearest map frame. The map is sampled at its band
+  // envelope's Nyquist rate, so what lies between two frames is recoverable:
+  //   - slower than the map rate (the playhead moves less than a frame per display
+  //     frame): interpolate between the frames either side, so a slow band or slow
+  //     speed glides instead of stepping;
+  //   - faster (several map frames pass per display frame): average the frames passed.
+  //     The display refresh is itself a sampler, and showing one frame out of each run
+  //     would alias -- activity flickering in and out depending on which frame is hit.
   const nFrames = seegActivity?.times?.length || 0;
+  const playMode = seegActivity?.mode === 'trial' ? 'trial' : 'scroll';
+  const playSpeed = seegPlaySpeed[playMode];
+  const mapTimes = seegActivity?.times;
+  const mapValues = seegActivity?.activity_values;
+  const mapUnit = seegActivity?.time_unit;
   useEffect(() => {
-    if (!seegPlaying || nFrames < 2) return undefined;
-    const id = setInterval(() => {
-      const { seegTimeIndex: t } = useAppStore.getState();
-      setSeegTimeIndex((t + 1) % nFrames);
-    }, 60);
-    return () => clearInterval(id);
-  }, [seegPlaying, nFrames]);
+    const times = mapTimes, values = mapValues;
+    if (!seegPlaying || !times || times.length < 2 || !values) return undefined;
+    const perSecond = playSpeed * (mapUnit === 'ms' ? 1000 : 1);
+    const last = times.length - 1;
+    const nCh = values.length / times.length;
+    // Last frame at or before t (times are ascending).
+    const frameAt = (t) => {
+      let lo = 0, hi = last;
+      while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (times[mid] <= t) lo = mid; else hi = mid - 1; }
+      return lo;
+    };
+    // Seeking pauses playback, so the playhead only needs seeding from the cursor here.
+    let playhead = times[Math.min(useAppStore.getState().seegTimeIndex, last)];
+    let prevFrame = frameAt(playhead);
+    let prevWall = performance.now();
+
+    const tick = () => {
+      const now = performance.now();
+      playhead += ((now - prevWall) / 1000) * perSecond;
+      prevWall = now;
+      let wrapped = false;
+      if (playhead > times[last]) { playhead = times[0]; wrapped = true; }   // loop
+      const k = frameAt(playhead);
+      const out = new Float32Array(nCh);
+      if (wrapped || k - prevFrame <= 1) {
+        const k1 = Math.min(k + 1, last);
+        const span = times[k1] - times[k];
+        const f = span > 0 ? Math.min(1, (playhead - times[k]) / span) : 0;
+        const a = k * nCh, b = k1 * nCh;
+        for (let c = 0; c < nCh; c++) out[c] = values[a + c] + (values[b + c] - values[a + c]) * f;
+      } else {
+        for (let j = prevFrame + 1; j <= k; j++) {
+          const a = j * nCh;
+          for (let c = 0; c < nCh; c++) out[c] += values[a + c];
+        }
+        const n = k - prevFrame;
+        for (let c = 0; c < nCh; c++) out[c] /= n;
+      }
+      prevFrame = k;
+      setSeegPlayhead(k, out);
+    };
+
+    // One step per displayed frame. requestAnimationFrame is suspended while the page is
+    // hidden or throttled, so a coarse timer keeps the playhead advancing then too.
+    let raf = 0, lastTick = performance.now();
+    const onFrame = () => { tick(); lastTick = performance.now(); raf = requestAnimationFrame(onFrame); };
+    raf = requestAnimationFrame(onFrame);
+    const watchdog = setInterval(() => {
+      if (performance.now() - lastTick > 100) { tick(); lastTick = performance.now(); }
+    }, 50);
+    return () => { cancelAnimationFrame(raf); clearInterval(watchdog); };
+  }, [seegPlaying, mapTimes, mapValues, mapUnit, playSpeed]);
 
   // Shaft colors come from the reconstruction's own shafts, so a shaft is the same
   // color here as in the reconstruction / electrode-editor viewers.
@@ -335,32 +400,41 @@ export default function SeegViewer({ reconId, onBack }) {
   // Contacts outside the brain are excluded when "ignore outside" is on. No floor
   // is applied, so quiet recordings get a tight scale; a manual limit
   // (seegColorLimit) overrides this auto value when set.
+  // A Nyquist-spaced map can hold millions of values, so this reads the flat typed array
+  // and, past ~1M, a regular subsample of frames: the 99th percentile of that many draws
+  // is stable to well under the 0.1 z the result is rounded to.
+  const autoValues = seegActivity?.activity_values;
+  const autoChannels = seegActivity?.channels;
   const autoDomain = useMemo(() => {
-    const act = seegActivity?.activity;
-    if (!act?.length) return 6;
-    const chans = seegActivity.channels;
-    const vals = [];
-    for (const row of act) {
-      for (let i = 0; i < row.length; i++) {
-        if (seegIgnoreOutside && insideByName[chans[i]] === false) continue;
-        vals.push(Math.abs(row[i]));
-      }
+    if (!autoValues?.length || !autoChannels?.length) return 6;
+    const nCh = autoChannels.length;
+    const nFrames = autoValues.length / nCh;
+    const keep = autoChannels.map((c) => !(seegIgnoreOutside && insideByName[c] === false));
+    const nKeep = keep.filter(Boolean).length;
+    if (!nKeep) return 6;
+    const frameStep = Math.max(1, Math.ceil((nFrames * nKeep) / 1e6));
+    const vals = new Float32Array(Math.ceil(nFrames / frameStep) * nKeep);
+    let n = 0;
+    for (let k = 0; k < nFrames; k += frameStep) {
+      const a = k * nCh;
+      for (let i = 0; i < nCh; i++) if (keep[i]) vals[n++] = Math.abs(autoValues[a + i]);
     }
-    if (!vals.length) return 6;
-    vals.sort((a, b) => a - b);
-    const p99 = vals[Math.floor(0.99 * (vals.length - 1))];
+    const sorted = vals.subarray(0, n).sort();          // typed-array sort is numeric
+    const p99 = sorted[Math.floor(0.99 * (n - 1))];
     // No floor or ceiling — the scale tracks the data; use the manual limit to
     // tame outliers. The guard only handles the all-zero case.
     if (p99 <= 0) return 6;
     return Math.round(p99 * 10) / 10;
-  }, [seegActivity, seegIgnoreOutside, insideByName]);
+  }, [autoValues, autoChannels, seegIgnoreOutside, insideByName]);
 
   const domain = (seegColorLimit != null && seegColorLimit > 0) ? seegColorLimit : autoDomain;
 
   // ── Resolve contacts (native brain space) at the current time index ───────────
   const contacts = useMemo(() => {
     if (!seegActivity || !surfaceMesh) return [];
-    const frame = seegActivity.activity[seegTimeIndex] || [];
+    // While playing, the value at the playhead itself (between frames); otherwise the frame.
+    const frame = (seegLiveValues && seegLiveValues.length === seegActivity.channels.length)
+      ? seegLiveValues : (seegActivity.activity[seegTimeIndex] || []);
     const coordsMap = seegActivity.coords_native;
     const out = [];
     seegActivity.channels.forEach((name, i) => {
@@ -372,7 +446,7 @@ export default function SeegViewer({ reconId, onBack }) {
         pos: [c[0], c[1], c[2]], inside });
     });
     return out;
-  }, [seegActivity, surfaceMesh, seegTimeIndex, seegIgnoreOutside, insideByName]);
+  }, [seegActivity, surfaceMesh, seegTimeIndex, seegLiveValues, seegIgnoreOutside, insideByName]);
 
   const handleUpload = async (e) => {
     const file = e.target.files?.[0];
@@ -457,6 +531,18 @@ export default function SeegViewer({ reconId, onBack }) {
           )}
           {bandError && (
             <div style={{ fontSize: 10, color: '#ff8a80', marginTop: 6 }}>{bandError}</div>
+          )}
+          {/* How finely the map is sampled against what the band needs. Below Nyquist only
+              happens when a long, many-channel recording would exceed the payload budget. */}
+          {seegActivity?.map_rate_hz != null && (
+            <div style={{ fontSize: 10, marginTop: 6, fontFamily: 'IBM Plex Mono, monospace',
+              color: seegActivity.map_nyquist_met ? '#7a8a99' : '#ffb74d' }}
+              title={seegActivity.map_nyquist_met
+                ? 'Map frame rate is at least twice the width of the band, the highest frequency its power envelope contains'
+                : 'Too many frames to send at the Nyquist rate; each frame averages the envelope over its span, so fast changes are smoothed rather than aliased'}>
+              map {seegActivity.map_rate_hz.toFixed(1)} Hz · Nyquist {seegActivity.map_nyquist_hz.toFixed(0)} Hz
+              {seegActivity.map_nyquist_met ? '' : ' · smoothed to fit'}
+            </div>
           )}
 
         </div>
@@ -689,6 +775,7 @@ export default function SeegViewer({ reconId, onBack }) {
           width={seegTracePanelW} setWidth={setSeegTracePanelW}
           traceGain={seegTraceGain} setTraceGain={setSeegTraceGain}
           playing={seegPlaying} setPlaying={setSeegPlaying}
+          speed={playSpeed} setSpeed={(v) => setSeegPlaySpeed(playMode, v)}
           shaftColors={shaftColors}
         />
       )}

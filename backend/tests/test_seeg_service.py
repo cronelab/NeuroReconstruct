@@ -6,6 +6,7 @@ Tests for services.seeg_service. Self-contained: run directly with
 (No pytest dependency in the neuro-recon env.) Uses the synthetic h5 generator.
 """
 
+import base64
 import os
 import sys
 import tempfile
@@ -91,12 +92,13 @@ def test_event_activity_rise():
         assert out["mode"] == "trial" and out["time_unit"] == "ms"
         assert out["groups"] == ["LAH", "LAH", "LAH", "LPH"]
         act = np.array(out["activity"])                     # (frames, channels)
-        raw = np.array(out["raw"])                          # (frames, channels) uV ERP
+        raw = np.array(out["raw"])                          # (trace frames, channels) uV ERP
         times = np.array(out["times"])                      # ms, full peri-event window
         assert out["align"] == "stimulus"
         assert act.shape[0] == len(times)
         assert act.shape[1] == len(chans)
-        assert raw.shape == act.shape and np.isfinite(raw).all()
+        assert raw.shape == (len(out["trace_times"]), len(chans)) and np.isfinite(raw).all()
+        assert out["map_nyquist_met"]
         # Output now spans the full window (default start -500 ms); baseline separate.
         assert -505 <= times.min() <= -495, times.min()
         # Active channels show a strong positive baseline-z in the burst (0..400 ms);
@@ -134,12 +136,60 @@ def test_continuous_traces():
         assert out["mode"] == "scroll" and out["time_unit"] == "s"
         assert out["channels"] == chans
         act = np.array(out["activity"]); raw = np.array(out["raw"])
-        t = np.array(out["times"])
-        assert act.shape == raw.shape == (len(t), len(chans))
+        t = np.array(out["times"]); tt = np.array(out["trace_times"])
+        assert act.shape == (len(t), len(chans))
+        assert raw.shape == (len(tt), len(chans))
         assert np.isfinite(act).all() and np.isfinite(raw).all()
         assert t.min() >= 0 and t.max() <= 30.0
-        assert act.shape[0] <= 2500
+        # Map frames at the high-gamma envelope's Nyquist stride: 2000 Hz / (2 * 80 Hz) -> 12.
+        assert np.allclose(np.diff(t), 12 / 2000.0, atol=1e-4)
+        assert out["map_nyquist_met"] and out["map_rate_hz"] >= out["map_nyquist_hz"]
+        assert len(tt) <= S.TRACE_FRAMES_SCROLL
     print("ok test_continuous_traces")
+
+
+def test_envelope_nyquist_step():
+    # The envelope of a [lo, hi] band spans 0..(hi - lo) Hz, so the stride is fs / 2(hi-lo).
+    assert S.envelope_nyquist_step(2000.0, (1.0, 70.0)) == 14       # 142.9 Hz >= 138 Hz
+    assert S.envelope_nyquist_step(2000.0, (70.0, 150.0)) == 12     # 166.7 Hz >= 160 Hz
+    assert S.envelope_nyquist_step(2000.0, (1.0, 4.0)) == 333       # 6.006 Hz >= 6 Hz
+    for band in S.BANDS.values():
+        step = S.envelope_nyquist_step(2000.0, band)
+        assert 2000.0 / step >= 2 * (band[1] - band[0])
+    # A band past what the rate can represent clamps; a degenerate one needs every sample.
+    assert S.envelope_nyquist_step(200.0, (150.0, 300.0)) == 1
+    print("ok test_envelope_nyquist_step")
+
+
+def test_map_budget_fallback_lowpasses():
+    # Within budget the Nyquist stride stands; past it the stride widens and each bin is
+    # averaged, so a fast oscillation is attenuated rather than aliased into a slow one.
+    assert S.map_step(600_000, 79, 2000.0, (1.0, 70.0), budget=10**8) == (14, 14)
+    step, nyq = S.map_step(600_000, 79, 2000.0, (1.0, 70.0), budget=79 * 1000)
+    assert nyq == 14 and step == 600 and np.ceil(600_000 / step) * 79 <= 79 * 1000
+    fs, n = 2000.0, 60_000
+    # 51 Hz, so the strided samples do not happen to land on zero crossings.
+    x = np.sin(2 * np.pi * 51.0 * np.arange(n) / fs)[:, None].astype(np.float32)
+    point = x[::600]                                     # what plain striding would show
+    binned = S._reduce_map(x, 600, 14)
+    assert np.abs(binned).max() < 0.05 < np.abs(point).max()
+    print("ok test_map_budget_fallback_lowpasses")
+
+
+def test_encode_activity_response():
+    act = np.array([[0.0, -1.234], [3.456, 400.0]], np.float32)
+    res = {"channels": ["A1", "A2"], "times": [0.0, 1.0], "activity": act,
+           "trace_times": [0.0], "raw": np.array([[1.23456, 2.0]], np.float32),
+           "raw_min": np.zeros((0, 2), np.float32), "raw_max": np.zeros((0, 2), np.float32)}
+    out = S.encode_activity_response(res)
+    assert not any(isinstance(v, np.ndarray) for v in out.values())
+    q = np.frombuffer(base64.b64decode(out["activity_b64"]), "<i2").reshape(out["activity_shape"])
+    assert np.allclose(q * out["activity_scale"], np.clip(act, -327.67, 327.67), atol=0.006)
+    assert out["raw"] == [[1.23, 2.0]] and out["raw_min"] == []
+    # The viewer's trace-only fetch omits the map and its axis.
+    slim = S.encode_activity_response(res, include_activity=False)
+    assert "activity_b64" not in slim and "times" not in slim and "trace_times" in slim
+    print("ok test_encode_activity_response")
 
 
 def test_env_cache():
@@ -153,7 +203,7 @@ def test_env_cache():
         assert os.path.exists(cache), "envelope cache not written"
         mt = os.path.getmtime(cache)
         out2 = S.compute_band_activity(p, band="high_gamma")     # hit -> same result
-        assert out1["activity"] == out2["activity"]
+        assert np.array_equal(out1["activity"], out2["activity"])
         # A different mode for the SAME (file, band) reuses the cache, not rewrites it.
         S.compute_continuous_traces(p, band="high_gamma")
         assert os.path.getmtime(cache) == mt, "cache was rewritten instead of reused"
@@ -172,7 +222,11 @@ def test_window_param():
         t = np.array(out["times"])
         # Displayed time course spans the full window: start .. end.
         assert -105 < t.min() <= -95, t.min()
-        assert 495 < t.max() <= 500.5, t.max()
+        # The map's last frame falls within one Nyquist-spaced frame of the last sample
+        # (499.5 ms at 2 kHz).
+        frame_ms = 1000.0 / out["map_rate_hz"]
+        assert 499.5 - frame_ms - 1e-3 <= t.max() <= 500.5, t.max()
+        assert 495 < max(out["trace_times"]) <= 500.5
         assert np.array(out["activity"]).shape[0] == len(t)
     print("ok test_window_param")
 
@@ -225,7 +279,7 @@ def test_stimulus_relative_baseline():
         a = S.compute_band_activity(p, band="high_gamma", window_ms=(-500.0, 1500.0))
         b = S.compute_band_activity(p, band="high_gamma", window_ms=(-500.0, 1500.0),
                                     baseline_ms=(-500.0, 0.0))
-        assert a["activity"] == b["activity"]
+        assert np.array_equal(a["activity"], b["activity"])
     print("ok test_stimulus_relative_baseline")
 
 
@@ -236,6 +290,9 @@ if __name__ == "__main__":
     test_name_join()
     test_degenerate_channel_finite()
     test_continuous_traces()
+    test_envelope_nyquist_step()
+    test_map_budget_fallback_lowpasses()
+    test_encode_activity_response()
     test_env_cache()
     test_window_param()
     test_event_activity_rise()

@@ -144,9 +144,33 @@ export const uploadSeeg = (reconId, file) => {
 export const listSeeg = (reconId) =>
   api.get(`/reconstructions/${reconId}/seeg`);
 
+// The activation map arrives as base64 int16 (`activity_b64`, see the backend's
+// encode_activity_response), because at the band's Nyquist rate it can run to millions
+// of values. Decode it into one Float32Array and hand consumers a per-frame view of it,
+// so `activity[frame][channel]` reads exactly as the old nested JSON arrays did.
+function decodeSeegActivity(d) {
+  if (!d || typeof d.activity_b64 !== 'string') return d;
+  const [nFrames, nCh] = d.activity_shape;
+  const bin = atob(d.activity_b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  // Int16Array reads the platform byte order; every browser platform is little-endian,
+  // matching the '<i2' the server writes.
+  const q = new Int16Array(bytes.buffer, 0, nFrames * nCh);
+  const values = new Float32Array(q.length);
+  const scale = d.activity_scale;
+  for (let i = 0; i < q.length; i++) values[i] = q[i] * scale;
+  const activity = new Array(nFrames);
+  for (let k = 0; k < nFrames; k++) activity[k] = values.subarray(k * nCh, (k + 1) * nCh);
+  const { activity_b64: _b64, ...rest } = d;
+  return { ...rest, activity, activity_values: values };
+}
+
 export const computeSeegActivity = (reconId, recId,
-  { band, mode, align, window_ms, baseline_ms, include_raw, filter_raw } = {}) =>
+  { band, mode, align, window_ms, baseline_ms, include_raw, include_activity, filter_raw } = {}) =>
   api.post(`/reconstructions/${reconId}/seeg/${recId}/activity`,
-    { band, mode, align, window_ms, baseline_ms, include_raw, filter_raw }, { timeout: 300000 });
+    { band, mode, align, window_ms, baseline_ms, include_raw, include_activity, filter_raw },
+    { timeout: 300000 })
+    .then((r) => ({ ...r, data: decodeSeegActivity(r.data) }));
 
 export default api;

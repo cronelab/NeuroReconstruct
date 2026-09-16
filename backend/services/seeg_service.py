@@ -27,6 +27,7 @@ import os
 import re
 import json
 import time
+import base64
 from collections import OrderedDict
 
 import numpy as np
@@ -102,7 +103,81 @@ def default_band_for(meta: dict) -> str:
 
 
 DEFAULT_WINDOW_MS = (-500.0, 2000.0)  # peri-stimulus window (relative to onset)
-MAX_OUTPUT_FRAMES = 1500              # cap frames sent to the client per request
+
+# ── Frame spacing ─────────────────────────────────────────────────────────────
+# The response carries two time axes, sized for different reasons.
+#
+# The ACTIVATION MAP (`times` / `activity`) is what the brain plays back, so its frame
+# spacing follows the signal: the Nyquist rate of the band-power envelope. The Hilbert
+# amplitude of a signal bandpassed to [lo, hi] is a baseband signal whose spectrum ends
+# at the band's WIDTH, hi - lo (the squared envelope's spectrum is exactly the analytic
+# spectrum's autocorrelation, supported on [-(hi-lo), hi-lo]). So the map needs at
+# least 2 * (hi - lo) frames per second -- 138 Hz for 1-70 Hz, 160 Hz for high gamma,
+# only 6 Hz for delta, whose envelope genuinely cannot change faster. Anything coarser
+# aliases; anything finer only costs bytes.
+#
+# The VOLTAGE TRACES (`trace_times` / `raw*`) are drawn into a panel a few hundred
+# pixels wide, so their resolution is a display concern and stays a fixed bin count.
+TRACE_FRAMES_TRIAL = 1500
+TRACE_FRAMES_SCROLL = 2500
+
+# Ceiling on map values (frames x channels) in one response. The Nyquist spacing alone
+# scales with recording length x band width x channel count: 478 s of 142 channels at
+# 1-70 Hz is 9.7M values. 4M int16 values is ~8 MB of payload (~10.7 MB base64), which
+# a browser parses in well under a second; past that the map is coarsened to fit --
+# with the envelope averaged over each bin first, so it is low-passed rather than
+# aliased -- and the response says so (`map_nyquist_met`).
+MAP_VALUE_BUDGET = 4_000_000
+
+
+def envelope_nyquist_step(fs: float, band_hz: tuple) -> int:
+    """
+    Largest sample stride that still samples the band's envelope at its Nyquist rate.
+
+    Mirrors ``bandpass``'s clamping of the band to what ``fs`` can represent. A band
+    that clamps to nothing falls back to the broadband |signal|, which needs every sample.
+    """
+    lo, hi = band_hz
+    width = min(hi, fs / 2.0 * 0.99) - max(lo, 0.1)
+    if width <= 0:
+        return 1
+    return max(1, int(fs // (2.0 * width)))
+
+
+def map_step(n_samples: int, n_channels: int, fs: float, band_hz: tuple,
+             budget: int = MAP_VALUE_BUDGET) -> tuple:
+    """``(step, nyquist_step)``: the Nyquist stride, widened only if it busts the budget."""
+    nyq = envelope_nyquist_step(fs, band_hz)
+    max_frames = max(1, budget // max(1, n_channels))
+    fit = int(np.ceil(n_samples / max_frames)) if n_samples > max_frames else 1
+    return max(nyq, fit), nyq
+
+
+def _reduce_map(x: np.ndarray, step: int, nyquist_step: int) -> np.ndarray:
+    """
+    Decimate an envelope-derived map (n_samples, n_channels) by ``step``.
+
+    At or below the Nyquist stride, point samples lose nothing. Beyond it (budget
+    fallback), averaging each bin first is a boxcar low-pass, so content the frame rate
+    can no longer represent is attenuated instead of folding down as false activity.
+    """
+    n = x.shape[0]
+    bins = np.arange(0, n, step)
+    if step <= nyquist_step:
+        return x[bins]
+    counts = np.diff(np.append(bins, n)).astype(x.dtype)
+    return np.add.reduceat(x, bins, axis=0) / counts[:, None]
+
+
+def _map_sampling(fs: float, step: int, nyquist_step: int, band_hz: tuple) -> dict:
+    lo, hi = band_hz
+    width = min(hi, fs / 2.0 * 0.99) - max(lo, 0.1)
+    return {
+        "map_rate_hz": round(fs / step, 3),
+        # A degenerate band falls back to the broadband signal, which needs the full rate.
+        "map_nyquist_hz": round(2.0 * width, 3) if width > 0 else float(fs),
+        "map_nyquist_met": bool(step <= nyquist_step),
+    }
 
 
 # ── H5 parsing ──────────────────────────────────────────────────────────────
@@ -417,7 +492,7 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
                           window_ms: tuple = DEFAULT_WINDOW_MS,
                           baseline_ms: tuple = None,
                           align: str = "stimulus",
-                          max_frames: int = MAX_OUTPUT_FRAMES,
+                          trace_frames: int = TRACE_FRAMES_TRIAL,
                           include_raw: bool = True) -> dict:
     """
     Compute the event-related display activity matrix for one h5 recording.
@@ -442,10 +517,13 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
     Returns:
       channels: [name, ...]              (mappable channels, order matches columns)
       groups:   [shaft, ...]             per-channel shaft name
-      times:    [t_ms, ...]              time in ms relative to the event (may be < 0)
-      activity: [[v, ...], ...]          shape (n_frames, n_channels), baseline z
-      raw:      [[uV, ...], ...]         trial-averaged, baseline-corrected ERP (uV)
-      mode ('trial'), time_unit ('ms'), band, align, n_trials, n_no_response
+      times:    [t_ms, ...]              map frames, ms relative to the event (may be < 0),
+                                         spaced at the band envelope's Nyquist rate
+      activity: float32 (n_frames, n_channels) baseline z on `times`
+      trace_times: [t_ms, ...]           trace frames, a fixed display resolution
+      raw:      float32 (n_trace_frames, n_channels) trial-averaged, baseline-corrected ERP (uV)
+      mode ('trial'), time_unit ('ms'), band, align, n_trials, n_no_response,
+      map_rate_hz, map_nyquist_hz, map_nyquist_met
     """
     # Normalise a preset name or a custom "<highpass>-<lowpass>" spec to its canonical
     # key, so the envelope cache and the echoed `band` field agree. Raises on a bad spec.
@@ -459,7 +537,8 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
     names = [c["name"] for c in meta["channels"]]
     groups = [c["group"] for c in meta["channels"]]
     if not meta["channels"]:
-        return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
+        return {"channels": [], "groups": [], "times": [], "activity": np.zeros((0, 0), np.float32),
+                "trace_times": [], "raw": np.zeros((0, 0), np.float32),
                 "mode": "trial", "time_unit": "ms", "band": band, "band_hz": list(band_hz), "align": align,
                 "n_trials": 0, "n_no_response": 0}
 
@@ -544,36 +623,42 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
     avg_raw = (np.nan_to_num(acc_raw / used, nan=0.0, posinf=0.0, neginf=0.0) * 1e6
                if include_raw else None)  # uV
 
-    # Decimate the (full-window) time axis if very long.
-    n_out = len(pst_times_ms)
-    if n_out > max_frames:
-        sel = np.arange(0, n_out, int(np.ceil(n_out / max_frames)))
-        avg, pst_times_ms = avg[sel], pst_times_ms[sel]
-        if include_raw:
-            avg_raw = avg_raw[sel]
+    # Map: frames at the envelope's Nyquist rate (see map_step).
+    step, nyq = map_step(n_pst, n_ch, fs, band_hz)
+    map_times = pst_times_ms[::step]
+    avg = _reduce_map(avg, step, nyq)
+    # Traces: their own display resolution. The ERP is broadband, so it keeps the
+    # finer stride it always had rather than inheriting a narrow band's coarse one.
+    tstep = int(np.ceil(n_pst / trace_frames)) if n_pst > trace_frames else 1
+    trace_times = pst_times_ms[::tstep]
+    if include_raw:
+        avg_raw = avg_raw[::tstep]
 
     return {
         "channels": names,
         "groups": groups,
-        "times": [round(float(t), 2) for t in pst_times_ms],
-        "activity": np.round(avg, 3).tolist(),
-        "raw": np.round(avg_raw, 2).tolist() if include_raw else [],
+        "times": [round(float(t), 2) for t in map_times],
+        "activity": avg.astype(np.float32),
+        "trace_times": [round(float(t), 2) for t in trace_times],
+        "raw": avg_raw.astype(np.float32) if include_raw else np.zeros((0, n_ch), np.float32),
         "mode": "trial", "time_unit": "ms", "band": band, "band_hz": list(band_hz), "align": align,
         "n_trials": used, "n_no_response": n_no_response,
+        **_map_sampling(fs, step, nyq, band_hz),
     }
 
 
 def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
-                              max_frames: int = 2500,
+                              trace_frames: int = TRACE_FRAMES_SCROLL,
                               include_raw: bool = True,
                               filter_raw: bool = True) -> dict:
     """
     Continuous (scrollable) traces over the whole recording.
 
     Returns per-channel band-power z-score (normalized to the whole-recording
-    envelope mean/SD) and voltage, both decimated to <= max_frames. The voltage is
-    bandpassed to ``band`` when ``filter_raw`` (the default) and is reduced by
-    per-bin min/max, returned alongside as ``raw_min``/``raw_max``.
+    envelope mean/SD) on frames at the envelope's Nyquist rate, and voltage on its own
+    axis of <= trace_frames display bins. The voltage is bandpassed to ``band`` when
+    ``filter_raw`` (the default) and is reduced by per-bin min/max, returned alongside
+    as ``raw_min``/``raw_max``.
 
     Returns the same shape as compute_band_activity with mode='scroll',
     time_unit='s', and n_trials=0.
@@ -586,9 +671,10 @@ def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
     names = [c["name"] for c in meta["channels"]]
     groups = [c["group"] for c in meta["channels"]]
     if not meta["channels"]:
-        return {"channels": [], "groups": [], "times": [], "activity": [], "raw": [],
-                "raw_min": [], "raw_max": [], "raw_filtered": False,
-                "raw_decimation": "none",
+        empty = np.zeros((0, 0), np.float32)
+        return {"channels": [], "groups": [], "times": [], "activity": empty,
+                "trace_times": [], "raw": empty, "raw_min": empty, "raw_max": empty,
+                "raw_filtered": False, "raw_decimation": "none",
                 "mode": "scroll", "time_unit": "s", "band": band, "band_hz": list(band_hz), "n_trials": 0,
                 "annotations": meta.get("annotations", [])}
 
@@ -600,7 +686,12 @@ def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
                       nan=0.0, posinf=0.0, neginf=0.0)
 
     n = env.shape[0]
-    step = int(np.ceil(n / max_frames)) if n > max_frames else 1
+    # Map: frames at the envelope's Nyquist rate (see map_step).
+    mstep, nyq = map_step(n, env.shape[1], fs, band_hz)
+    map_times_s = np.arange(0, n, mstep) / fs
+    z_map = _reduce_map(z, mstep, nyq)
+    # Traces: a fixed display resolution, independent of the map.
+    step = int(np.ceil(n / trace_frames)) if n > trace_frames else 1
     idx = np.arange(0, n, step)
     times_s = idx / fs
 
@@ -655,32 +746,41 @@ def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
         _dbg(f"[SEEG] scroll: decimated raw via {raw_src} "
              f"(filter_raw={filter_raw}) in {time.perf_counter() - t_raw:.2f}s")
 
+    empty = np.zeros((0, len(names)), np.float32)
     return {
         "channels": names,
         "groups": groups,
-        "times": [round(float(t), 4) for t in times_s],
-        "activity": np.round(z[idx], 3).tolist(),
-        "raw": np.round(raw * 1e6, 2).tolist() if include_raw else [],   # uV
+        "times": [round(float(t), 4) for t in map_times_s],
+        "activity": z_map.astype(np.float32),
+        "trace_times": [round(float(t), 4) for t in times_s],
+        "raw": (raw * 1e6).astype(np.float32) if include_raw else empty,   # uV
         # Per-bin extremes of the same series, so the panel can draw the true spike
         # envelope instead of a strided sample. Equal to `raw` when no reduction ran.
-        "raw_min": np.round(raw_min * 1e6, 2).tolist() if include_raw else [],
-        "raw_max": np.round(raw_max * 1e6, 2).tolist() if include_raw else [],
+        "raw_min": (raw_min * 1e6).astype(np.float32) if include_raw else empty,
+        "raw_max": (raw_max * 1e6).astype(np.float32) if include_raw else empty,
         "raw_filtered": bool(include_raw and filter_raw),
         "raw_decimation": raw_decimation,
         "mode": "scroll", "time_unit": "s", "band": band, "band_hz": list(band_hz), "n_trials": 0,
         # Reviewer markers on the same clock as `times` (clinical recordings only).
         "annotations": meta.get("annotations", []),
+        **_map_sampling(fs, mstep, nyq, band_hz),
     }
 
 
 # ── In-process result cache + cached dispatch ────────────────────────────────
 # Computed activity/trace responses are a pure function of (file identity, mode,
-# band, window, include_raw, max_frames). Memoize them in an LRU so flipping back
-# to a previously-viewed recording+settings is instant. Entries are small (the
-# decimated matrices), so a few dozen cost only tens of MB of RAM -- no disk.
+# band, window, include_raw, trace_frames). Memoize them in an LRU so flipping back
+# to a previously-viewed recording+settings is instant. Matrices are held as float32
+# arrays, not Python lists (a list costs ~8x the bytes), and eviction is by total size
+# as well as count: a Nyquist-spaced map can be up to MAP_VALUE_BUDGET x 4 bytes.
 
 _RESULT_CACHE = OrderedDict()
 _RESULT_CACHE_MAX = 32
+_RESULT_CACHE_MAX_BYTES = 512 * 1024 * 1024
+
+
+def _result_nbytes(result: dict) -> int:
+    return sum(v.nbytes for v in result.values() if isinstance(v, np.ndarray))
 
 
 def _file_identity(path: str):
@@ -701,8 +801,11 @@ def _cache_get(key):
 def _cache_put(key, val):
     _RESULT_CACHE[key] = val
     _RESULT_CACHE.move_to_end(key)
-    while len(_RESULT_CACHE) > _RESULT_CACHE_MAX:
-        _RESULT_CACHE.popitem(last=False)
+    total = sum(_result_nbytes(v) for v in _RESULT_CACHE.values())
+    while len(_RESULT_CACHE) > 1 and (len(_RESULT_CACHE) > _RESULT_CACHE_MAX
+                                      or total > _RESULT_CACHE_MAX_BYTES):
+        _, old = _RESULT_CACHE.popitem(last=False)
+        total -= _result_nbytes(old)
 
 
 def clear_result_cache():
@@ -712,7 +815,7 @@ def clear_result_cache():
 
 def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND,
                      window_ms=None, baseline_ms=None, align: str = "stimulus",
-                     include_raw: bool = True, max_frames: int = None,
+                     include_raw: bool = True, trace_frames: int = None,
                      filter_raw: bool = True) -> dict:
     """
     Cached dispatch for trial/scroll activity.
@@ -733,10 +836,10 @@ def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND
     if mode == "trial":
         window = tuple(window_ms) if window_ms else DEFAULT_WINDOW_MS
         baseline = tuple(baseline_ms) if baseline_ms else (window[0], 0.0)
-        mf = max_frames if max_frames is not None else MAX_OUTPUT_FRAMES
+        mf = trace_frames if trace_frames is not None else TRACE_FRAMES_TRIAL
         base = (os.path.abspath(path), ident, "trial", band, window, baseline, align, mf)
     else:
-        mf = max_frames if max_frames is not None else 2500
+        mf = trace_frames if trace_frames is not None else TRACE_FRAMES_SCROLL
         base = (os.path.abspath(path), ident, "scroll", band, mf, filter_raw)
 
     hit = _cache_get(base + (include_raw,))
@@ -752,12 +855,47 @@ def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND
 
     if mode == "trial":
         result = compute_band_activity(path, band, window, baseline_ms=baseline,
-                                       align=align, max_frames=mf, include_raw=include_raw)
+                                       align=align, trace_frames=mf, include_raw=include_raw)
     else:
-        result = compute_continuous_traces(path, band, max_frames=mf,
+        result = compute_continuous_traces(path, band, trace_frames=mf,
                                            include_raw=include_raw, filter_raw=filter_raw)
     _cache_put(base + (include_raw,), result)
     return result
+
+
+# ── Wire encoding ────────────────────────────────────────────────────────────
+# The map is the one matrix whose size scales with the Nyquist rate, so it goes out
+# as int16 in base64 rather than as JSON numbers: 2 bytes a value (2.7 in base64)
+# against ~6-20 for a JSON float, and the browser decodes it into a typed array
+# instead of materialising millions of boxed numbers. 0.01 z resolution is far below
+# what a color scale spanning several z can show. Traces stay JSON -- they are a
+# fixed display resolution -- but are rounded in float64 so they print short.
+
+ACTIVITY_QUANTUM = 0.01
+
+
+def encode_activity_response(result: dict, include_activity: bool = True,
+                             include_raw: bool = True) -> dict:
+    """JSON-safe view of a compute_activity result, omitting what the caller did not ask for."""
+    out = {k: v for k, v in result.items() if not isinstance(v, np.ndarray)}
+    act = result.get("activity")
+    if include_activity and act is not None:
+        q = np.clip(np.rint(np.nan_to_num(act) / ACTIVITY_QUANTUM), -32767, 32767).astype("<i2")
+        out["activity_b64"] = base64.b64encode(q.tobytes()).decode("ascii")
+        out["activity_shape"] = list(act.shape)
+        out["activity_scale"] = ACTIVITY_QUANTUM
+    else:
+        out.pop("times", None)          # the map axis travels with the map
+    for key in ("raw", "raw_min", "raw_max"):
+        arr = result.get(key)
+        if isinstance(arr, np.ndarray):
+            if include_raw and arr.size:
+                out[key] = np.round(arr.astype(np.float64), 2).tolist()
+            else:
+                out[key] = []
+    if not include_raw:
+        out.pop("trace_times", None)
+    return out
 
 
 # ── Channel <-> contact name join ────────────────────────────────────────────

@@ -8,6 +8,18 @@ const seg = (active) => ({
   background: active ? '#002233' : 'transparent', color: active ? '#00d4ff' : '#7a8a99',
 });
 
+// Playback speeds offered per mapping mode, as multiples of real time. A trial window
+// spans a couple of seconds, so it plays in slow motion; a continuous recording spans
+// minutes, so it plays from real time up.
+const SPEEDS = {
+  trial: [0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1],
+  scroll: [0.25, 0.5, 1, 2, 5, 10, 20, 50],
+};
+
+// Stable stand-in until the traces arrive, so a fresh [] per render does not re-run the
+// canvas draw (which would otherwise happen on every playback frame).
+const NO_TIMES = [];
+
 const ROW_H = 22;
 const GUTTER = 68;
 const RULER_H = 15;
@@ -37,7 +49,7 @@ export default function SeegTracePanel({
   data, signal, setSignal, scope, setScope, shaft, setShaft,
   timeIndex, setTimeIndex, hoveredChannel, setHoveredChannel,
   width: panelW, setWidth: setPanelW, traceGain = 1, setTraceGain,
-  playing, setPlaying, shaftColors,
+  playing, setPlaying, speed = 1, setSpeed, shaftColors,
 }) {
   const wrapRef = useRef(null);
   const canvasRef = useRef(null);
@@ -75,14 +87,19 @@ export default function SeegTracePanel({
     return out;
   }, [data.channels, data.groups, mappedSet, scope, shaft, shafts]);
 
+  // Two time axes: the activation map's frames (`times`, Nyquist-spaced for the band and
+  // what the cursor indexes) and the voltage traces' display bins (`trace_times`). They
+  // span the same recording, so everything here is placed on screen by time, not index.
   const nT = data.times.length;
+  const traceTimes = data.trace_times || NO_TIMES;
+  const nR = traceTimes.length;
   // Either voltage view ('filtered' or 'raw') draws from data.raw; they differ only
   // in whether the server bandpassed it, which the fetch layer decides.
   const isVoltage = signal !== 'z';
   // The two-phase fetch fills raw voltages (phase 2) after the activation map
   // (phase 1); until then data.raw is empty. Guard so voltage mode doesn't index
   // into a missing array.
-  const rawReady = !isVoltage || (Array.isArray(data.raw) && data.raw.length === nT);
+  const rawReady = !isVoltage || (nR > 0 && Array.isArray(data.raw) && data.raw.length === nR);
 
   // Per-bin extremes of the voltage trace (continuous mode): when present the trace
   // is drawn as a filled min..max envelope rather than a polyline through one sample
@@ -91,8 +108,8 @@ export default function SeegTracePanel({
   // at all) raw_min === raw === raw_max, and filling between them would paint a
   // zero-height band, i.e. an invisible trace.
   const hasEnvelope = isVoltage && data.raw_decimation === 'minmax'
-    && Array.isArray(data.raw_min) && data.raw_min.length === nT
-    && Array.isArray(data.raw_max) && data.raw_max.length === nT;
+    && Array.isArray(data.raw_min) && data.raw_min.length === nR
+    && Array.isArray(data.raw_max) && data.raw_max.length === nR;
 
   // Common gain (shared across channels so amplitudes stay comparable): the largest
   // |value| across shown rows for the active signal. Deliberately the data's own
@@ -103,11 +120,12 @@ export default function SeegTracePanel({
     const arr = isVoltage ? data.raw : data.activity;
     if (!arr || !arr.length) return 1;
     let m = isVoltage ? 1e-6 : 1;   // floor so a flat/quiet block doesn't over-amplify
-    const step = Math.max(1, Math.floor(nT / 400));
+    const n = isVoltage ? nR : nT;
+    const step = Math.max(1, Math.floor(n / 400));
     // Scale to the extremes actually drawn, or the envelope clips at the midpoint scale.
     const lo = hasEnvelope ? data.raw_min : null;
     const hi = hasEnvelope ? data.raw_max : null;
-    for (const r of rows) for (let k = 0; k < nT; k += step) {
+    for (const r of rows) for (let k = 0; k < n; k += step) {
       const v = hasEnvelope
         ? Math.max(Math.abs(lo[k][r.ci]), Math.abs(hi[k][r.ci]))
         : Math.abs(arr[k][r.ci]);
@@ -115,7 +133,14 @@ export default function SeegTracePanel({
     }
     return m;
   }, [isVoltage, rawReady, rows, data.raw, data.activity, data.raw_min, data.raw_max,
-      hasEnvelope, nT]);
+      hasEnvelope, nT, nR]);
+
+  // Time -> x. The axis spans both series, which can end a fraction of a frame apart.
+  const [axisT0, axisT1] = useMemo(() => {
+    const ends = [data.times[0], data.times[nT - 1], traceTimes[0], traceTimes[nR - 1]]
+      .filter((v) => typeof v === 'number');
+    return ends.length ? [Math.min(...ends), Math.max(...ends)] : [0, 0];
+  }, [data.times, traceTimes, nT, nR]);
 
   // ── Track width ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -143,8 +168,12 @@ export default function SeegTracePanel({
     ctx.clearRect(0, 0, width, canvasH);
 
     const plotW = width - GUTTER;
-    const step = Math.max(1, Math.floor(nT / plotW));
+    // Each series is strided to about one point per pixel column of its own axis.
+    const n = isVoltage ? nR : nT;
+    const ts = isVoltage ? traceTimes : data.times;
+    const step = Math.max(1, Math.floor(n / plotW));
     const amp = traceScale;
+    const span = axisT1 - axisT0;
     ctx.font = '10px IBM Plex Mono, monospace';
     ctx.textBaseline = 'middle';
 
@@ -161,7 +190,7 @@ export default function SeegTracePanel({
       // trace (voltage traces are skipped until phase 2 fills data.raw)
       if (!(isVoltage && !rawReady)) {
         const color = shaftColor(r.group, shaftColors);
-        const xAt = (k) => GUTTER + (nT > 1 ? (k / (nT - 1)) * plotW : 0);
+        const xAt = (k) => GUTTER + (span > 0 ? ((ts[k] - axisT0) / span) * plotW : 0);
         const yAt = (v) => yc - Math.max(-1, Math.min(1, v / amp)) * (rowH * 0.8);
 
         if (hasEnvelope) {
@@ -170,8 +199,8 @@ export default function SeegTracePanel({
           ctx.fillStyle = color;
           ctx.globalAlpha = hot ? 0.95 : 0.75;
           ctx.beginPath();
-          for (let k = 0; k < nT; k += step) ctx.lineTo(xAt(k), yAt(data.raw_max[k][r.ci]));
-          for (let k = nT - 1 - ((nT - 1) % step); k >= 0; k -= step) {
+          for (let k = 0; k < n; k += step) ctx.lineTo(xAt(k), yAt(data.raw_max[k][r.ci]));
+          for (let k = n - 1 - ((n - 1) % step); k >= 0; k -= step) {
             ctx.lineTo(xAt(k), yAt(data.raw_min[k][r.ci]));
           }
           ctx.closePath();
@@ -181,7 +210,7 @@ export default function SeegTracePanel({
           ctx.globalAlpha = hot ? 1 : 0.85;
           ctx.beginPath();
           let started = false;
-          for (let k = 0; k < nT; k += step) {
+          for (let k = 0; k < n; k += step) {
             const v = isVoltage ? data.raw[k][r.ci] : data.activity[k][r.ci];
             const x = xAt(k);
             const y = yAt(v);
@@ -197,32 +226,25 @@ export default function SeegTracePanel({
       ctx.fillStyle = '#7a8a99'; ctx.font = '11px IBM Plex Sans, sans-serif';
       ctx.fillText('Loading voltages…', GUTTER + 8, 12);
     }
-  }, [data, rows, signal, hoveredChannel, width, canvasH, rowH, nT, isVoltage, rawReady,
-      hasEnvelope, traceScale, shaftColors]);
+  }, [data, rows, signal, hoveredChannel, width, canvasH, rowH, nT, nR, traceTimes, isVoltage,
+      rawReady, hasEnvelope, traceScale, shaftColors, axisT0, axisT1]);
 
   // ── Cursor + interaction ───────────────────────────────────────────────────
   const plotW = width - GUTTER;
-  const cursorX = GUTTER + (nT > 1 ? (timeIndex / (nT - 1)) * plotW : 0);
+  const xOfTime = (t) => GUTTER + (axisT1 > axisT0 ? ((t - axisT0) / (axisT1 - axisT0)) * plotW : 0);
+  const cursorX = nT > 0 ? xOfTime(data.times[Math.min(timeIndex, nT - 1)]) : GUTTER;
 
   // Event marker: a faint fixed line at t=0 (the alignment event — stimulus or
   // response onset). Only meaningful for trial mode, whose window spans t<0..t>0.
-  const zeroIdx = useMemo(() => {
-    if (data.time_unit !== 'ms' || nT === 0) return -1;
-    let best = -1, bd = Infinity;
-    for (let i = 0; i < nT; i++) {
-      const d = Math.abs(data.times[i]);
-      if (d < bd) { bd = d; best = i; }
-    }
-    return best;
-  }, [data.times, data.time_unit, nT]);
-  const zeroX = zeroIdx >= 0 ? GUTTER + (nT > 1 ? (zeroIdx / (nT - 1)) * plotW : 0) : -1;
+  const zeroX = data.time_unit === 'ms' && nT > 0 && axisT0 <= 0 && axisT1 >= 0 ? xOfTime(0) : -1;
 
+  // x -> the map frame nearest that time (the cursor always sits on a map frame).
   const timeFromX = useCallback((clientX) => {
     const rect = scrollRef.current.getBoundingClientRect();
     const x = clientX - rect.left;
     const frac = Math.max(0, Math.min(1, (x - GUTTER) / Math.max(plotW, 1)));
-    return Math.round(frac * (nT - 1));
-  }, [plotW, nT]);
+    return nearestFrame(data.times, axisT0 + frac * (axisT1 - axisT0));
+  }, [plotW, data.times, axisT0, axisT1]);
 
   const draggingRef = useRef(false);
   const onDown = (e) => {
@@ -260,8 +282,9 @@ export default function SeegTracePanel({
   // the frame mapping must match the brain view's exactly, the pixel position is ours.
   const marks = useMemo(() => (
     buildMarks(data.times, data.annotations, tUnit)
-      .map((m) => ({ ...m, x: GUTTER + (nT > 1 ? (m.idx / (nT - 1)) * plotW : 0) }))
-  ), [data.annotations, data.times, tUnit, nT, plotW]);
+      .map((m) => ({ ...m, x: GUTTER + (axisT1 > axisT0
+        ? ((data.times[m.idx] - axisT0) / (axisT1 - axisT0)) * plotW : 0) }))
+  ), [data.annotations, data.times, tUnit, plotW, axisT0, axisT1]);
 
   const [showEvents, setShowEvents] = useState(true);
   // Height of the event list. Draggable divider, so a long marker track can be opened
@@ -308,6 +331,12 @@ export default function SeegTracePanel({
         <button onClick={() => setPlaying(!playing)} style={{ ...seg(playing), padding: '4px 10px' }}>
           {playing ? '❚❚' : '▶'}
         </button>
+        <select value={speed} onChange={(e) => setSpeed?.(parseFloat(e.target.value))}
+          title="Playback speed, as a multiple of real time"
+          style={{ width: 'auto', padding: '3px 4px', background: '#111418', color: '#c8d4e0',
+            border: '1px solid #2a3340', borderRadius: 4, fontSize: 10, fontFamily: 'IBM Plex Mono, monospace' }}>
+          {(SPEEDS[data.mode] || SPEEDS.scroll).map((s) => <option key={s} value={s}>{s}×</option>)}
+        </select>
         <div style={{ display: 'flex', gap: 4 }}>
           <div onClick={() => setSignal('z')} style={seg(signal === 'z')}
             title="Band-power z-score over the whole recording">z-score</div>

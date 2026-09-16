@@ -22,16 +22,17 @@ export const annColor = (cat) => ANN_COLOR[cat] || ANN_COLOR.note;
 // Categories emphasised on the trace canvas; the rest stay faint but reachable.
 export const ANN_EMPHASIS = new Set(['seizure_onset', 'seizure_end']);
 
-/** Frame whose timestamp is closest to `t`. `times` is ascending but may be unevenly
- *  decimated, so this scans rather than interpolating. */
+/** Frame whose timestamp is closest to `t`. `times` is ascending but need not be evenly
+ *  spaced, so this searches rather than dividing. A Nyquist-spaced map can run to tens
+ *  of thousands of frames, hence a binary search rather than a scan. */
 export function nearestIndex(times, t) {
   if (!times || !times.length) return -1;
-  let best = 0, bd = Infinity;
-  for (let i = 0; i < times.length; i++) {
-    const d = Math.abs(times[i] - t);
-    if (d < bd) { bd = d; best = i; }
+  let lo = 0, hi = times.length - 1;
+  while (lo < hi) {                               // first frame at or after t
+    const mid = (lo + hi) >> 1;
+    if (times[mid] < t) lo = mid + 1; else hi = mid;
   }
-  return best;
+  return lo > 0 && t - times[lo - 1] <= times[lo] - t ? lo - 1 : lo;
 }
 
 /**

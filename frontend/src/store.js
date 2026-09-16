@@ -119,7 +119,7 @@ export const useAppStore = create((set, get) => ({
     const prev = s.seegActivity?.times, next = a?.times;
     const sameAxis = prev && next && prev.length === next.length
       && prev[0] === next[0] && prev[prev.length - 1] === next[next.length - 1];
-    return { seegActivity: a, seegTimeIndex: sameAxis ? s.seegTimeIndex : 0 };
+    return { seegActivity: a, seegTimeIndex: sameAxis ? s.seegTimeIndex : 0, seegLiveValues: null };
   }),
   seegBand: 'high_gamma',
   setSeegBand: (b) => set({ seegBand: b }),
@@ -159,7 +159,16 @@ export const useAppStore = create((set, get) => ({
   seegStructureOpacity: 0.4,     // structure-overlay opacity in the sEEG view
   setSeegStructureOpacity: (v) => set({ seegStructureOpacity: v }),
   seegTimeIndex: 0,
-  setSeegTimeIndex: (i) => set({ seegTimeIndex: i }),
+  // A seek puts the brain back on a whole frame, so it drops any playback in-between values.
+  setSeegTimeIndex: (i) => set({ seegTimeIndex: i, seegLiveValues: null }),
+  // During playback: the per-channel values for the instant actually on screen, which
+  // generally falls between frames (see SeegViewer's playback loop). null = show the frame.
+  seegLiveValues: null,
+  setSeegPlayhead: (i, values) => set({ seegTimeIndex: i, seegLiveValues: values }),
   seegPlaying: false,
   setSeegPlaying: (v) => set({ seegPlaying: v }),
+  // Playback speed as a multiple of real time, held per mapping mode: a trial window
+  // is a couple of seconds and wants slow motion, a continuous recording is minutes long.
+  seegPlaySpeed: { trial: 0.05, scroll: 2 },
+  setSeegPlaySpeed: (mode, v) => set((s) => ({ seegPlaySpeed: { ...s.seegPlaySpeed, [mode]: v } })),
 }));

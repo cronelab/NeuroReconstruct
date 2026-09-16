@@ -94,8 +94,11 @@ function ActivityContact({ position, value, label, group, domain, baseRadius, hi
   const leave = () => { document.body.style.cursor = 'default'; onLeave?.(); };
   return (
     <group position={position}>
-      <mesh onPointerOver={enter} onPointerOut={leave}>
-        <sphereGeometry args={[radius, 16, 16]} />
+      {/* A unit sphere scaled to the radius. The radius tracks the value, so passing it
+          as geometry args rebuilt and re-uploaded every contact's geometry on every
+          playback frame; a scale is only a matrix update. */}
+      <mesh scale={radius} onPointerOver={enter} onPointerOut={leave}>
+        <sphereGeometry args={[1, 16, 16]} />
         <meshPhysicalMaterial color={color} opacity={inert ? 0.75 : 1} transparent={inert}
           emissive={active ? hiliteColor : '#000'}
           emissiveIntensity={active ? 0.7 : (inert ? 0.05 : 0.2)} roughness={0.25} metalness={0.5} />
