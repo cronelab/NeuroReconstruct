@@ -113,7 +113,14 @@ export const useAppStore = create((set, get) => ({
   //   { channels, times, activity[frame][ch], coords_native, coords_mni,
   //     matched, unmatched_channels, unmatched_contacts, has_mni, mode, band }
   seegActivity: null,
-  setSeegActivity: (a) => set({ seegActivity: a, seegTimeIndex: 0 }),
+  // The cursor survives a new payload on the same time axis (a band or signal change,
+  // or phase 2 filling in the voltages) and resets only when the axis itself changes.
+  setSeegActivity: (a) => set((s) => {
+    const prev = s.seegActivity?.times, next = a?.times;
+    const sameAxis = prev && next && prev.length === next.length
+      && prev[0] === next[0] && prev[prev.length - 1] === next[next.length - 1];
+    return { seegActivity: a, seegTimeIndex: sameAxis ? s.seegTimeIndex : 0 };
+  }),
   seegBand: 'high_gamma',
   setSeegBand: (b) => set({ seegBand: b }),
   // Trial-averaged peri-EVENT display window (ms magnitudes before/after the align event).

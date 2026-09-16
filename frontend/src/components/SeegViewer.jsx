@@ -222,14 +222,16 @@ export default function SeegViewer({ reconId, onBack }) {
   // which returns fast so the brain re-colors and the spinner clears; phase 2 then
   // fetches the raw voltages to fill the trace panel. reqSeqRef discards responses
   // from a request that a newer switch has superseded.
+  // Only the 'raw' signal wants the unfiltered trace; 'z' and 'filtered' both use the
+  // band, so the fetch keys on this rather than on the signal and switching between
+  // those two needs no request at all.
+  const filterRaw = seegTraceSignal !== 'raw';
   useEffect(() => {
     if (!reconId || !seegRecordingId) return undefined;
     const seq = ++reqSeqRef.current;
     const params = {
-      // Only the 'raw' signal wants the unfiltered trace; 'z' and 'filtered' both
-      // use the band, so switching between those two hits the same cache entry.
       band: seegBand, mode: seegMode, align: seegAlign,
-      filter_raw: seegTraceSignal !== 'raw',
+      filter_raw: filterRaw,
       window_ms: [-seegPre, seegPost],
       baseline_ms: [seegBaseStart, seegBaseEnd],
     };
@@ -282,7 +284,7 @@ export default function SeegViewer({ reconId, onBack }) {
         setComputing(false);
       });
     return undefined;
-  }, [reconId, seegRecordingId, seegBand, seegTraceSignal, seegMode, seegAlign, seegPre, seegPost,
+  }, [reconId, seegRecordingId, seegBand, filterRaw, seegMode, seegAlign, seegPre, seegPost,
       seegBaseStart, seegBaseEnd]);
 
   // ── Playback ──────────────────────────────────────────────────────────────────
