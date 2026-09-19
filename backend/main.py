@@ -1784,6 +1784,10 @@ class SeegActivityRequest(BaseModel):
     window_ms: Optional[List[float]] = None
     # Baseline window [start_ms, end_ms], both <= 0, ALWAYS relative to stimulus onset.
     baseline_ms: Optional[List[float]] = None
+    # Continuous mode only: [t0, t1] in seconds of recording clock. The voltage trace is
+    # then computed for that window alone, which is what lets an unfiltered trace reach
+    # real samples at a few seconds of zoom. The activation map is unaffected.
+    trace_window_s: Optional[List[float]] = None
     # False = activation map only (skip the slow raw-voltage read; ``raw`` empty).
     include_raw: bool = True
     # False = omit the activation map. The viewer's second fetch only wants the traces,
@@ -1846,6 +1850,14 @@ async def compute_seeg_activity(
 
     window = None
     baseline = None
+    # Continuous only; a trial's trace axis is the epoch itself, which is already native.
+    trace_window = None
+    if req.mode == "scroll" and req.trace_window_s is not None:
+        tw = req.trace_window_s
+        if len(tw) != 2 or not (tw[0] < tw[1]):
+            raise HTTPException(status_code=400,
+                                detail="trace_window_s must be [t0, t1] with t0 < t1")
+        trace_window = (max(0.0, float(tw[0])), float(tw[1]))
     if req.mode == "trial":
         if req.align not in ("stimulus", "response"):
             raise HTTPException(status_code=400, detail="align must be 'stimulus' or 'response'")
@@ -1864,7 +1876,7 @@ async def compute_seeg_activity(
             None, lambda: compute_activity(
                 h5_path, mode=req.mode, band=band_key, window_ms=window,
                 baseline_ms=baseline, align=req.align, include_raw=req.include_raw,
-                filter_raw=req.filter_raw)
+                filter_raw=req.filter_raw, trace_window=trace_window)
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))

@@ -119,7 +119,8 @@ export const useAppStore = create((set, get) => ({
     const prev = s.seegActivity?.times, next = a?.times;
     const sameAxis = prev && next && prev.length === next.length
       && prev[0] === next[0] && prev[prev.length - 1] === next[next.length - 1];
-    return { seegActivity: a, seegTimeIndex: sameAxis ? s.seegTimeIndex : 0, seegLiveValues: null };
+    return { seegActivity: a, seegTimeIndex: sameAxis ? s.seegTimeIndex : 0,
+      seegLiveValues: null, seegPlayheadTime: null };
   }),
   seegBand: 'high_gamma',
   setSeegBand: (b) => set({ seegBand: b }),
@@ -150,6 +151,21 @@ export const useAppStore = create((set, get) => ({
   setSeegTracePanelW: (w) => set({ seegTracePanelW: w }),
   seegTraceGain: 1,              // vertical zoom of the trace stack (row height + amplitude)
   setSeegTraceGain: (g) => set({ seegTraceGain: g }),
+  // Time base of the trace panel: how much of the recording is on screen at once, in
+  // that mode's own unit (ms for a trial window, s for a continuous recording).
+  // null = fit the whole thing. Held per mode, like the playback speed, because the two
+  // are orders of magnitude apart.
+  // { value, unit }: the amount as typed and the unit it was typed in, kept apart so
+  // the field reads back exactly as entered. value null = fit the whole recording.
+  // A trial window is a couple of seconds and is meant to be read whole; a continuous
+  // recording is minutes long, where ten seconds a screen is how EEG is read.
+  seegTraceWindow: {
+    trial: { value: null, unit: 'ms' },
+    scroll: { value: 10, unit: 's' },
+  },
+  setSeegTraceWindow: (mode, w) => set((s) => ({
+    seegTraceWindow: { ...s.seegTraceWindow, [mode]: w },
+  })),
   seegBrainOpacity: 0.4,         // native-brain surface opacity in the sEEG view
   setSeegBrainOpacity: (v) => set({ seegBrainOpacity: v }),
   seegIgnoreOutside: true,       // render contacts outside the brain mesh inert (default on)
@@ -160,11 +176,17 @@ export const useAppStore = create((set, get) => ({
   setSeegStructureOpacity: (v) => set({ seegStructureOpacity: v }),
   seegTimeIndex: 0,
   // A seek puts the brain back on a whole frame, so it drops any playback in-between values.
-  setSeegTimeIndex: (i) => set({ seegTimeIndex: i, seegLiveValues: null }),
+  setSeegTimeIndex: (i) => set({ seegTimeIndex: i, seegLiveValues: null, seegPlayheadTime: null }),
   // During playback: the per-channel values for the instant actually on screen, which
   // generally falls between frames (see SeegViewer's playback loop). null = show the frame.
   seegLiveValues: null,
-  setSeegPlayhead: (i, values) => set({ seegTimeIndex: i, seegLiveValues: values }),
+  // The instant on screen, on the recording's own clock. The frame index alone is too
+  // coarse to draw a cursor with: a 140 Hz map steps 7 ms at a time, which is a visible
+  // jump once the trace panel is zoomed into a few seconds. null = not playing.
+  seegPlayheadTime: null,
+  setSeegPlayhead: (i, values, t) => set({
+    seegTimeIndex: i, seegLiveValues: values, seegPlayheadTime: t,
+  }),
   seegPlaying: false,
   setSeegPlaying: (v) => set({ seegPlaying: v }),
   // Playback speed as a multiple of real time, held per mapping mode: a trial window

@@ -128,6 +128,20 @@ TRACE_FRAMES_SCROLL = 2500
 # with the envelope averaged over each bin first, so it is low-passed rather than
 # aliased -- and the response says so (`map_nyquist_met`).
 MAP_VALUE_BUDGET = 4_000_000
+# Same order for a voltage trace. A filtered trace needs 2x the band's upper cutoff,
+# which for every band up to gamma is the same rate the map already runs at, so the two
+# matrices cost about the same.
+TRACE_VALUE_BUDGET = 4_000_000
+# ...but a trace sampled at its own Nyquist rate is a waveform, and one below it is only
+# a band of extremes, so that is worth paying for: a faithful trace may exceed the soft
+# budget as far as this ceiling. High-gamma filtered on a five-minute, eighty-channel
+# recording needs 333 Hz and lands here (7.9M values, ~21 MB on the wire) rather than
+# falling back to min/max. Unfiltered raw would need 47M and stays out of reach.
+TRACE_VALUE_CEILING = 12_000_000
+# A windowed detail request is bounded by the screen as well: no panel is wider than a
+# few hundred pixels, so past this there is nothing left to see and it is only bytes.
+# Below it, a window is still sent as real samples -- which is the whole point of asking.
+DETAIL_MAX_BINS = 4_000
 
 
 def envelope_nyquist_step(fs: float, band_hz: tuple) -> int:
@@ -142,6 +156,32 @@ def envelope_nyquist_step(fs: float, band_hz: tuple) -> int:
     if width <= 0:
         return 1
     return max(1, int(fs // (2.0 * width)))
+
+
+def wave_step(n_samples, n_channels, fs, band_hz, filtered: bool,
+              budget=TRACE_VALUE_BUDGET, ceiling=TRACE_VALUE_CEILING) -> tuple:
+    """Sample step for a voltage trace, and the step Nyquist actually asks for.
+
+    A *waveform* is band-limited by the band's upper cutoff (unlike its power envelope,
+    which is limited by the band's width), so it needs 2 x hi. Unfiltered, nothing has
+    been removed and the faithful step is 1 -- every sample. Returns (step, nyquist_step):
+    when step > nyquist_step the budget has forced the trace below its own Nyquist and
+    the caller must reduce by min/max rather than by point-sampling, or it will alias.
+    """
+    if filtered:
+        hi = min(band_hz[1], fs / 2.0 * 0.99)
+        nyq = max(1, int(fs // (2.0 * hi))) if hi > 0 else 1
+    else:
+        nyq = 1
+    # Faithful first: if sampling at the signal's own rate fits under the ceiling, send
+    # it, even when that is past the soft budget. It is the difference between a
+    # waveform and a band of extremes.
+    if int(np.ceil(n_samples / nyq)) * max(1, n_channels) <= ceiling:
+        return nyq, nyq
+    # Otherwise the trace is reduced by min/max -- two matrices, so half the budget.
+    max_frames = max(1, (budget // 2) // max(1, n_channels))
+    fit = int(np.ceil(n_samples / max_frames)) if n_samples > max_frames else 1
+    return max(nyq, fit), nyq
 
 
 def map_step(n_samples: int, n_channels: int, fs: float, band_hz: tuple,
@@ -493,7 +533,8 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
                           baseline_ms: tuple = None,
                           align: str = "stimulus",
                           trace_frames: int = TRACE_FRAMES_TRIAL,
-                          include_raw: bool = True) -> dict:
+                          include_raw: bool = True,
+                          filter_raw: bool = True) -> dict:
     """
     Compute the event-related display activity matrix for one h5 recording.
 
@@ -596,7 +637,20 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
     raw_disp = raw_base = None
     if include_raw:
         t_raw = time.perf_counter()
-        if full_sig is not None:
+        if filter_raw:
+            # Bandpass the WHOLE recording, then cut the epochs out of it -- the same
+            # order the envelope is built in. Filtering epoch by epoch instead would let
+            # each one's edges ring, and those edges sit right where the event is.
+            # Costs a full read when the envelope came from cache, which is the price of
+            # a filtered trace; the unfiltered one below still reads epochs only.
+            sig = full_sig if full_sig is not None else _read_full_signal(path, meta)
+            filtered = bandpass(sig, fs, band_hz)
+            if filtered is not None:
+                sig = filtered
+            raw_disp = [sig[s:e] for s, e in disp_windows]
+            raw_base = [sig[s:e] for s, e in base_windows]
+            raw_src = ("reused full signal" if full_sig is not None else "full read") + ", bandpassed"
+        elif full_sig is not None:
             raw_disp = [full_sig[s:e] for s, e in disp_windows]
             raw_base = [full_sig[s:e] for s, e in base_windows]
             raw_src = "reused full signal"
@@ -627,12 +681,25 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
     step, nyq = map_step(n_pst, n_ch, fs, band_hz)
     map_times = pst_times_ms[::step]
     avg = _reduce_map(avg, step, nyq)
-    # Traces: their own display resolution. The ERP is broadband, so it keeps the
-    # finer stride it always had rather than inheriting a narrow band's coarse one.
-    tstep = int(np.ceil(n_pst / trace_frames)) if n_pst > trace_frames else 1
+    # Traces: the same rate rule the continuous view uses. The trial-averaged ERP is
+    # never filtered, so it is broadband and its faithful step is 1 -- and an epoch is
+    # small enough that native costs nothing (a 2.5 s window at 2 kHz is 5000 samples,
+    # ~1 MB of int16 across a hundred channels), so the panel can zoom anywhere inside
+    # the epoch with no reduction at all. The budget only ever binds on an extreme
+    # window x channel count, and then min/max keeps it honest.
+    tstep, tnyq = wave_step(n_pst, n_ch, fs, band_hz, bool(include_raw and filter_raw))
     trace_times = pst_times_ms[::tstep]
+    raw_min = raw_max = None
+    raw_decimation = "none"
     if include_raw:
-        avg_raw = avg_raw[::tstep]
+        if tstep > tnyq:
+            bins = np.arange(0, n_pst, tstep, dtype=np.int64)
+            raw_min = np.minimum.reduceat(avg_raw, bins, axis=0)
+            raw_max = np.maximum.reduceat(avg_raw, bins, axis=0)
+            avg_raw = None
+            raw_decimation = "minmax"
+        else:
+            avg_raw = avg_raw[::tstep]
 
     return {
         "channels": names,
@@ -640,7 +707,14 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
         "times": [round(float(t), 2) for t in map_times],
         "activity": avg.astype(np.float32),
         "trace_times": [round(float(t), 2) for t in trace_times],
-        "raw": avg_raw.astype(np.float32) if include_raw else np.zeros((0, n_ch), np.float32),
+        "raw": avg_raw.astype(np.float32) if avg_raw is not None else np.zeros((0, n_ch), np.float32),
+        "raw_min": raw_min.astype(np.float32) if raw_min is not None else np.zeros((0, n_ch), np.float32),
+        "raw_max": raw_max.astype(np.float32) if raw_max is not None else np.zeros((0, n_ch), np.float32),
+        "raw_decimation": raw_decimation,
+        "raw_filtered": bool(include_raw and filter_raw),
+        "rate_hz": float(fs),
+        "trace_rate_hz": round(fs / tstep, 2),
+        "trace_nyquist_met": bool(tstep <= tnyq),
         "mode": "trial", "time_unit": "ms", "band": band, "band_hz": list(band_hz), "align": align,
         "n_trials": used, "n_no_response": n_no_response,
         **_map_sampling(fs, step, nyq, band_hz),
@@ -650,7 +724,8 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
 def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
                               trace_frames: int = TRACE_FRAMES_SCROLL,
                               include_raw: bool = True,
-                              filter_raw: bool = True) -> dict:
+                              filter_raw: bool = True,
+                              trace_window: tuple = None) -> dict:
     """
     Continuous (scrollable) traces over the whole recording.
 
@@ -690,9 +765,27 @@ def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
     mstep, nyq = map_step(n, env.shape[1], fs, band_hz)
     map_times_s = np.arange(0, n, mstep) / fs
     z_map = _reduce_map(z, mstep, nyq)
-    # Traces: a fixed display resolution, independent of the map.
-    step = int(np.ceil(n / trace_frames)) if n > trace_frames else 1
-    idx = np.arange(0, n, step)
+    # Traces: sampled at the rate the signal itself implies (see wave_step), the same
+    # principle the map uses. For a filtered trace that is 2 x the band's upper cutoff --
+    # 142.9 Hz on a 1-70 Hz review band, i.e. the same rate and the same payload as the
+    # map -- so the whole recording travels at full fidelity and every zoom level is
+    # already in the browser. `trace_frames` survives only as a floor for callers that
+    # ask for a coarse trace.
+    # ``trace_window`` (t0, t1) seconds narrows the trace to what is on screen and
+    # spends the same rule on that alone, which is how an unfiltered trace -- 47M
+    # samples over a whole recording, far past any budget -- becomes real samples again
+    # at a few seconds of zoom. The map is computed over the whole recording either way.
+    lo, hi = 0, n
+    if trace_window is not None:
+        lo = max(0, min(n - 1, int(np.floor(float(trace_window[0]) * fs))))
+        hi = max(lo + 1, min(n, int(np.ceil(float(trace_window[1]) * fs))))
+    span = hi - lo
+    step, wnyq = wave_step(span, len(names), fs, band_hz, filter_raw)
+    if trace_window is not None:
+        # 2 kHz across ten seconds is sixty samples a pixel; cap it and let the min/max
+        # path below report the true extremes of each bin instead.
+        step = max(step, int(np.ceil(span / DETAIL_MAX_BINS)))
+    idx = np.arange(lo, hi, step)
     times_s = idx / fs
 
     # Decimated voltage for the trace panel. Skipped when the caller wants only the
@@ -710,41 +803,49 @@ def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
     # where the stride happens to land. Min/max per bin instead reports the extremes
     # the bin actually spans, so a spike is drawn at its true height at any zoom.
     raw = raw_min = raw_max = None
-    # How the trace was reduced: "minmax" carries real per-bin extremes, "strided"
-    # (or "none", when no reduction was needed) means raw_min == raw == raw_max, and a
-    # consumer must not try to draw a min..max band from them -- it would be empty.
+    # How the trace was reduced. "none" means every value sent is a real sample at or
+    # above the signal's Nyquist rate -- draw it as a line. "minmax" means the budget
+    # forced it below that, so raw_min/raw_max carry the true extremes of each bin and a
+    # consumer must draw the band; point-sampling there would alias.
     raw_decimation = "none"
     if include_raw:
         t_raw = time.perf_counter()
+        # `base` is the absolute sample index of sig[0], so a windowed read can be
+        # indexed with the same absolute positions as a full one.
         if full_sig is not None:
-            sig, raw_src = full_sig, "reused full signal"
-        elif filter_raw:
-            # Filtering is only meaningful at the native rate, so a strided read
-            # cannot serve it; pay for the full read.
-            sig, raw_src = _read_full_signal(path, meta), "full read for filter"
+            sig, base, raw_src = full_sig, 0, "reused full signal"
+        elif trace_window is not None:
+            # Only the window, plus room either side for the filter to settle (trimmed
+            # off below). Touches a handful of chunks instead of the whole file.
+            pad = int(round(2.0 * fs)) if filter_raw else 0
+            rs = max(0, lo - pad)
+            sig = _read_windows(path, meta, [(rs, min(n, hi + pad))])[0]
+            base, raw_src = rs, "windowed read"
         else:
-            sig, raw_src = None, "strided lazy read"
+            # Every sample: the filter is only meaningful at the native rate, and an
+            # unfiltered trace has to be reduced by min/max rather than strided --
+            # striding 2 kHz down to a display rate aliases everything above it, which
+            # is what made the old raw trace untrustworthy at any zoom.
+            sig, base, raw_src = _read_full_signal(path, meta), 0, "full read"
 
-        if sig is None:
-            strided = _read_strided(path, meta, step)[:len(idx)]
-            raw = raw_min = raw_max = strided
-            raw_decimation = "strided" if step > 1 else "none"
+        if filter_raw:
+            filtered = bandpass(sig, fs, band_hz)
+            if filtered is not None:
+                sig = filtered
+        if trace_window is not None:
+            # Trim to the window itself. The settling pad has done its job, and
+            # reduceat's last bin runs to the end of whatever array it is given.
+            sig = sig[lo - base: lo - base + span]
+            base = lo
+        bins = (idx - base).astype(np.int64)
+        if step > wnyq:
+            raw_min = np.minimum.reduceat(sig, bins, axis=0)
+            raw_max = np.maximum.reduceat(sig, bins, axis=0)
+            raw_decimation = "minmax"
         else:
-            if filter_raw:
-                filtered = bandpass(sig, fs, band_hz)
-                if filtered is not None:
-                    sig = filtered
-            if step > 1:
-                bins = idx.astype(np.int64)
-                raw_min = np.minimum.reduceat(sig, bins, axis=0)
-                raw_max = np.maximum.reduceat(sig, bins, axis=0)
-                # Midpoint keeps a single-valued series for consumers drawing a line.
-                raw = (raw_min + raw_max) * 0.5
-                raw_decimation = "minmax"
-            else:
-                raw = raw_min = raw_max = sig[idx]
-        _dbg(f"[SEEG] scroll: decimated raw via {raw_src} "
-             f"(filter_raw={filter_raw}) in {time.perf_counter() - t_raw:.2f}s")
+            raw = sig[bins]
+        _dbg(f"[SEEG] scroll: trace via {raw_src} at {fs / step:.1f} Hz "
+             f"({raw_decimation}, filter_raw={filter_raw}) in {time.perf_counter() - t_raw:.2f}s")
 
     empty = np.zeros((0, len(names)), np.float32)
     return {
@@ -753,13 +854,16 @@ def compute_continuous_traces(path: str, band: str = DEFAULT_BAND,
         "times": [round(float(t), 4) for t in map_times_s],
         "activity": z_map.astype(np.float32),
         "trace_times": [round(float(t), 4) for t in times_s],
-        "raw": (raw * 1e6).astype(np.float32) if include_raw else empty,   # uV
-        # Per-bin extremes of the same series, so the panel can draw the true spike
-        # envelope instead of a strided sample. Equal to `raw` when no reduction ran.
-        "raw_min": (raw_min * 1e6).astype(np.float32) if include_raw else empty,
-        "raw_max": (raw_max * 1e6).astype(np.float32) if include_raw else empty,
+        # uV. Exactly one of these is sent: real samples, or the per-bin extremes when
+        # the budget forced the trace below its own Nyquist rate.
+        "raw": (raw * 1e6).astype(np.float32) if raw is not None else empty,
+        "raw_min": (raw_min * 1e6).astype(np.float32) if raw_min is not None else empty,
+        "raw_max": (raw_max * 1e6).astype(np.float32) if raw_max is not None else empty,
         "raw_filtered": bool(include_raw and filter_raw),
         "raw_decimation": raw_decimation,
+        "rate_hz": float(fs),
+        "trace_rate_hz": round(fs / step, 2),
+        "trace_nyquist_met": bool(step <= wnyq),
         "mode": "scroll", "time_unit": "s", "band": band, "band_hz": list(band_hz), "n_trials": 0,
         # Reviewer markers on the same clock as `times` (clinical recordings only).
         "annotations": meta.get("annotations", []),
@@ -816,7 +920,7 @@ def clear_result_cache():
 def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND,
                      window_ms=None, baseline_ms=None, align: str = "stimulus",
                      include_raw: bool = True, trace_frames: int = None,
-                     filter_raw: bool = True) -> dict:
+                     filter_raw: bool = True, trace_window=None) -> dict:
     """
     Cached dispatch for trial/scroll activity.
 
@@ -837,10 +941,15 @@ def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND
         window = tuple(window_ms) if window_ms else DEFAULT_WINDOW_MS
         baseline = tuple(baseline_ms) if baseline_ms else (window[0], 0.0)
         mf = trace_frames if trace_frames is not None else TRACE_FRAMES_TRIAL
-        base = (os.path.abspath(path), ident, "trial", band, window, baseline, align, mf)
+        base = (os.path.abspath(path), ident, "trial", band, window, baseline, align, mf,
+                filter_raw)
     else:
         mf = trace_frames if trace_frames is not None else TRACE_FRAMES_SCROLL
-        base = (os.path.abspath(path), ident, "scroll", band, mf, filter_raw)
+        # The window is part of the key, so panning builds up a cache of recent windows
+        # and coming back to one is instant. The byte-bounded LRU bounds how many.
+        tw = ((round(float(trace_window[0]), 3), round(float(trace_window[1]), 3))
+              if trace_window else None)
+        base = (os.path.abspath(path), ident, "scroll", band, mf, filter_raw, tw)
 
     hit = _cache_get(base + (include_raw,))
     if hit is not None:
@@ -855,10 +964,12 @@ def compute_activity(path: str, *, mode: str = "trial", band: str = DEFAULT_BAND
 
     if mode == "trial":
         result = compute_band_activity(path, band, window, baseline_ms=baseline,
-                                       align=align, trace_frames=mf, include_raw=include_raw)
+                                       align=align, trace_frames=mf, include_raw=include_raw,
+                                       filter_raw=filter_raw)
     else:
         result = compute_continuous_traces(path, band, trace_frames=mf,
-                                           include_raw=include_raw, filter_raw=filter_raw)
+                                           include_raw=include_raw, filter_raw=filter_raw,
+                                           trace_window=trace_window)
     _cache_put(base + (include_raw,), result)
     return result
 
@@ -886,13 +997,25 @@ def encode_activity_response(result: dict, include_activity: bool = True,
         out["activity_scale"] = ACTIVITY_QUANTUM
     else:
         out.pop("times", None)          # the map axis travels with the map
+    # Traces go out the same way the map does: int16 at a scale carried alongside,
+    # base64'd. As JSON numbers a Nyquist-rate trace would be ~20 bytes a value -- 68 MB
+    # where the binary form is 6.8 MB -- and the browser would have to parse millions of
+    # them into boxed numbers instead of filling one typed array.
+    traces = {k: result.get(k) for k in ("raw", "raw_min", "raw_max")}
+    traces = {k: v for k, v in traces.items()
+              if include_raw and isinstance(v, np.ndarray) and v.size}
+    if traces:
+        # One scale across all three, so a min and a max stay comparable.
+        peak = max(float(np.nanmax(np.abs(v))) for v in traces.values())
+        scale = (peak / 32767.0) if peak > 0 else 1.0
+        for key, arr in traces.items():
+            q = np.clip(np.rint(np.nan_to_num(arr) / scale), -32767, 32767).astype("<i2")
+            out[f"{key}_b64"] = base64.b64encode(q.tobytes()).decode("ascii")
+        out["trace_shape"] = list(next(iter(traces.values())).shape)
+        out["trace_scale"] = scale
+        out["trace_keys"] = sorted(traces)
     for key in ("raw", "raw_min", "raw_max"):
-        arr = result.get(key)
-        if isinstance(arr, np.ndarray):
-            if include_raw and arr.size:
-                out[key] = np.round(arr.astype(np.float64), 2).tolist()
-            else:
-                out[key] = []
+        out.pop(key, None)
     if not include_raw:
         out.pop("trace_times", None)
     return out

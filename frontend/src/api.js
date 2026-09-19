@@ -148,28 +148,60 @@ export const listSeeg = (reconId) =>
 // encode_activity_response), because at the band's Nyquist rate it can run to millions
 // of values. Decode it into one Float32Array and hand consumers a per-frame view of it,
 // so `activity[frame][channel]` reads exactly as the old nested JSON arrays did.
-function decodeSeegActivity(d) {
-  if (!d || typeof d.activity_b64 !== 'string') return d;
-  const [nFrames, nCh] = d.activity_shape;
-  const bin = atob(d.activity_b64);
+// Int16Array reads the platform byte order; every browser platform is little-endian,
+// matching the '<i2' the server writes.
+function b64ToInt16(b64) {
+  const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  // Int16Array reads the platform byte order; every browser platform is little-endian,
-  // matching the '<i2' the server writes.
-  const q = new Int16Array(bytes.buffer, 0, nFrames * nCh);
+  return new Int16Array(bytes.buffer, 0, bin.length >> 1);
+}
+
+// One flat Float32Array plus a row view per frame, so a matrix of millions of values
+// costs one allocation instead of a boxed number per sample.
+function scaleToRows(q, scale, nFrames, nCh) {
   const values = new Float32Array(q.length);
-  const scale = d.activity_scale;
   for (let i = 0; i < q.length; i++) values[i] = q[i] * scale;
-  const activity = new Array(nFrames);
-  for (let k = 0; k < nFrames; k++) activity[k] = values.subarray(k * nCh, (k + 1) * nCh);
-  const { activity_b64: _b64, ...rest } = d;
-  return { ...rest, activity, activity_values: values };
+  const rows = new Array(nFrames);
+  for (let k = 0; k < nFrames; k++) rows[k] = values.subarray(k * nCh, (k + 1) * nCh);
+  return { values, rows };
+}
+
+/**
+ * Decode the binary matrices in an activity response: the activation map, and whichever
+ * voltage series the server sent (real samples as `raw`, or the per-bin extremes as
+ * `raw_min`/`raw_max` when the trace had to be reduced). A response may carry either,
+ * both or neither -- the two-phase fetch asks for one at a time.
+ */
+function decodeSeegActivity(d) {
+  if (!d || typeof d !== 'object') return d;
+  const out = { ...d };
+  if (typeof d.activity_b64 === 'string' && d.activity_shape) {
+    const [nFrames, nCh] = d.activity_shape;
+    const { values, rows } = scaleToRows(b64ToInt16(d.activity_b64), d.activity_scale,
+                                         nFrames, nCh);
+    out.activity = rows;
+    out.activity_values = values;
+    delete out.activity_b64;
+  }
+  if (Array.isArray(d.trace_keys) && Array.isArray(d.trace_shape)) {
+    const [nBins, nCh] = d.trace_shape;
+    for (const key of d.trace_keys) {
+      const b64 = d[`${key}_b64`];
+      if (typeof b64 !== 'string') continue;
+      out[key] = scaleToRows(b64ToInt16(b64), d.trace_scale, nBins, nCh).rows;
+      delete out[`${key}_b64`];
+    }
+  }
+  return out;
 }
 
 export const computeSeegActivity = (reconId, recId,
-  { band, mode, align, window_ms, baseline_ms, include_raw, include_activity, filter_raw } = {}) =>
+  { band, mode, align, window_ms, baseline_ms, include_raw, include_activity, filter_raw,
+    trace_window_s } = {}) =>
   api.post(`/reconstructions/${reconId}/seeg/${recId}/activity`,
-    { band, mode, align, window_ms, baseline_ms, include_raw, include_activity, filter_raw },
+    { band, mode, align, window_ms, baseline_ms, include_raw, include_activity, filter_raw,
+      trace_window_s },
     { timeout: 300000 })
     .then((r) => ({ ...r, data: decodeSeegActivity(r.data) }));
 

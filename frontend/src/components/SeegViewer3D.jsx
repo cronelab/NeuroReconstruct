@@ -139,7 +139,7 @@ function LoadingOverlay({ message }) {
     <Html center style={{ pointerEvents: 'none' }}>
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, color: '#7a8a99', fontFamily: 'IBM Plex Sans, sans-serif' }}>
         <div style={{ width: 32, height: 32, border: '2px solid #1e2530', borderTop: '2px solid #00d4ff', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
-        <span style={{ fontSize: 12 }}>{message || 'Loading...'}</span>
+        <span style={{ fontSize: 13 }}>{message || 'Loading...'}</span>
       </div>
     </Html>
   );
@@ -242,19 +242,19 @@ export default function SeegViewer3D({
             </span>
           </div>
           {effHover.inert && (
-            <div style={{ color: '#c8975a', fontSize: 12, marginTop: 3 }}>outside brain · not scored</div>
+            <div style={{ color: '#c8975a', fontSize: 13, marginTop: 3 }}>outside brain · not scored</div>
           )}
           {effHover.region ? (
             effHover.region.inside ? (
-              <div style={{ color: effHover.region.color, fontSize: 13, marginTop: 3 }}>{effHover.region.label}</div>
+              <div style={{ color: effHover.region.color, fontSize: 14, marginTop: 3 }}>{effHover.region.label}</div>
             ) : (
               <div style={{ marginTop: 3 }}>
-                <div style={{ color: effHover.region.color, fontSize: 13 }}>{effHover.region.label}</div>
-                <span style={{ color: '#7a8a99', fontSize: 12 }}>nearest · {effHover.region.dist.toFixed(1)} mm</span>
+                <div style={{ color: effHover.region.color, fontSize: 14 }}>{effHover.region.label}</div>
+                <span style={{ color: '#7a8a99', fontSize: 13 }}>nearest · {effHover.region.dist.toFixed(1)} mm</span>
               </div>
             )
           ) : (
-            <span style={{ color: '#7a8a99', fontSize: 13 }}>unlabelled</span>
+            <span style={{ color: '#7a8a99', fontSize: 14 }}>unlabelled</span>
           )}
         </div>
       )}
@@ -262,7 +262,7 @@ export default function SeegViewer3D({
       <div style={{
         position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)',
         display: 'flex', gap: 20, color: '#4a5568',
-        fontFamily: 'IBM Plex Mono, monospace', fontSize: 10, letterSpacing: '0.05em', pointerEvents: 'none',
+        fontFamily: 'IBM Plex Mono, monospace', fontSize: 12, letterSpacing: '0.05em', pointerEvents: 'none',
       }}>
         <span>LEFT DRAG — rotate</span>
         <span>RIGHT DRAG — pan</span>

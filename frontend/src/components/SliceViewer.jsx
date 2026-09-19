@@ -2,6 +2,8 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { useAppStore } from '../store';
 import { buildStructureMeshes, structureAtPoint } from '../anatomy';
+import { shaftColorOf } from '../seegColors';
+import { activityColor } from './SeegViewer3D';
 import LocatorOverlay from './LocatorOverlay';
 
 const AXIS_INFO = {
@@ -14,6 +16,11 @@ const PREFETCH_AHEAD = 10;
 const PREFETCH_BEHIND = 4;
 const MAX_CONCURRENT = 6; // throttle simultaneous requests
 const CONTACT_THICKNESS_MM = 4.0; // show contacts within ±this many mm of slice plane
+// sEEG activity mode: base marker radius in px (the 3D view's baseRadius is in mm,
+// but these panes do not zoom, so a pixel base keeps the size range readable), and the
+// neutral fill for contacts the z-score does not apply to.
+const ACTIVITY_R = 4.5;
+const INERT_COLOR = '#5f6b76';
 
 // Raycastable structure meshes for the electrode-centric hover (which structure a
 // contact sits in). Built once per structuresData and shared across all SliceViewer
@@ -40,6 +47,17 @@ export default function SliceViewer({
   syncSliceIdx = null,
   // Shown in the corner when more than one pane is up, to say which is which.
   layerLabel = null,
+  // sEEG activity mode. Given the same [{ name, group, value, pos, inside }] the 3D
+  // view draws, these panes become its slice counterpart: markers are placed from
+  // `pos` (the same mesh-centred space as a stored contact), coloured by z on the
+  // shared scale and sized by |z|. Null anywhere else, which leaves the shaft-coloured
+  // markers the reconstruction viewer has always drawn.
+  activityContacts = null,
+  activityDomain = 6,
+  shaftColors = {},
+  // Cross-highlight with the 3D view and the trace panel, by channel name.
+  hoveredChannel = null,
+  onHoverContact,
 }) {
   const { reconstruction, meshData, structuresData, structureVisible } = useAppStore();
   const canvasRef = useRef(null);
@@ -202,86 +220,115 @@ export default function SliceViewer({
       // and stretch the overlay by n/(n-1) about the centre.
       const flipNorm = (v, n) => (n - 0.5 - v) / n;
 
+      // What to draw at each contact. In the sEEG viewer these panes are the slice
+      // counterpart of the 3D activity view, so a marker is filled with its z-score on
+      // the same diverging scale and sized by |z| on the same law the spheres use.
+      // Without activity (the reconstruction viewer) they stay shaft-coloured and fixed.
+      const markers = activityContacts
+        ? activityContacts.map((c) => ({
+            id: c.name, label: c.name, mesh: c.pos, value: c.value,
+            inert: c.inside === false, ring: shaftColorOf(c.group, shaftColors),
+          }))
+        : shafts.flatMap((shaft) => (shaft.contacts || [])
+            .filter((c) => c.x_mm != null)
+            .map((c) => ({
+              id: `${shaft.id}-${c.contact_number}`,
+              label: `${shaft.name}${c.contact_number}${shaft.label ? ` (${shaft.label})` : ''}`,
+              mesh: [c.x_mm, c.y_mm, c.z_mm], ring: shaft.color,
+            })));
+      // A contact hovered in the trace panel or the 3D view is ringed here too; marker
+      // ids are channel names in activity mode, which is what those views report.
+      const hoverId = hoveredIdRef.current
+        || (activityContacts && hoveredChannel ? hoveredChannel : null);
+
       const hits = [];
-      shafts.forEach(shaft => {
-        (shaft.contacts || []).forEach(c => {
-          if (c.x_mm == null) return;
+      markers.forEach((m) => {
+        // Convert Three.js (mesh-centred) → world RAS
+        const wx = m.mesh[0] + meshCenter[0];
+        const wy = m.mesh[1] + meshCenter[1];
+        const wz = m.mesh[2] + meshCenter[2];
 
-          // Convert Three.js (mesh-centred) → world RAS
-          const wx = c.x_mm + meshCenter[0];
-          const wy = c.y_mm + meshCenter[1];
-          const wz = c.z_mm + meshCenter[2];
+        let canX, canY, dist;
+        if (iA && vShape) {
+          // Voxel coordinates via inverse affine  (row-major 4×4)
+          const vx = iA[0]*wx + iA[1]*wy + iA[2]*wz + iA[3];
+          const vy = iA[4]*wx + iA[5]*wy + iA[6]*wz + iA[7];
+          const vz = iA[8]*wx + iA[9]*wy + iA[10]*wz + iA[11];
+          const [nx, ny, nz] = vShape;
 
-          let canX, canY, dist;
-          if (iA && vShape) {
-            // Voxel coordinates via inverse affine  (row-major 4×4)
-            const vx = iA[0]*wx + iA[1]*wy + iA[2]*wz + iA[3];
-            const vy = iA[4]*wx + iA[5]*wy + iA[6]*wz + iA[7];
-            const vz = iA[8]*wx + iA[9]*wy + iA[10]*wz + iA[11];
-            const [nx, ny, nz] = vShape;
+          // Filter: only contacts near the current slice plane. Do this in voxel
+          // space — never by comparing the contact's world x/y/z against
+          // X-Slice-World-Coord, which is just the plane's centre and drifts across
+          // the plane on an oblique volume (measured: up to 26 slices out on this
+          // dataset's axial view). The voxel-index difference is exact for any
+          // affine, and is the same quantity the X-Slice-Plane-* headers express;
+          // we use the voxel form here because vx/vy/vz are needed anyway.
+          const vAxis = axis === 'sagittal' ? vx : axis === 'coronal' ? vy : vz;
+          dist = Math.abs(vAxis - drawnIdx) * sliceSpacingMm;
+          if (dist > CONTACT_THICKNESS_MM) return;
 
-            // Filter: only contacts near the current slice plane. Do this in voxel
-            // space — never by comparing the contact's world x/y/z against
-            // X-Slice-World-Coord, which is just the plane's centre and drifts across
-            // the plane on an oblique volume (measured: up to 26 slices out on this
-            // dataset's axial view). The voxel-index difference is exact for any
-            // affine, and is the same quantity the X-Slice-Plane-* headers express;
-            // we use the voxel form here because vx/vy/vz are needed anyway.
-            const vAxis = axis === 'sagittal' ? vx : axis === 'coronal' ? vy : vz;
-            dist = Math.abs(vAxis - drawnIdx) * sliceSpacingMm;
-            if (dist > CONTACT_THICKNESS_MM) return;
+          // Map to normalised display coords using the same rot90+fliplr the backend applies:
+          //   axial:    display[row=vy, col=vx]  img size (ny, nx)
+          //   sagittal: display[row=vz, col=vy]  img size (nz, ny)
+          //   coronal:  display[row=vz, col=vx]  img size (nz, nx)
+          // rot90(k=1) + fliplr inverts both in-plane axes:
+          //   axial:    display[row=ny-1-vy, col=nx-1-vx]
+          //   sagittal: display[row=nz-1-vz, col=ny-1-vy]
+          //   coronal:  display[row=nz-1-vz, col=nx-1-vx]
+          let normX, normY;
+          if (axis === 'axial')    { normX = flipNorm(vx, nx); normY = flipNorm(vy, ny); }
+          if (axis === 'sagittal') { normX = flipNorm(vy, ny); normY = flipNorm(vz, nz); }
+          if (axis === 'coronal')  { normX = flipNorm(vx, nx); normY = flipNorm(vz, nz); }
+          canX = dx + normX * dw;
+          canY = dy + normY * dh;
+        } else {
+          // No inverse affine yet, so the in-plane position is unknown — park the
+          // marker at the centre. The plane test is still exact: the plane headers
+          // give the perpendicular mm distance directly, no affine needed.
+          dist = planeNormal
+            ? Math.abs(planeNormal[0]*wx + planeNormal[1]*wy + planeNormal[2]*wz - planeOffset)
+            : 0;
+          if (dist > CONTACT_THICKNESS_MM) return;
+          canX = dx + dw / 2;
+          canY = dy + dh / 2;
+        }
 
-            // Map to normalised display coords using the same rot90+fliplr the backend applies:
-            //   axial:    display[row=vy, col=vx]  img size (ny, nx)
-            //   sagittal: display[row=vz, col=vy]  img size (nz, ny)
-            //   coronal:  display[row=vz, col=vx]  img size (nz, nx)
-            // rot90(k=1) + fliplr inverts both in-plane axes:
-            //   axial:    display[row=ny-1-vy, col=nx-1-vx]
-            //   sagittal: display[row=nz-1-vz, col=ny-1-vy]
-            //   coronal:  display[row=nz-1-vz, col=nx-1-vx]
-            let normX, normY;
-            if (axis === 'axial')    { normX = flipNorm(vx, nx); normY = flipNorm(vy, ny); }
-            if (axis === 'sagittal') { normX = flipNorm(vy, ny); normY = flipNorm(vz, nz); }
-            if (axis === 'coronal')  { normX = flipNorm(vx, nx); normY = flipNorm(vz, nz); }
-            canX = dx + normX * dw;
-            canY = dy + normY * dh;
-          } else {
-            // No inverse affine yet, so the in-plane position is unknown — park the
-            // marker at the centre. The plane test is still exact: the plane headers
-            // give the perpendicular mm distance directly, no affine needed.
-            dist = planeNormal
-              ? Math.abs(planeNormal[0]*wx + planeNormal[1]*wy + planeNormal[2]*wz - planeOffset)
-              : 0;
-            if (dist > CONTACT_THICKNESS_MM) return;
-            canX = dx + dw / 2;
-            canY = dy + dh / 2;
-          }
+        // Depth into the slab stays the alpha. With the fill now carrying the z-score
+        // it keeps a much higher floor, or a contact a few mm off-plane would fade
+        // towards the background and read as quieter than it is.
+        const alpha = activityContacts
+          ? 1 - 0.45 * (dist / CONTACT_THICKNESS_MM)
+          : Math.max(0.3, 1 - dist / CONTACT_THICKNESS_MM);
+        // The radius law is ActivityContact's, in pixels instead of mm, but with twice
+        // its swing: 0.7x at z=0 growing to 3.9x at the edge of the colour scale, where
+        // it clamps. A slice shows a handful of contacts at a time, so size can carry
+        // more of the reading here than it does among all the spheres at once.
+        const radius = !activityContacts ? (dist < 1.5 ? 5 : 3.5)
+          : m.inert ? ACTIVITY_R
+            : ACTIVITY_R * (0.7 + Math.min(3.2, 2 * Math.abs(m.value || 0) / (activityDomain || 6)));
 
-          const alpha = Math.max(0.3, 1 - dist / CONTACT_THICKNESS_MM);
-          const radius = dist < 1.5 ? 5 : 3.5;
+        ctx.globalAlpha = alpha;
+        ctx.beginPath();
+        ctx.arc(canX, canY, radius, 0, Math.PI*2);
+        ctx.fillStyle = !activityContacts ? m.ring
+          : m.inert ? INERT_COLOR : activityColor(m.value, activityDomain);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 1;
+        ctx.stroke();
 
+        hits.push({ id: m.id, canX, canY, radius, color: m.ring,
+          meshPos: m.mesh, label: m.label, value: m.value });
+
+        // Electrode-centric hover: ring the hovered contact (matches 3D viewer).
+        if (m.id === hoverId) {
           ctx.beginPath();
-          ctx.arc(canX, canY, radius, 0, Math.PI*2);
-          ctx.fillStyle = shaft.color + Math.round(alpha * 255).toString(16).padStart(2, '0');
-          ctx.fill();
-          ctx.strokeStyle = '#000';
-          ctx.lineWidth = 1;
+          ctx.arc(canX, canY, radius + 4, 0, Math.PI * 2);
+          ctx.strokeStyle = m.ring;
+          ctx.lineWidth = 2;
           ctx.stroke();
-
-          const id = `${shaft.id}-${c.contact_number}`;
-          const label = `${shaft.name}${c.contact_number}${shaft.label ? ` (${shaft.label})` : ''}`;
-          hits.push({ id, canX, canY, radius, color: shaft.color,
-            meshPos: [c.x_mm, c.y_mm, c.z_mm], label });
-
-          // Electrode-centric hover: ring the hovered contact (matches 3D viewer).
-          if (id === hoveredIdRef.current) {
-            ctx.beginPath();
-            ctx.arc(canX, canY, radius + 4, 0, Math.PI * 2);
-            ctx.strokeStyle = shaft.color;
-            ctx.lineWidth = 2;
-            ctx.stroke();
-          }
-        });
+        }
       });
       contactHitsRef.current = hits;
 
@@ -297,7 +344,8 @@ export default function SliceViewer({
       ctx.font = 'bold 9px IBM Plex Mono, monospace';
       ctx.fillText(info.label.slice(0,3).toUpperCase(), 4, 12);
     }
-  }, [axis, isThumbnail, reconstruction, meshData, info]);
+  }, [axis, isThumbnail, reconstruction, meshData, info,
+      activityContacts, activityDomain, shaftColors, hoveredChannel]);
 
   useEffect(() => { doDraw(); }, [renderTick, doDraw]);
 
@@ -586,7 +634,9 @@ export default function SliceViewer({
     canvas.style.cursor = best ? 'pointer' : 'default';
 
     if (!best) {
-      if (hoveredIdRef.current !== null) { hoveredIdRef.current = null; setHoveredContact(null); triggerDraw(); }
+      if (hoveredIdRef.current !== null) {
+        hoveredIdRef.current = null; setHoveredContact(null); onHoverContact?.(null); triggerDraw();
+      }
       return;
     }
     if (best.id === hoveredIdRef.current) {
@@ -603,13 +653,17 @@ export default function SliceViewer({
         : null;
       regionCacheRef.current.set(best.id, region);
     }
-    setHoveredContact({ id: best.id, label: best.label, color: best.color, region, x: mx, y: my });
+    setHoveredContact({ id: best.id, label: best.label, color: best.color, region,
+      value: best.value, x: mx, y: my });
+    onHoverContact?.(best.id);
     triggerDraw();
-  }, [isThumbnail, triggerDraw]);
+  }, [isThumbnail, triggerDraw, onHoverContact]);
 
   const handleMouseLeave = useCallback(() => {
-    if (hoveredIdRef.current !== null) { hoveredIdRef.current = null; setHoveredContact(null); triggerDraw(); }
-  }, [triggerDraw]);
+    if (hoveredIdRef.current !== null) {
+      hoveredIdRef.current = null; setHoveredContact(null); onHoverContact?.(null); triggerDraw();
+    }
+  }, [triggerDraw, onHoverContact]);
 
   const handleScrollbar = useCallback((e) => {
     if (isThumbnail) return;
@@ -683,7 +737,14 @@ export default function SliceViewer({
           fontFamily: 'IBM Plex Mono, monospace', fontSize: 16.5,
           boxShadow: `0 0 12px ${hoveredContact.color}44`,
         }}>
-          <div style={{ color: hoveredContact.color, marginBottom: 3 }}>{hoveredContact.label}</div>
+          <div style={{ color: hoveredContact.color, marginBottom: 3 }}>
+            {hoveredContact.label}
+            {hoveredContact.value != null && (
+              <span style={{ color: '#9fb3c8', marginLeft: 8, fontSize: 14 }}>
+                {hoveredContact.value >= 0 ? '+' : ''}{hoveredContact.value.toFixed(2)} z
+              </span>
+            )}
+          </div>
           {hoveredContact.region ? (
             hoveredContact.region.inside ? (
               <div style={{ color: hoveredContact.region.color, fontSize: 15 }}>{hoveredContact.region.label}</div>

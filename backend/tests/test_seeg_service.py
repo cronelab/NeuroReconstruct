@@ -144,7 +144,13 @@ def test_continuous_traces():
         # Map frames at the high-gamma envelope's Nyquist stride: 2000 Hz / (2 * 80 Hz) -> 12.
         assert np.allclose(np.diff(t), 12 / 2000.0, atol=1e-4)
         assert out["map_nyquist_met"] and out["map_rate_hz"] >= out["map_nyquist_hz"]
-        assert len(tt) <= S.TRACE_FRAMES_SCROLL
+        # Trace frames at the WAVEFORM's Nyquist stride, which is set by the band's upper
+        # cutoff rather than its width: 2000 Hz / (2 * 150 Hz) -> 6, i.e. 333.3 Hz. Every
+        # value is a real sample, so nothing is reduced and no min/max band is sent.
+        assert np.allclose(np.diff(tt), 6 / 2000.0, atol=1e-6)
+        assert out["trace_rate_hz"] == 333.33 and out["trace_nyquist_met"]
+        assert out["raw_decimation"] == "none"
+        assert np.asarray(out["raw_min"]).size == 0
     print("ok test_continuous_traces")
 
 
@@ -159,6 +165,33 @@ def test_envelope_nyquist_step():
     # A band past what the rate can represent clamps; a degenerate one needs every sample.
     assert S.envelope_nyquist_step(200.0, (150.0, 300.0)) == 1
     print("ok test_envelope_nyquist_step")
+
+
+def test_wave_step():
+    # A waveform is limited by the band's UPPER CUTOFF, not by its width (that is the
+    # envelope's limit), so filtered review needs 2 x 70 Hz and high gamma 2 x 150 Hz.
+    assert S.wave_step(600_000, 79, 2000.0, (1.0, 70.0), True, budget=10**9) == (14, 14)
+    assert S.wave_step(600_000, 79, 2000.0, (70.0, 150.0), True, budget=10**9) == (6, 6)
+    # Unfiltered, nothing has been removed: every sample is needed to be faithful.
+    assert S.wave_step(600_000, 79, 2000.0, (1.0, 70.0), False, budget=10**9) == (1, 1)
+    # Past the budget the stride widens beyond Nyquist, which the caller must answer
+    # with min/max rather than point sampling.
+    step, nyq = S.wave_step(600_000, 79, 2000.0, (1.0, 70.0), False, budget=79 * 1000)
+    assert nyq == 1 and step > nyq and np.ceil(600_000 / step) * 79 <= 79 * 1000
+    print("ok test_wave_step")
+
+
+def test_unfiltered_trace_keeps_spikes():
+    # The old raw path strided 2 kHz down to the display rate, so a spike survived only
+    # if it happened to land on a bin edge. Reduced by min/max, its height is always kept.
+    fs, n = 2000.0, 60_000
+    x = np.zeros((n, 1), np.float32)
+    x[12_345] = 5.0                                       # one sample, between bin edges
+    step = 600
+    idx = np.arange(0, n, step)
+    assert x[idx].max() == 0.0                            # striding misses it entirely
+    assert np.maximum.reduceat(x, idx, axis=0).max() == 5.0
+    print("ok test_unfiltered_trace_keeps_spikes")
 
 
 def test_map_budget_fallback_lowpasses():
@@ -185,7 +218,11 @@ def test_encode_activity_response():
     assert not any(isinstance(v, np.ndarray) for v in out.values())
     q = np.frombuffer(base64.b64decode(out["activity_b64"]), "<i2").reshape(out["activity_shape"])
     assert np.allclose(q * out["activity_scale"], np.clip(act, -327.67, 327.67), atol=0.006)
-    assert out["raw"] == [[1.23, 2.0]] and out["raw_min"] == []
+    # Traces are int16 at a shared scale, not JSON numbers.
+    assert "raw" not in out and "raw_min" not in out
+    assert out["trace_shape"] == [1, 2] and out["trace_keys"] == ["raw"]
+    q = np.frombuffer(base64.b64decode(out["raw_b64"]), "<i2")
+    assert np.allclose(q * out["trace_scale"], [1.23456, 2.0], atol=1e-3)
     # The viewer's trace-only fetch omits the map and its axis.
     slim = S.encode_activity_response(res, include_activity=False)
     assert "activity_b64" not in slim and "times" not in slim and "trace_times" in slim
@@ -291,6 +328,8 @@ if __name__ == "__main__":
     test_degenerate_channel_finite()
     test_continuous_traces()
     test_envelope_nyquist_step()
+    test_wave_step()
+    test_unfiltered_trace_keeps_spikes()
     test_map_budget_fallback_lowpasses()
     test_encode_activity_response()
     test_env_cache()

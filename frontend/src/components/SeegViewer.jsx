@@ -6,6 +6,7 @@ import {
 import * as THREE from 'three';
 import SeegViewer3D, { activityColor } from './SeegViewer3D';
 import SeegTracePanel from './SeegTracePanel';
+import SeegSliceViews from './SeegSliceViews';
 import StructurePanel from './StructurePanel';
 import { buildShaftColorMap } from '../seegColors';
 import { activeMarksAt, buildMarks } from '../seegAnnotations';
@@ -30,14 +31,14 @@ const panel = {
   padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 16,
   fontFamily: 'IBM Plex Sans, sans-serif', color: '#c8d4e0',
 };
-const label = { fontSize: 10, letterSpacing: '0.08em', textTransform: 'uppercase', color: '#7a8a99', marginBottom: 6 };
+const label = { fontSize: 12, letterSpacing: '0.08em', textTransform: 'uppercase', color: '#7a8a99', marginBottom: 6 };
 const numInput = {
   width: 62, padding: '4px 6px', background: '#111418', color: '#e8edf2',
-  border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, textAlign: 'right',
+  border: '1px solid #2a3340', borderRadius: 4, fontSize: 13, textAlign: 'right',
   fontFamily: 'IBM Plex Mono, monospace',
 };
 const seg = (active) => ({
-  padding: '5px 10px', fontSize: 11, fontFamily: 'IBM Plex Mono, monospace', cursor: 'pointer',
+  padding: '5px 10px', fontSize: 13, fontFamily: 'IBM Plex Mono, monospace', cursor: 'pointer',
   border: `1px solid ${active ? '#00d4ff55' : '#2a3340'}`, borderRadius: 4,
   background: active ? '#002233' : 'transparent', color: active ? '#00d4ff' : '#7a8a99',
 });
@@ -51,7 +52,7 @@ function ColorBar({ domain }) {
         height: 12, borderRadius: 3,
         background: `linear-gradient(to right, ${activityColor(-domain, domain)}, ${activityColor(0, domain)}, ${activityColor(domain, domain)})`,
       }} />
-      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: 9, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4, fontSize: 12, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace' }}>
         {stops.map((s) => <span key={s}>{s > 0 ? '+' : ''}{s.toFixed(0)}</span>)}
       </div>
     </div>
@@ -97,18 +98,27 @@ export default function SeegViewer({ reconId, onBack }) {
     seegMode, setSeegMode,
     seegTraceSignal, setSeegTraceSignal, seegTraceScope, setSeegTraceScope,
     seegTraceShaft, setSeegTraceShaft, seegTracePanelW, setSeegTracePanelW,
-    seegTraceGain, setSeegTraceGain,
+    seegTraceGain, setSeegTraceGain, seegTraceWindow, setSeegTraceWindow,
     seegBrainOpacity, setSeegBrainOpacity, seegStructureOpacity, setSeegStructureOpacity,
     seegIgnoreOutside, setSeegIgnoreOutside, seegColorLimit, setSeegColorLimit,
     seegTimeIndex, setSeegTimeIndex, seegPlaying, setSeegPlaying,
-    seegPlaySpeed, setSeegPlaySpeed, seegLiveValues, setSeegPlayhead,
+    seegPlaySpeed, setSeegPlaySpeed, seegLiveValues, seegPlayheadTime, setSeegPlayhead,
     // Structures live in the global store so the shared StructurePanel (master
     // toggle + hierarchical tri-state + opacity) drives both this view and the
     // main reconstruction viewer consistently.
     structuresData, setStructuresData, structureVisible,
+    // The 2D slice panes read the surface from the store (they place contacts relative
+    // to the mesh centre), so the mesh this view loads goes in there rather than only
+    // into local state.
+    setMeshData,
   } = useAppStore();
 
   const [nativeMesh, setNativeMesh] = useState(null);
+  // Voltage for the window on screen, at that window's own resolution. Only fetched
+  // when the whole-session trace could not reach the signal's rate (see below).
+  const [traceDetail, setTraceDetail] = useState(null);
+  const [viewWindow, setViewWindow] = useState(null);
+  const detailSeqRef = useRef(0);
   const [hoveredChannel, setHoveredChannel] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [computing, setComputing] = useState(false);
@@ -208,7 +218,8 @@ export default function SeegViewer({ reconId, onBack }) {
       setSeegRecordings(r.data);
       if (r.data.length && !seegRecordingId) setSeegRecordingId(r.data[0].id);
     }).catch(() => {});
-    getMesh(reconId).then((r) => setNativeMesh(r.data)).catch(() => setNativeMesh(null));
+    getMesh(reconId).then((r) => { setNativeMesh(r.data); setMeshData(r.data); })
+      .catch(() => setNativeMesh(null));
   }, [reconId]);
 
   // Structures load on demand via the StructurePanel's "Load" button (matches the
@@ -238,6 +249,7 @@ export default function SeegViewer({ reconId, onBack }) {
     };
     setError(null);
     setSeegPlaying(false);
+    setTraceDetail(null);
 
     // Cache hit: revisiting a computed setting loads instantly (full result, raw
     // included) with no fetch. Only trial-mode results are cached (see RESULT_CACHE).
@@ -276,6 +288,9 @@ export default function SeegViewer({ reconId, onBack }) {
               raw_max: r2.data.raw_max,
               raw_filtered: r2.data.raw_filtered,
               raw_decimation: r2.data.raw_decimation,
+              rate_hz: r2.data.rate_hz,
+              trace_rate_hz: r2.data.trace_rate_hz,
+              trace_nyquist_met: r2.data.trace_nyquist_met,
             };
             setSeegActivity(full);
             if (key) cachePut(key, full);   // cache the full result for instant re-switch
@@ -291,6 +306,46 @@ export default function SeegViewer({ reconId, onBack }) {
     return undefined;
   }, [reconId, seegRecordingId, seegBand, filterRaw, seegMode, seegAlign, seegPre, seegPost,
       seegBaseStart, seegBaseEnd]);
+
+  // ── Trace detail for the visible window ───────────────────────────────────────
+  // Only worth asking for when the whole-session trace is below the signal's own rate,
+  // which in practice means the unfiltered one: raw would need 47 million samples for a
+  // five-minute recording, so the session view sends the true high/low of each bin
+  // instead. Spending the same rule on a few seconds gets real samples back. A filtered
+  // trace already arrives at its Nyquist rate, so it never asks.
+  const onViewWindow = useMemo(() => (t0, t1) => {
+    setViewWindow((p) => (p && p[0] === t0 && p[1] === t1 ? p : [t0, t1]));
+  }, []);
+
+  const needsDetail = seegActivity?.trace_nyquist_met === false;
+  useEffect(() => {
+    if (!needsDetail || !viewWindow || seegMode !== 'scroll' || !reconId || !seegRecordingId) {
+      setTraceDetail(null);
+      return undefined;
+    }
+    const [t0, t1] = viewWindow;
+    // Beyond about half a minute the session view is already as fine as the screen,
+    // so a request would cost bytes and buy nothing.
+    if (!(t1 > t0) || t1 - t0 > 30) { setTraceDetail(null); return undefined; }
+    const seq = ++detailSeqRef.current;
+    // Debounced: a drag would otherwise fire a request a frame.
+    const timer = setTimeout(() => {
+      computeSeegActivity(reconId, seegRecordingId, {
+        band: seegBand, mode: 'scroll', align: seegAlign, filter_raw: filterRaw,
+        window_ms: [-seegPre, seegPost], baseline_ms: [seegBaseStart, seegBaseEnd],
+        include_raw: true, include_activity: false, trace_window_s: [t0, t1],
+      }).then((r) => {
+        if (seq !== detailSeqRef.current) return;              // superseded by a newer window
+        setTraceDetail({
+          t0, t1, times: r.data.trace_times, raw: r.data.raw,
+          raw_min: r.data.raw_min, raw_max: r.data.raw_max,
+          raw_decimation: r.data.raw_decimation, rate: r.data.trace_rate_hz,
+        });
+      }).catch(() => {});
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [needsDetail, viewWindow, seegMode, reconId, seegRecordingId, seegBand, seegAlign,
+      filterRaw, seegPre, seegPost, seegBaseStart, seegBaseEnd]);
 
   // ── Playback ──────────────────────────────────────────────────────────────────
   // Playback runs on the recording's clock, not the frame count: a playhead advances by
@@ -349,17 +404,22 @@ export default function SeegViewer({ reconId, onBack }) {
         for (let c = 0; c < nCh; c++) out[c] /= n;
       }
       prevFrame = k;
-      setSeegPlayhead(k, out);
+      setSeegPlayhead(k, out, playhead);
     };
 
-    // One step per displayed frame. requestAnimationFrame is suspended while the page is
-    // hidden or throttled, so a coarse timer keeps the playhead advancing then too.
+    // One step per displayed frame, with a timer standing in whenever requestAnimationFrame
+    // is throttled -- which it routinely is: in an unfocused window, and in the desktop
+    // app's own browser pane, rAF can drop to a few frames a second or stop altogether.
+    // The timer runs at display rate rather than as a coarse safety net, because a
+    // ~10 Hz playhead is visibly steppy once the traces are zoomed in. Either clock
+    // yields to the other, so this is still at most one step per displayed frame, and if
+    // the main thread cannot keep up the timer is delayed with it.
     let raf = 0, lastTick = performance.now();
     const onFrame = () => { tick(); lastTick = performance.now(); raf = requestAnimationFrame(onFrame); };
     raf = requestAnimationFrame(onFrame);
     const watchdog = setInterval(() => {
-      if (performance.now() - lastTick > 100) { tick(); lastTick = performance.now(); }
-    }, 50);
+      if (performance.now() - lastTick > 24) { tick(); lastTick = performance.now(); }
+    }, 16);
     return () => { cancelAnimationFrame(raf); clearInterval(watchdog); };
   }, [seegPlaying, mapTimes, mapValues, mapUnit, playSpeed]);
 
@@ -475,7 +535,7 @@ export default function SeegViewer({ reconId, onBack }) {
       <div style={panel}>
         <div>
           <div style={{ fontSize: 14, fontWeight: 600, color: '#e8edf2' }}>sEEG Functional Mapping</div>
-          <div style={{ fontSize: 11, color: '#7a8a99', marginTop: 2 }}>
+          <div style={{ fontSize: 13, color: '#7a8a99', marginTop: 2 }}>
             {reconstruction ? `Patient ${reconstruction.patient_id}` : '—'}
           </div>
         </div>
@@ -491,7 +551,7 @@ export default function SeegViewer({ reconId, onBack }) {
           {seegRecordings.length > 0 && (
             <select value={seegRecordingId || ''} onChange={(e) => setSeegRecordingId(Number(e.target.value))}
               style={{ width: '100%', marginTop: 8, padding: '5px 8px', background: '#111418', color: '#c8d4e0',
-                border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }}>
+                border: '1px solid #2a3340', borderRadius: 4, fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' }}>
               {seegRecordings.map((r) => (
                 <option key={r.id} value={r.id}>{r.task || r.filename}</option>
               ))}
@@ -508,7 +568,7 @@ export default function SeegViewer({ reconId, onBack }) {
               setSeegBand(v === CUSTOM_BAND ? `${hpDraft}-${lpDraft}` : v);
             }}
             style={{ width: '100%', padding: '6px 8px', background: '#111418', color: '#c8d4e0',
-              border: '1px solid #2a3340', borderRadius: 4, fontSize: 12, fontFamily: 'IBM Plex Mono, monospace' }}>
+              border: '1px solid #2a3340', borderRadius: 4, fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' }}>
             {BANDS.map(([key, txt]) => <option key={key} value={key}>{txt}</option>)}
             <option value={CUSTOM_BAND}>Custom bandpass…</option>
           </select>
@@ -520,28 +580,46 @@ export default function SeegViewer({ reconId, onBack }) {
                 onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
                 title="High-pass cutoff (Hz)"
                 style={numInput} />
-              <span style={{ fontSize: 11, color: '#7a8a99' }}>–</span>
+              <span style={{ fontSize: 13, color: '#7a8a99' }}>–</span>
               <input type="number" min={0.2} step={5} value={lpDraft}
                 onChange={(e) => setLpDraft(e.target.value)} onBlur={commitCustomBand}
                 onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
                 title="Low-pass cutoff (Hz)"
                 style={numInput} />
-              <span style={{ fontSize: 11, color: '#7a8a99' }}>Hz</span>
+              <span style={{ fontSize: 13, color: '#7a8a99' }}>Hz</span>
             </div>
           )}
           {bandError && (
-            <div style={{ fontSize: 10, color: '#ff8a80', marginTop: 6 }}>{bandError}</div>
+            <div style={{ fontSize: 12, color: '#ff8a80', marginTop: 6 }}>{bandError}</div>
           )}
-          {/* How finely the map is sampled against what the band needs. Below Nyquist only
-              happens when a long, many-channel recording would exceed the payload budget. */}
+          {/* How many frames a second the brain is animated at. It is set from the band
+              (see the Nyquist reasoning in seeg_service.envelope_nyquist_step), but the
+              reader only needs the rate itself -- and to be told when a long, many-channel
+              recording had to be smoothed to fit inside the payload budget. */}
           {seegActivity?.map_rate_hz != null && (
-            <div style={{ fontSize: 10, marginTop: 6, fontFamily: 'IBM Plex Mono, monospace',
+            <div style={{ fontSize: 12, marginTop: 6, fontFamily: 'IBM Plex Mono, monospace',
               color: seegActivity.map_nyquist_met ? '#7a8a99' : '#ffb74d' }}
               title={seegActivity.map_nyquist_met
-                ? 'Map frame rate is at least twice the width of the band, the highest frequency its power envelope contains'
-                : 'Too many frames to send at the Nyquist rate; each frame averages the envelope over its span, so fast changes are smoothed rather than aliased'}>
-              map {seegActivity.map_rate_hz.toFixed(1)} Hz · Nyquist {seegActivity.map_nyquist_hz.toFixed(0)} Hz
+                ? 'Frames per second of recording in the brain view. Fast enough to follow everything this band can change at.'
+                : `Too many frames to send at the ${seegActivity.map_nyquist_hz.toFixed(0)} Hz this band can change at, so each frame averages its own span: fast changes are smoothed rather than lost to aliasing.`}>
+              frame rate {seegActivity.map_rate_hz.toFixed(1)} Hz
               {seegActivity.map_nyquist_met ? '' : ' · smoothed to fit'}
+            </div>
+          )}
+          {/* What the voltage trace itself is: real samples at or above the rate the
+              signal needs, or -- when that would not fit -- the true high/low of each
+              bin, which draws as a band rather than a waveform. */}
+          {seegActivity?.trace_rate_hz != null && seegTraceSignal !== 'z' && (
+            <div style={{ fontSize: 12, marginTop: 3, fontFamily: 'IBM Plex Mono, monospace',
+              color: seegActivity.trace_nyquist_met ? '#7a8a99' : '#ffb74d' }}
+              title={seegActivity.trace_nyquist_met
+                ? 'Every point drawn is a real sample, at or above the rate this signal needs. Zoom in as far as you like.'
+                : 'Too many samples to send at full rate, so each bin carries its true highest and lowest value. Spikes keep their height, but the trace reads as a band rather than a waveform.'}>
+              trace {(traceDetail?.rate ?? seegActivity.trace_rate_hz).toFixed(1)} Hz
+              {(traceDetail ? traceDetail.raw_decimation === 'none'
+                            : seegActivity.trace_nyquist_met)
+                ? ' · true samples' : ' · high/low per bin'}
+              {traceDetail ? ' · this window' : ''}
             </div>
           )}
 
@@ -556,7 +634,7 @@ export default function SeegViewer({ reconId, onBack }) {
           </div>
 
           {seegMode === 'scroll' ? (
-            <div style={{ fontSize: 10, color: '#7a8a99' }}>
+            <div style={{ fontSize: 12, color: '#7a8a99' }}>
               Continuous recording · band-power z-score over the whole session
               {seegActivity?.band_hz
                 ? `, ${seegActivity.band_hz[0]}–${seegActivity.band_hz[1]} Hz.`
@@ -576,27 +654,27 @@ export default function SeegViewer({ reconId, onBack }) {
           <div style={label}>Display window (± event, ms)</div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <span style={{ fontSize: 10, color: '#7a8a99' }}>−</span>
+              <span style={{ fontSize: 12, color: '#7a8a99' }}>−</span>
               <input type="number" min={10} max={2000} step={50} value={preDraft}
                 onChange={(e) => setPreDraft(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && applyWindow()}
-                style={{ width: 56, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
-                  border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }} />
+                style={{ width: 62, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
+                  border: '1px solid #2a3340', borderRadius: 4, fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' }} />
             </div>
-            <span style={{ fontSize: 10, color: '#4a5568' }}>to</span>
+            <span style={{ fontSize: 12, color: '#4a5568' }}>to</span>
             <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-              <span style={{ fontSize: 10, color: '#7a8a99' }}>+</span>
+              <span style={{ fontSize: 12, color: '#7a8a99' }}>+</span>
               <input type="number" min={50} max={4000} step={50} value={postDraft}
                 onChange={(e) => setPostDraft(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && applyWindow()}
-                style={{ width: 56, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
-                  border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }} />
+                style={{ width: 62, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
+                  border: '1px solid #2a3340', borderRadius: 4, fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' }} />
             </div>
             <button onClick={applyWindow} disabled={!windowDirty}
               style={{ ...seg(windowDirty), padding: '4px 10px', opacity: windowDirty ? 1 : 0.4,
                 cursor: windowDirty ? 'pointer' : 'default' }}>Apply</button>
           </div>
-          <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 5 }}>
+          <div style={{ fontSize: 12, color: '#7a8a99', marginTop: 5 }}>
             Shown around {seegAlign === 'response' ? 'the response' : 'stimulus onset'} (t=0). Full window is displayed.
           </div>
 
@@ -606,19 +684,19 @@ export default function SeegViewer({ reconId, onBack }) {
             <input type="number" max={0} step={50} value={baseStartDraft}
               onChange={(e) => setBaseStartDraft(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && applyBaseline()}
-              style={{ width: 56, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
-                border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }} />
-            <span style={{ fontSize: 10, color: '#4a5568' }}>to</span>
+              style={{ width: 62, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
+                border: '1px solid #2a3340', borderRadius: 4, fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' }} />
+            <span style={{ fontSize: 12, color: '#4a5568' }}>to</span>
             <input type="number" max={0} step={50} value={baseEndDraft}
               onChange={(e) => setBaseEndDraft(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && applyBaseline()}
-              style={{ width: 56, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
-                border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }} />
+              style={{ width: 62, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
+                border: '1px solid #2a3340', borderRadius: 4, fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' }} />
             <button onClick={applyBaseline} disabled={!baselineDirty}
               style={{ ...seg(baselineDirty), padding: '4px 10px', opacity: baselineDirty ? 1 : 0.4,
                 cursor: baselineDirty ? 'pointer' : 'default' }}>Apply</button>
           </div>
-          <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 5 }}>
+          <div style={{ fontSize: 12, color: '#7a8a99', marginTop: 5 }}>
             Always measured before <span style={{ color: '#c8d4e0' }}>stimulus</span> onset (both ≤ 0), even when aligned to the response.
           </div>
           </>)}
@@ -627,20 +705,20 @@ export default function SeegViewer({ reconId, onBack }) {
         <div>
           <ColorBar domain={domain} />
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8 }}>
-            <span style={{ fontSize: 10, color: '#7a8a99' }}>Limit ±z</span>
+            <span style={{ fontSize: 12, color: '#7a8a99' }}>Limit ±z</span>
             <input type="number" min={0.1} step={0.5} placeholder={String(autoDomain)}
               value={seegColorLimit ?? ''}
               onChange={(e) => {
                 const v = e.target.value;
                 setSeegColorLimit(v === '' ? null : Math.max(0.1, Number(v)));
               }}
-              style={{ width: 56, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
-                border: '1px solid #2a3340', borderRadius: 4, fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }} />
+              style={{ width: 62, padding: '4px 6px', background: '#111418', color: '#c8d4e0',
+                border: '1px solid #2a3340', borderRadius: 4, fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' }} />
             <button onClick={() => setSeegColorLimit(null)} disabled={seegColorLimit == null}
               style={{ ...seg(false), padding: '4px 10px', opacity: seegColorLimit == null ? 0.4 : 1,
                 cursor: seegColorLimit == null ? 'default' : 'pointer' }}>Auto</button>
           </div>
-          <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 4 }}>
+          <div style={{ fontSize: 12, color: '#7a8a99', marginTop: 4 }}>
             {seegColorLimit != null ? 'Manual color limit' : `Auto · 99th percentile of |z| (±${autoDomain})`}
           </div>
         </div>
@@ -652,7 +730,7 @@ export default function SeegViewer({ reconId, onBack }) {
             <input type="range" min={0} max={1} step={0.05} value={seegBrainOpacity}
               onChange={(e) => setSeegBrainOpacity(parseFloat(e.target.value))}
               style={{ flex: 1, accentColor: '#00d4ff' }} />
-            <span style={{ fontSize: 11, fontFamily: 'IBM Plex Mono, monospace', color: '#7a8a99', width: 34, textAlign: 'right' }}>
+            <span style={{ fontSize: 13, fontFamily: 'IBM Plex Mono, monospace', color: '#7a8a99', width: 34, textAlign: 'right' }}>
               {Math.round(seegBrainOpacity * 100)}%
             </span>
           </div>
@@ -660,10 +738,10 @@ export default function SeegViewer({ reconId, onBack }) {
             <input type="checkbox" checked={seegIgnoreOutside}
               onChange={(e) => setSeegIgnoreOutside(e.target.checked)}
               style={{ accentColor: '#00d4ff', width: 14, height: 14 }} />
-            <span style={{ fontSize: 12, color: '#c8d4e0' }}>Ignore contacts outside brain</span>
+            <span style={{ fontSize: 13, color: '#c8d4e0' }}>Ignore contacts outside brain</span>
           </label>
           {seegIgnoreOutside && (
-            <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 4 }}>
+            <div style={{ fontSize: 12, color: '#7a8a99', marginTop: 4 }}>
               Outside contacts stay in place but aren’t colored/scaled by z or used for the color limit.
             </div>
           )}
@@ -685,30 +763,30 @@ export default function SeegViewer({ reconId, onBack }) {
         {seegActivity && (
           <div>
             <div style={label}>Channel coverage</div>
-            <div style={{ fontSize: 11, fontFamily: 'IBM Plex Mono, monospace' }}>
+            <div style={{ fontSize: 13, fontFamily: 'IBM Plex Mono, monospace' }}>
               <span style={{ color: '#00e676' }}>{matchedN} mapped</span>
               {unmatchedN > 0 && <span style={{ color: '#ffab40', marginLeft: 10 }}>{unmatchedN} unmatched</span>}
             </div>
             {unmatchedN > 0 && (
-              <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 6, wordBreak: 'break-word' }}>
+              <div style={{ fontSize: 12, color: '#7a8a99', marginTop: 6, wordBreak: 'break-word' }}>
                 No contact for: {seegActivity.unmatched_channels.slice(0, 24).join(', ')}
                 {unmatchedN > 24 ? ` +${unmatchedN - 24} more` : ''}
               </div>
             )}
-            <div style={{ fontSize: 10, color: '#7a8a99', marginTop: 4 }}>
+            <div style={{ fontSize: 12, color: '#7a8a99', marginTop: 4 }}>
               {seegActivity.mode === 'scroll'
                 ? 'continuous recording'
                 : `${seegActivity.n_trials} trials averaged · aligned to ${seegActivity.align === 'response' ? 'response' : 'stimulus'} onset`}
             </div>
             {seegActivity.mode !== 'scroll' && seegActivity.align === 'response' && seegActivity.n_no_response > 0 && (
-              <div style={{ fontSize: 10, color: '#ffab40', marginTop: 2 }}>
+              <div style={{ fontSize: 12, color: '#ffab40', marginTop: 2 }}>
                 {seegActivity.n_no_response} trial{seegActivity.n_no_response === 1 ? '' : 's'} dropped (no response detected)
               </div>
             )}
           </div>
         )}
 
-        {error && <div style={{ fontSize: 11, color: '#ff8a80' }}>{error}</div>}
+        {error && <div style={{ fontSize: 13, color: '#ff8a80' }}>{error}</div>}
 
         <div style={{ flex: 1 }} />
         {onBack && (
@@ -716,8 +794,12 @@ export default function SeegViewer({ reconId, onBack }) {
         )}
       </div>
 
-      {/* ── Brain (center) ── */}
-      <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
+      {/* ── Brain + MRI slice planes (center) ── */}
+      <SeegSliceViews reconId={reconId}
+        activityContacts={contacts} activityDomain={domain} shaftColors={shaftColors}
+        hoveredChannel={hoveredChannel} onHoverContact={setHoveredChannel}
+        viewer3D={(
+      <div style={{ position: 'absolute', inset: 0 }}>
         <SeegViewer3D
           meshData={surfaceMesh}
           contacts={contacts}
@@ -736,7 +818,7 @@ export default function SeegViewer({ reconId, onBack }) {
           <div style={{ position: 'absolute', top: 12, left: 12, display: 'flex',
             flexDirection: 'column', gap: 6, alignItems: 'flex-start',
             maxWidth: 'calc(100% - 24px)', pointerEvents: 'none' }}>
-            <div style={{ fontSize: 10, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace',
+            <div style={{ fontSize: 12, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace',
               background: '#0d1015aa', padding: '4px 8px', borderRadius: 3 }}>
               Native brain · {seegActivity.band_hz
                 ? `${seegActivity.band_hz[0]}–${seegActivity.band_hz[1]} Hz`
@@ -749,12 +831,12 @@ export default function SeegViewer({ reconId, onBack }) {
               <div key={`am${i}`} style={{ display: 'flex', alignItems: 'baseline', gap: 8,
                 background: '#0d1015e6', borderLeft: `3px solid ${m.color}`,
                 padding: '5px 10px', borderRadius: 3 }}>
-                <span style={{ fontSize: 10, color: '#7a8a99',
+                <span style={{ fontSize: 12, color: '#7a8a99',
                   fontFamily: 'IBM Plex Mono, monospace' }}>{m.onset.toFixed(0)}s</span>
-                <span style={{ fontSize: 13, color: m.color, fontWeight: 500,
+                <span style={{ fontSize: 14, color: m.color, fontWeight: 500,
                   fontFamily: 'IBM Plex Mono, monospace' }}>{m.text}</span>
                 {m.channels?.length > 0 && (
-                  <span style={{ fontSize: 10, color: '#8a97a6',
+                  <span style={{ fontSize: 12, color: '#8a97a6',
                     fontFamily: 'IBM Plex Mono, monospace' }}>{m.channels.join(' ')}</span>
                 )}
               </div>
@@ -762,6 +844,7 @@ export default function SeegViewer({ reconId, onBack }) {
           </div>
         )}
       </div>
+      )} />
 
       {/* ── Trace panel (right) — stacked traces with synced time cursor ── */}
       {seegActivity && nFrames > 0 && (
@@ -774,6 +857,10 @@ export default function SeegViewer({ reconId, onBack }) {
           hoveredChannel={hoveredChannel} setHoveredChannel={setHoveredChannel}
           width={seegTracePanelW} setWidth={setSeegTracePanelW}
           traceGain={seegTraceGain} setTraceGain={setSeegTraceGain}
+          playheadTime={seegPlaying ? seegPlayheadTime : null}
+          traceDetail={traceDetail} onViewWindow={onViewWindow}
+          timeWindow={seegTraceWindow[playMode]}
+          setTimeWindow={(v) => setSeegTraceWindow(playMode, v)}
           playing={seegPlaying} setPlaying={setSeegPlaying}
           speed={playSpeed} setSpeed={(v) => setSeegPlaySpeed(playMode, v)}
           shaftColors={shaftColors}
