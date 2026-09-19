@@ -549,6 +549,9 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
     band:        key in BANDS.
     window_ms:   peri-event display window in ms [start, end], start < 0 < end,
                  relative to the alignment event.
+    filter_raw:  bandpass the recording to `band` before epoching, so the returned
+                 trace is the band's waveform rather than the broadband ERP. Does not
+                 affect the activation map, which is always built from the envelope.
     baseline_ms: baseline window in ms [start, end], both <= 0, ALWAYS relative to
                  STIMULUS onset (start_time) -- not the alignment event. Aligning to
                  the response makes the pre-response interval a bad baseline (it holds
@@ -562,7 +565,10 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
                                          spaced at the band envelope's Nyquist rate
       activity: float32 (n_frames, n_channels) baseline z on `times`
       trace_times: [t_ms, ...]           trace frames, a fixed display resolution
-      raw:      float32 (n_trace_frames, n_channels) trial-averaged, baseline-corrected ERP (uV)
+      raw:      float32 (n_trace_frames, n_channels) trial-averaged, baseline-corrected
+                voltage (uV) -- bandpassed to `band` when filter_raw, broadband (the
+                classic ERP) when not. Absent when the trace had to be reduced, in
+                which case raw_min/raw_max carry the per-bin extremes instead.
       mode ('trial'), time_unit ('ms'), band, align, n_trials, n_no_response,
       map_rate_hz, map_nyquist_hz, map_nyquist_met
     """
@@ -681,11 +687,11 @@ def compute_band_activity(path: str, band: str = DEFAULT_BAND,
     step, nyq = map_step(n_pst, n_ch, fs, band_hz)
     map_times = pst_times_ms[::step]
     avg = _reduce_map(avg, step, nyq)
-    # Traces: the same rate rule the continuous view uses. The trial-averaged ERP is
-    # never filtered, so it is broadband and its faithful step is 1 -- and an epoch is
-    # small enough that native costs nothing (a 2.5 s window at 2 kHz is 5000 samples,
-    # ~1 MB of int16 across a hundred channels), so the panel can zoom anywhere inside
-    # the epoch with no reduction at all. The budget only ever binds on an extreme
+    # Traces: the same rate rule the continuous view uses, so a filtered trace is sent
+    # at its band's Nyquist rate and a broadband one at the acquisition rate. Either way
+    # an epoch is small enough that native costs nothing (a 2.5 s window at 2 kHz is 5000
+    # samples, ~1 MB of int16 across a hundred channels), so the panel can zoom anywhere
+    # inside the epoch with no reduction at all. The budget only ever binds on an extreme
     # window x channel count, and then min/max keeps it honest.
     tstep, tnyq = wave_step(n_pst, n_ch, fs, band_hz, bool(include_raw and filter_raw))
     trace_times = pst_times_ms[::tstep]
