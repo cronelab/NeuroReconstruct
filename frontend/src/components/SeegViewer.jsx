@@ -72,6 +72,16 @@ const DEFAULT_WINDOW = {
 // already viewed loads instantly — no server round-trip and no two-phase fetch flash.
 // Keyed including recId (a fresh id per upload makes invalidation trivial); LRU-capped
 // to bound memory. Complements the backend result + envelope caches.
+// Everything phase 2 fills in. Removing exactly these leaves a map-only result, the
+// same shape phase 1 returns -- which is what lets a held map stand in for one.
+const TRACE_FIELDS = ['trace_times', 'raw', 'raw_min', 'raw_max', 'raw_filtered',
+                      'raw_decimation', 'rate_hz', 'trace_rate_hz', 'trace_nyquist_met'];
+const stripTrace = (a) => {
+  const out = { ...a };
+  for (const k of TRACE_FIELDS) delete out[k];
+  return out;
+};
+
 const RESULT_CACHE = new Map();
 const RESULT_CACHE_MAX = 24;
 const cacheKey = (recId, p) => [
@@ -125,6 +135,7 @@ export default function SeegViewer({ reconId, onBack }) {
   const [error, setError] = useState(null);
   const fileRef = useRef(null);
   const reqSeqRef = useRef(0);   // guards against stale two-phase responses
+  const mapKeyRef = useRef(null);  // settings the map in the store was computed for
 
   // Custom bandpass cutoffs. Held as drafts and committed on blur/Enter so typing
   // "1" on the way to "15" doesn't kick off a recompute per keystroke.
@@ -238,6 +249,11 @@ export default function SeegViewer({ reconId, onBack }) {
   // band, so the fetch keys on this rather than on the signal and switching between
   // those two needs no request at all.
   const filterRaw = seegTraceSignal !== 'raw';
+  // The map does not depend on which trace the panel draws -- it is always built from
+  // the band envelope -- so everything here except filter_raw decides it. Toggling
+  // raw <-> filtered would otherwise re-fetch a byte-identical 9 MB matrix.
+  const mapKey = JSON.stringify([reconId, seegRecordingId, seegBand, seegMode, seegAlign,
+                                 seegPre, seegPost, seegBaseStart, seegBaseEnd]);
   useEffect(() => {
     if (!reconId || !seegRecordingId) return undefined;
     const seq = ++reqSeqRef.current;
@@ -258,16 +274,25 @@ export default function SeegViewer({ reconId, onBack }) {
       const cached = cacheGet(key);
       if (cached) {
         setSeegActivity(cached);
+        mapKeyRef.current = mapKey;
         setComputing(false);
         return undefined;
       }
     }
 
-    setComputing(true);
-    computeSeegActivity(reconId, seegRecordingId, { ...params, include_raw: false })
+    // Only the trace changed: keep the map already in the store and skip phase 1.
+    // Its trace fields go, though -- they belong to the signal being switched away
+    // from, and drawing them under the new label until phase 2 lands would be a lie.
+    const held = mapKeyRef.current === mapKey ? useAppStore.getState().seegActivity : null;
+    setComputing(!held);
+    const phase1 = held
+      ? Promise.resolve({ data: stripTrace(held) })
+      : computeSeegActivity(reconId, seegRecordingId, { ...params, include_raw: false });
+    phase1
       .then((r) => {
         if (seq !== reqSeqRef.current) return;                 // superseded
         setSeegActivity(r.data);
+        mapKeyRef.current = mapKey;
         setComputing(false);                                   // map is ready
         // Phase 2: raw voltages for the trace panel (map stays put on failure). The map
         // is already here and is the bulk of the payload, so this asks for traces only.
@@ -301,18 +326,22 @@ export default function SeegViewer({ reconId, onBack }) {
         if (seq !== reqSeqRef.current) return;
         setError(e?.response?.data?.detail || 'Could not compute activity');
         setSeegActivity(null);
+        mapKeyRef.current = null;
         setComputing(false);
       });
     return undefined;
   }, [reconId, seegRecordingId, seegBand, filterRaw, seegMode, seegAlign, seegPre, seegPost,
-      seegBaseStart, seegBaseEnd]);
+      seegBaseStart, seegBaseEnd, mapKey]);
 
   // ── Trace detail for the visible window ───────────────────────────────────────
-  // Only worth asking for when the whole-session trace is below the signal's own rate,
-  // which in practice means the unfiltered one: raw would need 47 million samples for a
-  // five-minute recording, so the session view sends the true high/low of each bin
-  // instead. Spending the same rule on a few seconds gets real samples back. A filtered
-  // trace already arrives at its Nyquist rate, so it never asks.
+  // Only worth asking for when the whole-session trace came back below the signal's own
+  // rate. Raw always does -- it would need 47 million samples for a five-minute
+  // recording -- so the session view sends the true high/low of each bin instead, and
+  // spending the same rule on a few seconds gets real samples back. A filtered trace
+  // usually arrives at its Nyquist rate already and never asks, but not always: high
+  // gamma needs 333 Hz, and on a long recording with a wide montage (an eight-minute,
+  // 115-channel session is 19M values) that is past the ceiling too. So this keys on
+  // what the response reported, not on which signal was requested.
   const onViewWindow = useMemo(() => (t0, t1) => {
     setViewWindow((p) => (p && p[0] === t0 && p[1] === t1 ? p : [t0, t1]));
   }, []);

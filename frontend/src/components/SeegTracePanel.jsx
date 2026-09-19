@@ -368,12 +368,26 @@ export default function SeegTracePanel({
     rows.forEach((r, i) => {
       const yc = i * rowH + rowH / 2;
       const hot = hoveredChannel === r.name;
-      if (hot) { ctx.fillStyle = '#00d4ff14'; ctx.fillRect(0, i * rowH, width, rowH); }
+      if (hot) {
+        // Hovering a contact in the brain or a slice view lands here, so this has to be
+        // findable at a glance in a montage of a hundred rows: a tinted band, rules top
+        // and bottom to bound it, and a solid cyan tab in the gutter that stays visible
+        // even where the band washes out against a busy trace.
+        ctx.fillStyle = '#00d4ff1f';
+        ctx.fillRect(0, i * rowH, width, rowH);
+        ctx.strokeStyle = '#00d4ff55'; ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, i * rowH + 0.5); ctx.lineTo(width, i * rowH + 0.5);
+        ctx.moveTo(0, (i + 1) * rowH - 0.5); ctx.lineTo(width, (i + 1) * rowH - 0.5);
+        ctx.stroke();
+        ctx.fillStyle = '#00d4ff';
+        ctx.fillRect(0, i * rowH + 1, 3, rowH - 2);
+      }
       // baseline + separator
       ctx.strokeStyle = '#1a2029'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(GUTTER, yc); ctx.lineTo(width, yc); ctx.stroke();
       // label
-      ctx.fillStyle = hot ? '#e8edf2' : '#8a97a6';
+      ctx.fillStyle = hot ? '#7fe9ff' : '#8a97a6';
       ctx.fillText(r.name, 6, yc);
       // trace (voltage traces are skipped until phase 2 fills data.raw)
       if (!(isVoltage && !rawReady) && k1 >= k0) {
@@ -491,11 +505,64 @@ export default function SeegTracePanel({
   };
   const onAxisUp = () => { panRef.current = null; };
 
+  // ── Follow a hover from the brain ──────────────────────────────────────────
+  // Hovering a contact in the 3D view or a slice pane highlights its trace. In a
+  // montage of a hundred channels that row is usually scrolled out of sight, so bring
+  // it into view -- but only when it is not already visible, which is exactly the case
+  // where the hover came from this panel's own pointer and scrolling would fight the
+  // mouse. No origin tracking needed: the condition is the origin.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!hoveredChannel || !el) return;
+    const i = rows.findIndex((r) => r.name === hoveredChannel);
+    if (i < 0) return;
+    const top = i * rowH;
+    if (top >= el.scrollTop && top + rowH <= el.scrollTop + el.clientHeight) return;
+    el.scrollTop = Math.max(0, top - (el.clientHeight - rowH) / 2);
+  }, [hoveredChannel, rows, rowH]);
+
+  // ── Arrow keys ─────────────────────────────────────────────────────────────
+  // Left/right move through time, up/down through the channel stack -- the two
+  // scrollbars, from the keyboard. Bound to the window rather than to the panel so it
+  // works without clicking into the panel first; form fields keep their own arrow
+  // behaviour, and so does anything held down with a modifier.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const tag = e.target?.tagName;
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA'
+          || e.target?.isContentEditable) return;
+      const back = e.key === 'ArrowLeft' || e.key === 'ArrowUp';
+      const fwd = e.key === 'ArrowRight' || e.key === 'ArrowDown';
+      if (!back && !fwd) return;
+      const horiz = e.key === 'ArrowLeft' || e.key === 'ArrowRight';
+      e.preventDefault();                       // don't also scroll the page
+      if (horiz) {
+        if (!(viewSpan > 0 && viewSpan < fullSpan)) return;   // nothing to scroll to
+        // A tenth of a window per press, a whole window with shift -- a scrollbar's
+        // arrow and its trough. Measured from viewT0, which is already clamped, so
+        // holding a key at either end cannot wind the anchor off into space.
+        setPlaying(false);
+        setAnchor(viewT0 + viewSpan * (e.shiftKey ? 1 : 0.1) * (back ? -1 : 1));
+      } else if (scrollRef.current) {
+        scrollRef.current.scrollTop += (back ? -1 : 1) * rowH * (e.shiftKey ? 5 : 1);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [viewSpan, fullSpan, viewT0, rowH, setPlaying]);   // eslint-disable-line
+
   // ── Resize (drag the left edge horizontally) ───────────────────────────────
   const onResizeDown = (e) => {
     e.preventDefault();
     const startX = e.clientX; const startW = panelW;
-    const move = (ev) => setPanelW(Math.max(280, Math.min(760, startW + (startX - ev.clientX))));
+    // Upper bound from the window, not a fixed 760: on a wide display that cap left
+    // the traces cramped while most of the screen sat empty. 420px is what the control
+    // column and the view selector need to stay usable, so the panel can take the rest.
+    const move = (ev) => {
+      const cap = Math.max(480, window.innerWidth - 420);
+      setPanelW(Math.max(280, Math.min(cap, startW + (startX - ev.clientX))));
+    };
     const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
     window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
   };
@@ -560,9 +627,9 @@ export default function SeegTracePanel({
   return (
     <div style={{ width: panelW, flexShrink: 0, height: '100%', background: '#0d1015',
       borderLeft: '1px solid #1e2530', display: 'flex', flexDirection: 'column', position: 'relative' }}>
-      {/* resize handle (left edge) */}
-      <div onPointerDown={onResizeDown}
-        style={{ position: 'absolute', top: 0, bottom: 0, left: -3, width: 6, cursor: 'ew-resize', zIndex: 5 }} />
+      {/* the split against the 3D view: a visible rail, draggable to resize */}
+      <div className="seeg-panel-divider" onPointerDown={onResizeDown}
+        title="Drag to resize the trace panel" />
 
       {/* header controls */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 12px',
@@ -677,7 +744,8 @@ export default function SeegTracePanel({
 
       {/* trace body: vertically-scrolling canvas + fixed cursor overlay */}
       <div ref={wrapRef} style={{ flex: 1, position: 'relative', minHeight: 0 }}>
-        <div ref={scrollRef} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp}
+        <div ref={scrollRef} className="seeg-trace-scroll"
+          onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp}
           onPointerLeave={() => { if (!draggingRef.current) setHoveredChannel(null); }}
           style={{ position: 'absolute', inset: 0, overflowY: 'auto', overflowX: 'hidden', cursor: 'crosshair' }}>
           <canvas ref={canvasRef} style={{ display: 'block' }} />
@@ -738,8 +806,8 @@ export default function SeegTracePanel({
       {/* Position in the recording, and the way to move through it -- the horizontal
           counterpart of the trace stack's own scrollbar. Inert at a time base of `fit`,
           where the window already holds everything. */}
-      <div style={{ height: 16, flexShrink: 0, display: 'flex', alignItems: 'center',
-        padding: `0 6px 0 ${GUTTER}px`, background: '#0a0d11',
+      <div style={{ height: 28, flexShrink: 0, display: 'flex', alignItems: 'center',
+        padding: `0 8px 0 ${GUTTER}px`, background: '#0a0d11',
         borderTop: '1px solid #161b22' }}>
         <input
           type="range"
@@ -749,10 +817,11 @@ export default function SeegTracePanel({
           value={viewT0}
           disabled={!(viewSpan < fullSpan)}
           onChange={(e) => { setPlaying(false); setAnchor(parseFloat(e.target.value)); }}
-          title={viewSpan < fullSpan ? 'Scroll through the recording' : undefined}
-          style={{ width: '100%', height: 10, cursor: viewSpan < fullSpan ? 'pointer' : 'default',
-            accentColor: '#00d4ff', background: 'transparent',
-            opacity: viewSpan < fullSpan ? 1 : 0.35 }} />
+          className="seeg-scroll-x"
+          title={viewSpan < fullSpan
+            ? 'Scroll through the recording (or left/right arrow keys)' : undefined}
+          style={{ cursor: viewSpan < fullSpan ? 'pointer' : 'default',
+            opacity: viewSpan < fullSpan ? 1 : 0.55 }} />
       </div>
 
       {/* draggable divider between the traces and the event list */}

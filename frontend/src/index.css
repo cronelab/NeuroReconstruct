@@ -45,6 +45,62 @@ html, body, #root {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 2px; }
 
+/* sEEG trace panel.
+
+   The 4px default above suits a sidebar of text. The trace panel's scrollbars are
+   working controls -- one scrubs a montage of a hundred channels, the other moves
+   through minutes of recording -- so they get a target you can hit without aiming. */
+.seeg-trace-scroll { scrollbar-width: auto; scrollbar-color: #3d4a5a #0a0d11; }
+.seeg-trace-scroll::-webkit-scrollbar { width: 14px; }
+.seeg-trace-scroll::-webkit-scrollbar-track { background: #0a0d11; }
+.seeg-trace-scroll::-webkit-scrollbar-thumb {
+  background: #3d4a5a;
+  border: 3px solid #0a0d11;   /* inset, so 14px of target holds an 8px thumb */
+  border-radius: 7px;
+}
+.seeg-trace-scroll::-webkit-scrollbar-thumb:hover { background: #55677d; }
+
+/* The time scrollbar. A range input, but it reads as a scrollbar: a broad cyan thumb
+   sitting in a dark trough, in the same cyan as the playback cursor it moves with.
+   The thumb is the control -- it says where in the recording you are and it is what
+   you grab -- so it is sized to be seen from across the montage, not to be tasteful.
+   Flat cyan, no gradient or glow: width against a dark trough is what makes it read,
+   and a shiny thumb would be the loudest thing on a panel whose job is the traces.
+   Thumb height is 1px inside the track's content box on each side, which leaves a rim
+   of trough showing above and below rather than letting the thumb overhang it.
+   Each selector carries the input[type="range"] qualifier so it outranks the generic
+   range styling further down this file -- without it the thumb stayed a 12px dot. */
+input[type="range"].seeg-scroll-x { -webkit-appearance: none; appearance: none; height: 18px;
+  background: transparent; width: 100%; }
+input[type="range"].seeg-scroll-x::-webkit-slider-runnable-track {
+  height: 18px; border-radius: 9px; background: #10151b; border: 1px solid #2b3747; }
+input[type="range"].seeg-scroll-x::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 64px; height: 16px; border-radius: 8px; margin-top: 0;
+  background: #00d4ff; border: none; }
+input[type="range"].seeg-scroll-x::-webkit-slider-thumb:hover { background: #4ce0ff; }
+input[type="range"].seeg-scroll-x::-moz-range-track {
+  height: 18px; border-radius: 9px; background: #10151b; border: 1px solid #2b3747; }
+input[type="range"].seeg-scroll-x::-moz-range-thumb {
+  width: 64px; height: 16px; border-radius: 8px;
+  background: #00d4ff; border: none; }
+/* Nothing to scroll to: still legible as a full trough, but plainly inert. */
+input[type="range"].seeg-scroll-x:disabled::-webkit-slider-thumb { background: #38424f; }
+input[type="range"].seeg-scroll-x:disabled::-moz-range-thumb { background: #38424f; }
+
+/* The split between the brain view and the trace panel: a visible rail with a grip,
+   rather than a hairline border with an invisible grab strip lying over it. */
+.seeg-panel-divider {
+  position: absolute; top: 0; bottom: 0; left: -6px; width: 12px; z-index: 5;
+  cursor: ew-resize; display: flex; align-items: center; justify-content: center; }
+.seeg-panel-divider::before {
+  content: ''; position: absolute; top: 0; bottom: 0; width: 3px; background: #26303c; }
+.seeg-panel-divider::after {
+  content: ''; position: absolute; width: 5px; height: 42px; border-radius: 3px;
+  background: #47566a; }
+.seeg-panel-divider:hover::before { background: rgba(0, 212, 255, 0.35); }
+.seeg-panel-divider:hover::after { background: #00d4ff; }
+
 /* Utility */
 .mono { font-family: var(--font-mono); }
 
