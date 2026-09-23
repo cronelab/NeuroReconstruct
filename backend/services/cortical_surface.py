@@ -693,15 +693,10 @@ def get_or_build_isolated(recon_dir, target_faces=DEFAULT_TARGET_FACES):
         HEAVY_JOB_LOCK.acquire()
     try:
         # Another worker for this reconstruction may have finished while queued.
-        if os.path.exists(cache):
-            try:
-                with open(cache) as fh:
-                    got = json.load(fh)
-                if got.get("schema") == SCHEMA_VERSION:
-                    print("[CORTEX] Built by another worker while queued")
-                    return got
-            except (ValueError, OSError):
-                pass
+        got = _load_valid_cache(recon_dir)
+        if got is not None:
+            print("[CORTEX] Built by another worker while queued")
+            return got
         print(f"[CORTEX] Spawning surface worker (pid parent {os.getpid()}, "
               f"container limit {describe_limit()})")
         returncode, peak = run_worker(cmd, cwd=backend_dir, env=env)
@@ -709,6 +704,7 @@ def get_or_build_isolated(recon_dir, target_faces=DEFAULT_TARGET_FACES):
         HEAVY_JOB_LOCK.release()
 
     print(f"[CORTEX] {describe_outcome(returncode, peak)}")
+    cache = os.path.join(recon_dir, CACHE_NAME)
     if returncode != 0:
         raise RuntimeError(f"cortical surface build {describe_outcome(returncode, peak)}")
     if not os.path.exists(cache):
