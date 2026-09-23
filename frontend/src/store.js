@@ -114,6 +114,7 @@ export const useAppStore = create((set, get) => ({
       meshData: null,
       structuresData: null,
       corticalData: null,
+      structureVisibleSaved: null,
     }
   )),
   meshData: null,
@@ -128,6 +129,22 @@ export const useAppStore = create((set, get) => ({
   setStructureVisible: (key, v) => set(s => ({ structureVisible: { ...s.structureVisible, [key]: v } })),
   setStructureVisibleMany: (keys, v) =>
     set(s => ({ structureVisible: { ...s.structureVisible, ...Object.fromEntries(keys.map(k => [k, v])) } })),
+  // The master "Show brain structures" toggle. Hiding remembers which structures
+  // were showing, so re-showing brings back that selection instead of all ~78.
+  // With nothing remembered (first use, or a different reconstruction -- see
+  // setActiveRecon), it shows everything.
+  structureVisibleSaved: null,   // keys that were visible when the master last hid them
+  toggleAllStructures: (keys) => set(s => {
+    const shown = keys.filter(k => s.structureVisible[k] !== false);
+    if (shown.length) {
+      return {
+        structureVisibleSaved: shown,
+        structureVisible: { ...s.structureVisible, ...Object.fromEntries(keys.map(k => [k, false])) },
+      };
+    }
+    const restore = new Set(s.structureVisibleSaved || keys);
+    return { structureVisible: { ...s.structureVisible, ...Object.fromEntries(keys.map(k => [k, restore.has(k)])) } };
+  }),
 
   // ── Brain render mode ────────────────────────────────────────────────────────
   // 'structures' draws the ~78 nested translucent parcellation meshes (the

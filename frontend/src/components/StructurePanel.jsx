@@ -41,6 +41,7 @@ export default function StructurePanel({
     structureVisible,
     setStructureVisible,
     setStructureVisibleMany,
+    toggleAllStructures,
     brainRenderMode,
     setBrainRenderMode,
     corticalColorBy,
@@ -146,7 +147,7 @@ export default function StructurePanel({
               <TriStateCheckbox
                 checked={allState.checked}
                 indeterminate={allState.indeterminate}
-                onChange={e => setStructureVisibleMany(allKeys, e.target.checked)}
+                onChange={() => toggleAllStructures(allKeys)}
                 style={{ accentColor: '#74C0FC' }}
               />
               <span style={{ fontSize: 12, color: '#c8d4e0', fontFamily: 'IBM Plex Mono, monospace' }}>Show brain structures</span>
