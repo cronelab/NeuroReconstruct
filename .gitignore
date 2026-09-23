@@ -23,6 +23,11 @@ backend/brain_viewer.db
 # Reconstruction data (large NIfTI files, patient data)
 backend/data/
 
+# Local sEEG test fixture and the activity cache derived from it.
+# Both are regenerated on demand and neither belongs in the history.
+fake_seeg.h5
+.envcache/
+
 # Node / React
 frontend/node_modules/
 frontend/build/
