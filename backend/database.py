@@ -184,6 +184,13 @@ class SecondaryScan(Base):
     filename = Column(String(255), nullable=False)      # original upload filename
     stored_path = Column(String(512), nullable=False)   # raw upload, relative to DATA_DIR
     resampled_path = Column(String(512), nullable=True) # in primary-MRI grid, relative to DATA_DIR
+    # The volume that DRIVES registration, when that is not this scan itself.
+    # A derived map like FA has little anatomy for mutual information to lock
+    # onto, so the b=0 volume it was computed from is registered instead and the
+    # resulting transform applied here. The two share a voxel grid, so reusing
+    # the transform is exact rather than an approximation.
+    # NULL = register this scan directly.
+    reference_path = Column(String(512), nullable=True)
     # pending | registering | ready | error
     status = Column(String(32), default="pending")
     error = Column(String(512), nullable=True)

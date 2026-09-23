@@ -338,7 +338,8 @@ def _make_mri_registration_method():
 
 
 def register_secondary_to_primary(primary_path: str, secondary_path: str,
-                                  out_path: str, threads: int = 8) -> np.ndarray:
+                                  out_path: str, threads: int = 8,
+                                  drive_path: str = None) -> np.ndarray:
     """
     Rigidly register a secondary MRI to the primary MRI and write it resampled
     into the primary's voxel grid.
@@ -347,6 +348,17 @@ def register_secondary_to_primary(primary_path: str, secondary_path: str,
         primary_path:   the reconstruction's primary MRI (fixed image)
         secondary_path: the uploaded secondary MRI (moving image)
         out_path:       where to write the resampled NIfTI
+        drive_path:     optional volume to register INSTEAD of secondary_path,
+                        with the resulting transform then applied to
+                        secondary_path. This exists for derived diffusion maps:
+                        an FA volume is a ratio image whose contrast has little
+                        to do with the T1's, so mutual information has a poor
+                        optimum against it, while the b=0 volume it was computed
+                        from is an EPI with real anatomy and registers well.
+                        The two are outputs of one reconstruction and share a
+                        voxel grid, so carrying the transform across is exact,
+                        not an approximation -- but that is only true when they
+                        DO share a grid, which the caller must guarantee.
         threads:        ITK worker threads. Multithreading makes the optimizer
                         non-deterministic, which for CT->MRI matters enough to
                         warrant a review workflow. It matters less here: same-
@@ -370,6 +382,25 @@ def register_secondary_to_primary(primary_path: str, secondary_path: str,
         print(f"[SEC REG] secondary size: {moving_raw.GetSize()}, "
               f"spacing: {[round(v, 2) for v in moving_raw.GetSpacing()]}")
 
+        # The image the optimizer actually sees. Normally the secondary itself;
+        # for a derived map, the reference volume it was computed from.
+        drive_raw = moving_raw
+        if drive_path:
+            drive_raw = sitk.ReadImage(drive_path, sitk.sitkFloat32)
+            print(f"[SEC REG] driving registration on reference: {drive_raw.GetSize()}, "
+                  f"spacing: {[round(v, 2) for v in drive_raw.GetSpacing()]}")
+            # Carrying the transform across is only exact on a shared grid.
+            # Refuse rather than silently misplace a tract map by a voxel or two.
+            if (drive_raw.GetSize() != moving_raw.GetSize()
+                    or not np.allclose(drive_raw.GetSpacing(), moving_raw.GetSpacing(), atol=1e-3)
+                    or not np.allclose(drive_raw.GetOrigin(), moving_raw.GetOrigin(), atol=1e-3)
+                    or not np.allclose(drive_raw.GetDirection(), moving_raw.GetDirection(), atol=1e-3)):
+                raise ValueError(
+                    "The registration reference and the map must share a voxel grid "
+                    "(same size, spacing, origin and orientation); they do not. "
+                    "Both should come from the same diffusion reconstruction."
+                )
+
         # Register on zero-mean/unit-variance copies. MRI intensities carry no
         # absolute meaning -- the same sequence on the same scanner can differ by
         # an order of magnitude between sessions -- so without this the fixed
@@ -378,7 +409,7 @@ def register_secondary_to_primary(primary_path: str, secondary_path: str,
         # which is what gets resampled below, so the stored voxel values are the
         # real ones.
         fixed = sitk.Normalize(fixed_raw)
-        moving = sitk.Normalize(moving_raw)
+        moving = sitk.Normalize(drive_raw)
 
         reg = _make_mri_registration_method()
         reg.SetInitialTransform(_build_initial_transform(fixed, moving), inPlace=False)

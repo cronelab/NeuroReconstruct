@@ -567,6 +567,18 @@ async def startup():
                 await conn.exec_driver_sql("ALTER TABLE seeg_recordings ADD COLUMN content_hash VARCHAR")
                 print("[STARTUP] Added seeg_recordings.content_hash column.")
 
+            # Same story for secondary_scans.reference_path -- the b=0 volume a
+            # derived diffusion map has its registration driven by. Nullable, so
+            # existing rows keep behaving exactly as before.
+            cols = await conn.run_sync(
+                lambda c: [row[1] for row in c.exec_driver_sql("PRAGMA table_info(secondary_scans)").fetchall()]
+            )
+            for col, ddl in (("reference_path", "VARCHAR(512)"),):
+                if cols and col not in cols:
+                    await conn.exec_driver_sql(
+                        f"ALTER TABLE secondary_scans ADD COLUMN {col} {ddl}")
+                    print(f"[STARTUP] Added secondary_scans.{col} column.")
+
     # Backfill content_hash for legacy rows by hashing the stored file, so
     # content-based upload dedup works retroactively for recordings uploaded
     # before the column existed.
@@ -1948,7 +1960,7 @@ async def compute_seeg_activity(
 # Structure overlays and electrode contacts therefore need no adjustment at all:
 # switching base layers changes the pixels underneath them and nothing else.
 
-_SECONDARY_MODALITIES = ("t2", "flair", "pd", "other")
+_SECONDARY_MODALITIES = ("t2", "flair", "pd", "fa", "adc", "other")
 
 
 def _nifti_suffix(filename: str) -> str:
@@ -2019,12 +2031,17 @@ async def _register_secondary_background(scan_id: int):
         )).scalar_one_or_none()
         primary_abs = _abs(recon.mri_path) if recon and recon.mri_path else None
         secondary_abs = _abs(scan.stored_path)
+        reference_abs = _abs(scan.reference_path) if scan.reference_path else None
 
     if not primary_abs or not os.path.exists(primary_abs):
         await _finish_secondary(scan_id, "error", None, "Primary MRI is not available")
         return
     if not secondary_abs or not os.path.exists(secondary_abs):
         await _finish_secondary(scan_id, "error", None, "Uploaded file is missing on disk")
+        return
+    if reference_abs and not os.path.exists(reference_abs):
+        await _finish_secondary(scan_id, "error", None,
+                                "Registration reference is missing on disk")
         return
 
     async with AsyncSessionLocal() as db:
@@ -2043,7 +2060,8 @@ async def _register_secondary_background(scan_id: int):
         from services.registration import register_secondary_to_primary
         with HEAVY_JOB_LOCK:
             register_secondary_to_primary(primary_abs, secondary_abs, out_abs,
-                                          threads=min(8, os.cpu_count() or 1))
+                                          threads=min(8, os.cpu_count() or 1),
+                                          drive_path=reference_abs)
 
     try:
         await asyncio.get_event_loop().run_in_executor(None, _run)
@@ -2060,9 +2078,15 @@ async def _register_secondary_background(scan_id: int):
 
 
 async def _create_secondary_scan(db: AsyncSession, recon_id: int, recon_dir: str,
-                                 upload: UploadFile, label: str, modality: str) -> SecondaryScan:
+                                 upload: UploadFile, label: str, modality: str,
+                                 reference: UploadFile = None) -> SecondaryScan:
     """Persist one uploaded secondary scan. Does NOT start registration -- the
-    caller schedules _register_secondary_background once the row is committed."""
+    caller schedules _register_secondary_background once the row is committed.
+
+    `reference` is the volume registration should be driven by instead of the
+    scan itself -- the b=0 of the diffusion run an FA map came from. It is stored
+    beside the map and only ever used to compute the transform.
+    """
     modality = (modality or "t2").lower()
     if modality not in _SECONDARY_MODALITIES:
         modality = "other"
@@ -2073,12 +2097,21 @@ async def _create_secondary_scan(db: AsyncSession, recon_id: int, recon_dir: str
     with open(stored_abs, "wb") as f:
         f.write(await upload.read())
 
+    reference_rel = None
+    if reference is not None and reference.filename:
+        ref_abs = os.path.join(dest_dir,
+                               f"{uuid.uuid4().hex[:8]}_ref{_nifti_suffix(reference.filename)}")
+        with open(ref_abs, "wb") as f:
+            f.write(await reference.read())
+        reference_rel = _rel(ref_abs)
+
     scan = SecondaryScan(
         reconstruction_id=recon_id,
         label=(label or modality.upper())[:64],
         modality=modality,
         filename=filename[:255],
         stored_path=_rel(stored_abs),
+        reference_path=reference_rel,
         status="pending",
     )
     db.add(scan)
@@ -2140,6 +2173,7 @@ async def upload_secondary_scan(
     file: UploadFile = File(...),
     label: str = Form(""),
     modality: str = Form("t2"),
+    reference: Optional[UploadFile] = File(None),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db),
@@ -2160,7 +2194,7 @@ async def upload_secondary_scan(
                             detail="Upload the primary MRI before adding secondary scans")
 
     scan = await _create_secondary_scan(db, recon_id, os.path.dirname(primary_abs),
-                                        file, label, modality)
+                                        file, label, modality, reference)
     await db.commit()
     await db.refresh(scan)
     background_tasks.add_task(_register_secondary_background, scan.id)

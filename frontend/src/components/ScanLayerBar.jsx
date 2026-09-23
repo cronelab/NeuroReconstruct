@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store';
 import { listSecondaryScans, uploadSecondaryScan, deleteSecondaryScan } from '../api';
-import { inferModality, scanLabelOrDefault, SCAN_TYPE_PLACEHOLDER } from '../scanTypes';
+import { inferModality, needsReference, scanLabelOrDefault, SCAN_TYPE_PLACEHOLDER } from '../scanTypes';
 
 /**
  * Picks which scans the 2D slice views show, as panes side by side.
@@ -41,6 +41,13 @@ export default function ScanLayerBar({ reconId, shareToken }) {
   const [error, setError] = useState('');
   const [scanType, setScanType] = useState('');
   const fileRef = useRef(null);
+  // Second file, only for derived diffusion maps -- see needsReference().
+  const refFileRef = useRef(null);
+
+  // Classify as the user types, so the reference field appears the moment the
+  // typed name reads as a diffusion map.
+  const pendingModality = inferModality(scanLabelOrDefault(scanType));
+  const wantsReference = needsReference(pendingModality);
 
   const refresh = useCallback(async () => {
     try {
@@ -69,8 +76,16 @@ export default function ScanLayerBar({ reconId, shareToken }) {
     setError('');
     try {
       const label = scanLabelOrDefault(scanType);
-      await uploadSecondaryScan(reconId, file, { label, modality: inferModality(label) });
+      const modality = inferModality(label);
+      await uploadSecondaryScan(reconId, file, {
+        label,
+        modality,
+        // Optional: without it the map is registered directly, which is worse
+        // but not wrong, so this does not block the upload.
+        reference: needsReference(modality) ? refFileRef.current?.files?.[0] : undefined,
+      });
       if (fileRef.current) fileRef.current.value = '';
+      if (refFileRef.current) refFileRef.current.value = '';
       setScanType('');
       setAdding(false);
       await refresh();
@@ -80,6 +95,7 @@ export default function ScanLayerBar({ reconId, shareToken }) {
       setBusy(false);
     }
   }, [reconId, scanType, refresh]);
+
 
   const handleDelete = useCallback(async (scanId) => {
     setBusy(true);
@@ -200,8 +216,26 @@ export default function ScanLayerBar({ reconId, shareToken }) {
             ref={fileRef}
             type="file"
             accept=".nii,.nii.gz"
+            title={wantsReference ? 'The map itself (e.g. the FA volume)' : undefined}
             style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace', maxWidth: 220 }}
           />
+          {wantsReference && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <span style={{ fontSize: 10, color: '#4a5568', fontFamily: 'IBM Plex Mono, monospace', letterSpacing: '0.06em' }}>
+                ALIGN ON
+              </span>
+              <input
+                ref={refFileRef}
+                type="file"
+                accept=".nii,.nii.gz"
+                title={'The b=0 volume from the same diffusion run. An FA map has too '
+                     + 'little anatomy to register on its own, so the b=0 is registered '
+                     + 'and the result applied to the map. Optional, but alignment is '
+                     + 'better with it.'}
+                style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace', maxWidth: 200 }}
+              />
+            </span>
+          )}
           <button
             onClick={handleAdd}
             disabled={busy}

@@ -15,6 +15,10 @@ export const SCAN_TYPE_PLACEHOLDER = 'T2 FLAIR';
 // which is what that value is for.
 export function inferModality(label) {
   const t = (label || '').toLowerCase();
+  // Diffusion maps first: "DTI FA" would otherwise fall through to 'other',
+  // and a derived map is registered differently from an anatomical scan.
+  if (/\bfa\b/.test(t) || t.includes('anisotropy')) return 'fa';
+  if (/\badc\b/.test(t) || t.includes('diffusivity')) return 'adc';
   // FLAIR before T2: "T2 FLAIR" matches both, and FLAIR is the more specific.
   if (t.includes('flair')) return 'flair';
   if (t.includes('t2')) return 't2';
@@ -25,4 +29,12 @@ export function inferModality(label) {
 // A scan still needs *a* name if the field was left empty.
 export function scanLabelOrDefault(label) {
   return (label || '').trim() || 'Secondary';
+}
+
+// Whether this kind of layer registers via a separate reference volume. A
+// derived diffusion map has little anatomy for mutual information to lock onto,
+// so the b=0 of the same diffusion run is registered instead and its transform
+// carried across -- exact, because the two share a voxel grid.
+export function needsReference(modality) {
+  return modality === 'fa' || modality === 'adc';
 }

@@ -124,11 +124,15 @@ export const uploadReconstructionFiles = (reconId, formData) =>
 export const listSecondaryScans = (reconId, token) =>
   api.get(`/reconstructions/${reconId}/secondary-scans${token ? `?token=${token}` : ''}`);
 
-export const uploadSecondaryScan = (reconId, file, { label, modality } = {}) => {
+export const uploadSecondaryScan = (reconId, file, { label, modality, reference } = {}) => {
   const form = new FormData();
   form.append('file', file);
   form.append('label', label || '');
   form.append('modality', modality || 't2');
+  // Only meaningful for derived diffusion maps: the b=0 volume whose
+  // registration to the T1 the map borrows, because the map itself has too
+  // little anatomy to register on. Omitted for ordinary anatomical scans.
+  if (reference) form.append('reference', reference);
   return api.post(`/reconstructions/${reconId}/secondary-scans`, form, {
     headers: { 'Content-Type': 'multipart/form-data' },
     timeout: 600000,

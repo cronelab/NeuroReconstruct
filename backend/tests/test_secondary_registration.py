@@ -205,8 +205,83 @@ def _resampled_with_identity(primary, secondary, tmpdir):
     return path
 
 
+def _faify(img):
+    """Turn a phantom into something FA-like: the contrast a derived diffusion
+    map has. Signal only in a thin rim (the "tracts") and nothing elsewhere,
+    values in 0..1. Registering THIS against a T1 is the case drive_path is for.
+    """
+    a = sitk.GetArrayFromImage(img)
+    hi = np.percentile(a[a > 0], 70) if (a > 0).any() else 1.0
+    fa = np.where((a > hi * 0.6) & (a < hi * 1.1), 0.8, 0.0).astype(np.float32)
+    out = sitk.GetImageFromArray(fa)
+    out.CopyInformation(img)
+    return out
+
+
+def test_reference_drives_registration_of_a_derived_map():
+    """A derived map registers via its reference volume, and the transform the
+    reference earns is what gets applied to the map.
+
+    The map is deliberately poor to register on -- that is the whole reason the
+    feature exists -- so what is checked is that driving on the reference lands
+    the MAP where the known transform says it belongs.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        primary = _phantom(contrast="t1")
+        truth = _offset_transform(primary, (3.0, -2.0, 2.5), (5.0, -3.0, 4.0))
+        reference = _displace(_phantom(contrast="t2"), truth)   # the b=0 stand-in
+        derived = _faify(reference)                             # the FA stand-in, same grid
+
+        p = os.path.join(d, "ref_primary.nii.gz")
+        m = os.path.join(d, "ref_map.nii.gz")
+        r = os.path.join(d, "ref_reference.nii.gz")
+        o = os.path.join(d, "ref_out.nii.gz")
+        for img, path in ((primary, p), (derived, m), (reference, r)):
+            sitk.WriteImage(img, path)
+        register_secondary_to_primary(p, m, o, threads=min(8, os.cpu_count() or 1),
+                                      drive_path=r)
+
+        got = sitk.ReadImage(o, sitk.sitkFloat32)
+        assert got.GetSize() == primary.GetSize(), "map must land in the primary grid"
+
+        residual = _residual_mm(primary, derived, o, truth)
+        left_in = _residual_mm(
+            primary, derived, _resampled_with_identity(primary, derived, d), truth)
+        assert residual < 2.0, (
+            f"reference-driven registration left {residual:.2f} mm of error "
+            f"(doing nothing would leave {left_in:.2f} mm)")
+    print("test_reference_drives_registration_of_a_derived_map OK")
+
+
+def test_reference_on_a_different_grid_is_refused():
+    """Borrowing the reference's transform is exact only on a shared voxel grid.
+    A mismatch has to fail loudly rather than quietly displace a tract map."""
+    with tempfile.TemporaryDirectory() as d:
+        primary = _phantom(contrast="t1")
+        derived = _faify(_phantom(contrast="t2"))
+        reference = _phantom(contrast="t2", spacing=SPACING * 1.25)   # wrong grid
+
+        p = os.path.join(d, "bad_primary.nii.gz")
+        m = os.path.join(d, "bad_map.nii.gz")
+        r = os.path.join(d, "bad_reference.nii.gz")
+        o = os.path.join(d, "bad_out.nii.gz")
+        for img, path in ((primary, p), (derived, m), (reference, r)):
+            sitk.WriteImage(img, path)
+
+        try:
+            register_secondary_to_primary(p, m, o, threads=1, drive_path=r)
+        except ValueError as e:
+            assert "voxel grid" in str(e), f"unexpected message: {e}"
+        else:
+            raise AssertionError("a reference on a different grid must be refused")
+        assert not os.path.exists(o), "nothing should be written when it is refused"
+    print("test_reference_on_a_different_grid_is_refused OK")
+
+
 if __name__ == "__main__":
     test_output_shares_the_primary_grid()
     test_self_registration_does_not_move()
     test_recovers_a_known_offset()
+    test_reference_drives_registration_of_a_derived_map()
+    test_reference_on_a_different_grid_is_refused()
     print("\nAll secondary-registration tests passed.")
