@@ -138,26 +138,61 @@ import services.worker_mem as _worker_mem  # noqa: E402
 _worker_mem.BEFORE_HEAVY_JOB.append(_drop_volume_caches)
 
 
+def _as_rgb_4d(img):
+    """A colour volume as a plain (x, y, z, 3) image; anything else unchanged.
+
+    Colour FA reaches here in two layouts -- an RGB24 upload that was never
+    resampled, or SimpleITK's vector output, which it writes 5D as (x, y, z, 1, 3).
+    Both are flattened to one 4D shape so canonical reorientation and slicing
+    treat the channels as a trailing axis.
+    """
+    import nibabel as nib
+    dtype = img.get_data_dtype()
+    if dtype.names and len(dtype.names) == 3:
+        raw = np.asanyarray(img.dataobj)
+        data = np.stack([raw[n] for n in dtype.names], axis=-1)
+    elif img.ndim == 5 and img.shape[3] == 1 and img.shape[4] == 3:
+        data = np.asanyarray(img.dataobj)[:, :, :, 0, :]
+    else:
+        return img
+    return nib.Nifti1Image(data.astype(np.uint8), img.affine)
+
+
 def _get_mri_volume(mri_path: str):
     """Load and canonicalize NIfTI once; cache the float array."""
     cached = _mri_volume_cache.get(mri_path)
     if cached is None:
         import nibabel as nib
-        img = nib.load(mri_path)
+        img = _as_rgb_4d(nib.load(mri_path))
         img_ras = nib.as_closest_canonical(img)
-        # float32, not get_fdata()'s float64: these are display slices, and the
-        # volume is float32 on disk anyway.
-        data = np.asanyarray(img_ras.dataobj, dtype=np.float32)
-        # Pre-compute per-axis normalization stats (percentile over whole volume)
-        axis_stats = {}
-        for ax, name in [(0, "sagittal"), (1, "coronal"), (2, "axial")]:
-            flat = data.ravel()
-            nonzero = flat[flat > 0]
-            vmin = float(np.percentile(nonzero, 2)) if len(nonzero) else 0.0
-            vmax = float(np.percentile(nonzero, 98)) if len(nonzero) else 1.0
-            axis_stats[name] = (vmin, vmax)
+        rgb = (img_ras.ndim == 4 and img_ras.shape[3] == 3
+               and img_ras.get_data_dtype() == np.uint8)
+        if rgb:
+            # A colour FA map, (x, y, z, 3) bytes. Kept as bytes: in the T1's grid
+            # float32 would be ~0.6 GB for a single display layer.
+            data = np.asanyarray(img_ras.dataobj).astype(np.uint8, copy=False)
+            # One window for all three channels, from the brightest channel of
+            # each voxel. Stretching channels separately would change the hue,
+            # and the hue IS the fibre direction.
+            peak = data.max(axis=3)
+            nonzero = peak[peak > 0]
+            vmax = float(np.percentile(nonzero, 99.5)) if len(nonzero) else 255.0
+            axis_stats = {name: (0.0, vmax) for name in ("sagittal", "coronal", "axial")}
+        else:
+            # float32, not get_fdata()'s float64: these are display slices, and the
+            # volume is float32 on disk anyway.
+            data = np.asanyarray(img_ras.dataobj, dtype=np.float32)
+            # Pre-compute per-axis normalization stats (percentile over whole volume)
+            axis_stats = {}
+            for ax, name in [(0, "sagittal"), (1, "coronal"), (2, "axial")]:
+                flat = data.ravel()
+                nonzero = flat[flat > 0]
+                vmin = float(np.percentile(nonzero, 2)) if len(nonzero) else 0.0
+                vmax = float(np.percentile(nonzero, 98)) if len(nonzero) else 1.0
+                axis_stats[name] = (vmin, vmax)
         cached = _mri_volume_cache.put(mri_path, {
             "data": data,
+            "rgb": rgb,
             "affine": img_ras.affine,
             "axis_stats": axis_stats,
             "png_cache": {},  # (axis, slice_idx) -> png_bytes
@@ -189,11 +224,12 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
     sl = np.fliplr(np.rot90(sl, k=1))
 
     vmin, vmax = vol["axis_stats"][axis]
-    sl_norm = np.clip((sl - vmin) / max(vmax - vmin, 1e-6), 0, 1)
-    sl_uint8 = (sl_norm * 255).astype(np.uint8)
+    sl_norm = np.clip((sl.astype(np.float32) - vmin) / max(vmax - vmin, 1e-6), 0, 1)
+    sl_uint8 = np.ascontiguousarray((sl_norm * 255).astype(np.uint8))
 
     buf = io.BytesIO()
-    Image.fromarray(sl_uint8, mode="L").save(buf, format="PNG", optimize=False, compress_level=1)
+    Image.fromarray(sl_uint8, mode="RGB" if vol.get("rgb") else "L").save(
+        buf, format="PNG", optimize=False, compress_level=1)
     png_bytes = buf.getvalue()
 
     voxel_sizes = np.sqrt((affine[:3, :3] ** 2).sum(axis=0))
@@ -223,7 +259,7 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
     plane_normal = (row / row_norm).tolist()
     plane_offset = float((slice_idx - inv_affine[ax, 3]) / row_norm)
 
-    centre_vox = [(d - 1) / 2.0 for d in data.shape]
+    centre_vox = [(d - 1) / 2.0 for d in data.shape[:3]]
     centre_vox[ax] = float(slice_idx)
     world_coord = float((affine @ np.array([*centre_vox, 1.0]))[ax])
 
@@ -236,7 +272,7 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
     px_h_mm = float(voxel_sizes[col_ax])
 
     result = (png_bytes, sl_uint8.shape, world_coord, voxel_size_mm, n, slice_idx,
-              inv_affine.flatten().tolist(), list(data.shape), px_w_mm, px_h_mm,
+              inv_affine.flatten().tolist(), list(data.shape[:3]), px_w_mm, px_h_mm,
               plane_normal, plane_offset)
     vol["png_cache"][key] = result  # cache the full tuple
     return result
@@ -358,10 +394,16 @@ def _get_label_volume(label_path: str):
     return cached
 
 def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx: int,
-                            visible_keys: set | None = None) -> bytes | None:
+                            visible_keys: set | None = None,
+                            style: str = "fill") -> bytes | None:
     """
     Return an RGBA PNG overlay for the given slice position, aligned to the MRI slice.
     visible_keys: set of structure keys to include; None = all structures.
+    style: "fill" paints each structure in its colour. "outline" draws only the
+        structure borders, opaque white -- for a colour FA base layer, where hue
+        encodes fibre direction: a coloured fill would be read as a direction and
+        would hide the directions underneath it. Borders run between adjacent
+        structures too, so neighbours stay distinguishable without colour.
     Returns None if the label file doesn't exist or has no labels at this slice.
     """
     if not os.path.exists(label_path):
@@ -423,10 +465,21 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
 
     # Build RGBA array
     rgba = np.zeros((*sl.shape, 4), dtype=np.uint8)
-    for lbl, color in label_rgba.items():
-        mask = sl == lbl
-        if mask.any():
-            rgba[mask] = color
+    if style == "outline":
+        shown = np.isin(sl, list(label_rgba)) if label_rgba else np.zeros(sl.shape, bool)
+        # A shown pixel is on a border when any 4-neighbour carries another label
+        # (background, a hidden structure or a different shown one). The image
+        # edge counts as a border, so a structure cut by the frame stays closed.
+        padded = np.pad(sl, 1, mode="constant", constant_values=-1)
+        differs = np.zeros(sl.shape, bool)
+        for dy, dx in ((0, 1), (2, 1), (1, 0), (1, 2)):
+            differs |= padded[dy:dy + sl.shape[0], dx:dx + sl.shape[1]] != sl
+        rgba[shown & differs] = (255, 255, 255, 255)
+    else:
+        for lbl, color in label_rgba.items():
+            mask = sl == lbl
+            if mask.any():
+                rgba[mask] = color
 
     # Resize to match MRI slice pixel dimensions so the overlay aligns
     pil = Image.fromarray(rgba, mode="RGBA")
@@ -1960,7 +2013,7 @@ async def compute_seeg_activity(
 # Structure overlays and electrode contacts therefore need no adjustment at all:
 # switching base layers changes the pixels underneath them and nothing else.
 
-_SECONDARY_MODALITIES = ("t2", "flair", "pd", "fa", "adc", "other")
+_SECONDARY_MODALITIES = ("t2", "flair", "pd", "fa", "colorfa", "adc", "other")
 
 
 def _nifti_suffix(filename: str) -> str:
@@ -2096,6 +2149,21 @@ async def _create_secondary_scan(db: AsyncSession, recon_id: int, recon_dir: str
     stored_abs = os.path.join(dest_dir, f"{uuid.uuid4().hex[:8]}{_nifti_suffix(filename)}")
     with open(stored_abs, "wb") as f:
         f.write(await upload.read())
+
+    # Colour is a property of the file, not of what the user called it. The
+    # viewer changes how it draws structures over a colour layer, so a colour FA
+    # uploaded as "DTI FA" still has to come out as colorfa -- and a scalar map
+    # typed as "colour FA" must not, or it would lose its structure fills for
+    # nothing.
+    try:
+        from services.registration import is_rgb_nifti
+        rgb = is_rgb_nifti(stored_abs)
+    except Exception:
+        rgb = False   # unreadable here -> registration reports it properly
+    if rgb:
+        modality = "colorfa"
+    elif modality == "colorfa":
+        modality = "fa"
 
     reference_rel = None
     if reference is not None and reference.filename:
@@ -2293,6 +2361,7 @@ async def get_structure_slice(
     axis: str = "axial",
     slice_idx: int = -1,
     visible: Optional[str] = None,   # comma-separated structure keys; omit = all
+    style: str = "fill",             # fill | outline (see _render_structure_slice)
     token: Optional[str] = None,
     current_user: Optional[User] = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -2313,7 +2382,8 @@ async def get_structure_slice(
 
     loop = asyncio.get_event_loop()
     png_bytes = await loop.run_in_executor(
-        None, _render_structure_slice, mri_abs, label_path, axis, slice_idx, visible_keys
+        None, _render_structure_slice, mri_abs, label_path, axis, slice_idx, visible_keys,
+        "outline" if style == "outline" else "fill"
     )
     if png_bytes is None:
         raise HTTPException(status_code=404, detail="Structure labels not available for this reconstruction")

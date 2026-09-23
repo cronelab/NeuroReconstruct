@@ -278,10 +278,62 @@ def test_reference_on_a_different_grid_is_refused():
     print("test_reference_on_a_different_grid_is_refused OK")
 
 
+def test_color_fa_registers_as_one_colour_volume():
+    """A colour FA map (RGB24, the layout dti2nii and DICOM converters write)
+    lands in the primary grid still as colour, in the right place, with its hue
+    intact -- the hue is the fibre direction, so a registration that shifted the
+    balance between channels would be reporting different fibres."""
+    import nibabel as nib
+    from services.registration import is_rgb_nifti
+
+    with tempfile.TemporaryDirectory() as d:
+        primary = _phantom(contrast="t1")
+        truth = _offset_transform(primary, (3.0, -2.0, 2.5), (5.0, -3.0, 4.0))
+        reference = _displace(_phantom(contrast="t2"), truth)
+        fa = sitk.GetArrayFromImage(_faify(reference)).transpose(2, 1, 0)   # -> x, y, z
+        hue = np.array([0.8, 0.5, 0.33])                                     # one fibre direction
+
+        p = os.path.join(d, "col_primary.nii.gz")
+        r = os.path.join(d, "col_reference.nii.gz")
+        m = os.path.join(d, "col_map.nii.gz")
+        o = os.path.join(d, "col_out.nii.gz")
+        sitk.WriteImage(primary, p)
+        sitk.WriteImage(reference, r)
+        rgb = np.zeros(fa.shape, dtype=[("R", "u1"), ("G", "u1"), ("B", "u1")])
+        for name, h in zip("RGB", hue):
+            rgb[name] = np.rint(fa * h * 255).astype(np.uint8)
+        nib.save(nib.Nifti1Image(rgb, nib.load(r).affine), m)
+        assert is_rgb_nifti(m), "an RGB24 map must be recognised as colour"
+        assert not is_rgb_nifti(r), "a scalar volume must not be"
+
+        register_secondary_to_primary(p, m, o, threads=min(8, os.cpu_count() or 1),
+                                      drive_path=r)
+
+        got = sitk.ReadImage(o)
+        assert got.GetNumberOfComponentsPerPixel() == 3, "output must stay 3-channel"
+        assert got.GetPixelID() == sitk.sitkVectorUInt8, got.GetPixelIDTypeAsString()
+        assert got.GetSize() == primary.GetSize(), "map must land in the primary grid"
+        assert is_rgb_nifti(o), "the stored output must still read as colour"
+
+        arr = sitk.GetArrayFromImage(got).astype(np.float64)       # z, y, x, 3
+        bright = arr[..., 0] > 100
+        ratios = arr[bright] / arr[bright][:, :1]
+        assert np.allclose(np.median(ratios, axis=0), hue / hue[0], atol=0.03), \
+            f"hue drifted: {np.median(ratios, axis=0)} vs {hue / hue[0]}"
+
+        red = os.path.join(d, "col_red.nii.gz")
+        red_img = sitk.VectorIndexSelectionCast(got, 0, sitk.sitkFloat32)
+        sitk.WriteImage(red_img, red)
+        residual = _residual_mm(primary, _faify(reference), red, truth)
+        assert residual < 2.0, f"colour map landed {residual:.2f} mm off"
+    print("test_color_fa_registers_as_one_colour_volume OK")
+
+
 if __name__ == "__main__":
     test_output_shares_the_primary_grid()
     test_self_registration_does_not_move()
     test_recovers_a_known_offset()
     test_reference_drives_registration_of_a_derived_map()
     test_reference_on_a_different_grid_is_refused()
+    test_color_fa_registers_as_one_colour_volume()
     print("\nAll secondary-registration tests passed.")

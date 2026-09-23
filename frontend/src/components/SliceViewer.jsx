@@ -42,6 +42,10 @@ export default function SliceViewer({
   // scan's id. A prop rather than store state because several of these are
   // mounted at once, one per pane, when scans are compared side by side.
   scanId = null,
+  // How the structure overlay is drawn: 'fill' (coloured, translucent) or
+  // 'outline' (white borders only). Outline is for a colour FA layer, where hue
+  // is fibre direction and a coloured fill would be mistaken for one.
+  structureStyle = 'fill',
   // Slice index to follow, so sibling panes stay on the same anatomy. Every
   // layer shares the primary's grid, so one index means one slice everywhere.
   syncSliceIdx = null,
@@ -79,6 +83,9 @@ export default function SliceViewer({
   syncIdxRef.current = syncSliceIdx;
   const scanParamRef = useRef(scanParam);
   scanParamRef.current = scanParam;
+  // Read by fetchOverlay/doDraw through a ref for the same stable-identity reason.
+  const structureStyleRef = useRef(structureStyle);
+  structureStyleRef.current = structureStyle;
 
   // Bumped whenever the base layer changes. A request already in flight when the
   // user switches would otherwise resolve afterwards and write another volume's
@@ -142,13 +149,17 @@ export default function SliceViewer({
         : '';
       if (!visibleKeys) { overlayRef.current = null; triggerDraw(); return; }
 
+      const style = structureStyleRef.current;
       const res = await fetch(
-        `/api/reconstructions/${reconId}/structure-slice?axis=${axis}&slice_idx=${idx}&visible=${encodeURIComponent(visibleKeys)}`,
+        `/api/reconstructions/${reconId}/structure-slice?axis=${axis}&slice_idx=${idx}&visible=${encodeURIComponent(visibleKeys)}&style=${style}`,
         { headers: token ? { Authorization: `Bearer ${token}` } : {} }
       );
       if (res.ok) {
         const blob = await res.blob();
         const bitmap = await createImageBitmap(blob);
+        // The style changed while this was in flight: a fill landing in an
+        // outline pane would put coloured patches back over the colour FA.
+        if (style !== structureStyleRef.current) return;
         overlayCacheRef.current.set(idx, bitmap);
         if (sliceIdxRef.current === idx) {
           overlayRef.current = bitmap;
@@ -192,9 +203,17 @@ export default function SliceViewer({
     // Structure overlay
     const overlay = overlayRef.current;
     if (!isThumbnail && overlay) {
-      ctx.globalAlpha = 0.45;
-      ctx.drawImage(overlay, dx, dy, dw, dh);
-      ctx.globalAlpha = 1.0;
+      if (structureStyleRef.current === 'outline') {
+        // Opaque, and not smoothed: a one-voxel border blurred by upscaling
+        // turns grey and tints the colours it runs over.
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(overlay, dx, dy, dw, dh);
+        ctx.imageSmoothingEnabled = true;
+      } else {
+        ctx.globalAlpha = 0.45;
+        ctx.drawImage(overlay, dx, dy, dw, dh);
+        ctx.globalAlpha = 1.0;
+      }
     }
 
     if (!isThumbnail) {
@@ -501,7 +520,7 @@ export default function SliceViewer({
     } else {
       triggerDraw();
     }
-  }, [structuresData, structureVisible, fetchOverlay, isThumbnail, triggerDraw]);
+  }, [structuresData, structureVisible, structureStyle, fetchOverlay, isThumbnail, triggerDraw]);
 
   // Initial load
   useEffect(() => {

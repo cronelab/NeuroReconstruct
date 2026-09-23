@@ -180,7 +180,7 @@ class SecondaryScan(Base):
     id = Column(Integer, primary_key=True)
     reconstruction_id = Column(Integer, ForeignKey("reconstructions.id"))
     label = Column(String(64), nullable=False)          # display name, e.g. "T2 FLAIR"
-    modality = Column(String(32), default="t2")         # t2 | flair | pd | other
+    modality = Column(String(32), default="t2")         # t2 | flair | pd | fa | colorfa | adc | other
     filename = Column(String(255), nullable=False)      # original upload filename
     stored_path = Column(String(512), nullable=False)   # raw upload, relative to DATA_DIR
     resampled_path = Column(String(512), nullable=True) # in primary-MRI grid, relative to DATA_DIR

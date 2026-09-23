@@ -17,7 +17,11 @@ export function inferModality(label) {
   const t = (label || '').toLowerCase();
   // Diffusion maps first: "DTI FA" would otherwise fall through to 'other',
   // and a derived map is registered differently from an anatomical scan.
-  if (/\bfa\b/.test(t) || t.includes('anisotropy')) return 'fa';
+  // Colour FA before plain FA, which "color FA" also matches. The backend
+  // re-checks this against the file itself, so it is only a first guess.
+  const isFa = /\bfa\b/.test(t) || t.includes('anisotropy');
+  if (/\bdec\b/.test(t) || (isFa && /colou?r|\brgb\b/.test(t))) return 'colorfa';
+  if (isFa) return 'fa';
   if (/\badc\b/.test(t) || t.includes('diffusivity')) return 'adc';
   // FLAIR before T2: "T2 FLAIR" matches both, and FLAIR is the more specific.
   if (t.includes('flair')) return 'flair';
@@ -36,5 +40,13 @@ export function scanLabelOrDefault(label) {
 // so the b=0 of the same diffusion run is registered instead and its transform
 // carried across -- exact, because the two share a voxel grid.
 export function needsReference(modality) {
-  return modality === 'fa' || modality === 'adc';
+  return modality === 'fa' || modality === 'colorfa' || modality === 'adc';
+}
+
+// Whether a layer's pixels are colour that carries meaning -- a direction-
+// encoded FA map, where hue IS the fibre direction. Structures are drawn over
+// such a layer as white outlines instead of coloured fills, so the parcellation
+// never reads as a direction or hides one.
+export function isColorLayer(modality) {
+  return modality === 'colorfa';
 }

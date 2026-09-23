@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useRef, useMemo } from 'react';
 import SliceViewer from './SliceViewer';
+import { isColorLayer } from '../scanTypes';
 import FusionSliceViewer from './FusionSliceViewer';
 import ScanLayerBar from './ScanLayerBar';
 import { useAppStore } from '../store';
@@ -32,7 +33,7 @@ export default function MultiViewLayout({ reconId, viewer3D, shareToken }) {
   const layers = useMemo(() => {
     const all = [
       { key: 'primary', scanId: null, label: 'Primary' },
-      ...secondaryScans.filter(sc => sc.ready).map(sc => ({ key: sc.id, scanId: sc.id, label: sc.label })),
+      ...secondaryScans.filter(sc => sc.ready).map(sc => ({ key: sc.id, scanId: sc.id, label: sc.label, modality: sc.modality })),
     ];
     const shown = all.filter(l => visibleLayers.includes(l.key));
     return shown.length ? shown : [all[0]];
@@ -412,6 +413,7 @@ export default function MultiViewLayout({ reconId, viewer3D, shareToken }) {
                       reconId={reconId}
                       axis={ax}
                       scanId={layer.scanId}
+                      structureStyle={isColorLayer(layer.modality) ? 'outline' : 'fill'}
                       layerLabel={layers.length > 1 ? layer.label : null}
                       syncSliceIdx={slicePositions[ax].count > 1 ? slicePositions[ax].idx : null}
                       onSliceChange={(idx, count) => handleSliceChange(ax, idx, count)}

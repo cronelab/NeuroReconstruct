@@ -337,6 +337,45 @@ def _make_mri_registration_method():
     return reg
 
 
+def is_rgb_nifti(path: str) -> bool:
+    """Whether a NIfTI holds a 3-channel colour volume -- a direction-encoded
+    colour FA map -- rather than one intensity per voxel. Header only.
+
+    Two layouts are accepted: NIfTI's own RGB24 datatype (what dti2nii and most
+    DICOM converters write) and a 4D byte volume with three channels last (what
+    dipy's save_nifti of an RGB array writes). A 4D FLOAT volume of three is NOT
+    colour: that is the principal eigenvector V1, whose components are signed.
+    """
+    import nibabel as nib
+    img = nib.load(path)
+    dtype = img.get_data_dtype()
+    if dtype.names and len(dtype.names) == 3:
+        return True
+    shape = img.shape
+    return (len(shape) == 4 and shape[3] == 3 and dtype == np.uint8) or \
+           (len(shape) == 5 and shape[3] == 1 and shape[4] == 3)
+
+
+def read_scan_for_registration(path: str) -> sitk.Image:
+    """Read a secondary for resampling: float32 scalar, or float32 3-vector for
+    a colour map. SimpleITK reads RGB24 as a vector image already; the 4D-bytes
+    layout arrives as a 4D scalar image and is recomposed into one."""
+    img = sitk.ReadImage(path)
+    if img.GetNumberOfComponentsPerPixel() > 1:
+        return sitk.Cast(img, sitk.sitkVectorFloat32)
+    if img.GetDimension() == 4 and img.GetSize()[3] == 3 and is_rgb_nifti(path):
+        size = list(img.GetSize())
+        channels = [sitk.Extract(img, size[:3] + [0], [0, 0, 0, c]) for c in range(3)]
+        return sitk.Cast(sitk.Compose(channels), sitk.sitkVectorFloat32)
+    return sitk.Cast(img, sitk.sitkFloat32)
+
+
+def _vector_magnitude(img: sitk.Image) -> sitk.Image:
+    """Per-voxel length of a colour map's RGB vector: |V1| * FA * 255 is a unit
+    vector scaled by FA, so this is the FA image it was coloured from."""
+    return sitk.Cast(sitk.VectorMagnitude(img), sitk.sitkFloat32)
+
+
 def register_secondary_to_primary(primary_path: str, secondary_path: str,
                                   out_path: str, threads: int = 8,
                                   drive_path: str = None) -> np.ndarray:
@@ -346,7 +385,14 @@ def register_secondary_to_primary(primary_path: str, secondary_path: str,
 
     Args:
         primary_path:   the reconstruction's primary MRI (fixed image)
-        secondary_path: the uploaded secondary MRI (moving image)
+        secondary_path: the uploaded secondary MRI (moving image). May be a
+                        colour FA map (see is_rgb_nifti): its three channels are
+                        resampled together and written back as bytes. The colours
+                        are NOT reoriented by the registration's rotation -- an
+                        RGB map stores |V1|, and without V1's signs a rotated
+                        direction cannot be recomputed -- so hues are those of the
+                        diffusion scan's own axes, off by the head's rotation
+                        between sessions (typically under ten degrees).
         out_path:       where to write the resampled NIfTI
         drive_path:     optional volume to register INSTEAD of secondary_path,
                         with the resulting transform then applied to
@@ -376,15 +422,18 @@ def register_secondary_to_primary(primary_path: str, secondary_path: str,
     sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
     try:
         fixed_raw = sitk.ReadImage(primary_path, sitk.sitkFloat32)
-        moving_raw = sitk.ReadImage(secondary_path, sitk.sitkFloat32)
+        moving_raw = read_scan_for_registration(secondary_path)
+        is_rgb = moving_raw.GetNumberOfComponentsPerPixel() > 1
         print(f"[SEC REG] primary size: {fixed_raw.GetSize()}, "
               f"spacing: {[round(v, 2) for v in fixed_raw.GetSpacing()]}")
         print(f"[SEC REG] secondary size: {moving_raw.GetSize()}, "
               f"spacing: {[round(v, 2) for v in moving_raw.GetSpacing()]}")
 
         # The image the optimizer actually sees. Normally the secondary itself;
-        # for a derived map, the reference volume it was computed from.
-        drive_raw = moving_raw
+        # for a derived map, the reference volume it was computed from. A colour
+        # map has three channels and no single intensity to register on, so
+        # without a reference it is driven by its brightness (the FA it encodes).
+        drive_raw = _vector_magnitude(moving_raw) if is_rgb else moving_raw
         if drive_path:
             drive_raw = sitk.ReadImage(drive_path, sitk.sitkFloat32)
             print(f"[SEC REG] driving registration on reference: {drive_raw.GetSize()}, "
@@ -427,6 +476,14 @@ def register_secondary_to_primary(primary_path: str, secondary_path: str,
             moving_raw, fixed_raw, final_transform, sitk.sitkLinear, 0.0,
             moving_raw.GetPixelID(),
         )
+        if is_rgb:
+            # Interpolated in float, stored back as 0-255 bytes: a colour map in
+            # the T1's grid is ~3x the T1's voxel count, and bytes keep it at a
+            # quarter of what float32 would cost.
+            arr = np.clip(np.rint(sitk.GetArrayFromImage(resampled)), 0, 255)
+            as_bytes = sitk.GetImageFromArray(arr.astype(np.uint8), isVector=True)
+            as_bytes.CopyInformation(resampled)
+            resampled = as_bytes
         sitk.WriteImage(resampled, out_path)
         print(f"[SEC REG] Resampled secondary written to {out_path}")
 
