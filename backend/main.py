@@ -2450,6 +2450,48 @@ async def get_structures(
 
     return structures
 
+@app.get("/api/reconstructions/{recon_id}/cortical-surface")
+async def get_cortical_surface(
+    recon_id: int,
+    token: Optional[str] = None,
+    current_user: Optional[User] = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Pial-like cortical surface for the 3D viewer's cortical render mode.
+
+    404 when the DKT label volume has not been computed for this reconstruction --
+    the mode is simply unavailable there. Deliberately never borrows another
+    reconstruction's surface, for the same reason /structures does not.
+    """
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not current_user and recon.share_token != token:
+        raise HTTPException(status_code=403, detail="Access denied")
+    mesh_abs = _abs(recon.mesh_path) if recon.mesh_path else None
+    if not mesh_abs or not os.path.exists(mesh_abs):
+        raise HTTPException(status_code=404, detail="Brain mesh not ready yet")
+
+    from services.cortical_surface import get_or_build_isolated
+    recon_dir = os.path.dirname(mesh_abs)
+
+    loop = asyncio.get_event_loop()
+    try:
+        payload = await loop.run_in_executor(
+            None, get_or_build_isolated, recon_dir
+        )
+    except Exception as e:
+        print(f"[CORTEX] Cortical surface failed for recon {recon.id}: {e}")
+        raise HTTPException(status_code=500, detail="Cortical surface build failed")
+
+    if payload is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cortical surface needs brain structures; load them first")
+    return JSONResponse(payload)
+
+
 @app.get("/api/reconstructions/{recon_id}/mesh")
 async def get_mesh(
     recon_id: int,

@@ -117,13 +117,38 @@ export const useAppStore = create((set, get) => ({
     }
   )),
   meshData: null,
-  setMeshData: (data) => set({ meshData: data }),
+  setMeshData: (data, forReconId) => set((s) => (
+    forReconId !== undefined && forReconId !== s.activeReconId ? {} : { meshData: data }
+  )),
   structuresData: null,          // { key: { label, color, vertices, faces, ... } }
-  setStructuresData: (data) => set({ structuresData: data }),
+  setStructuresData: (data, forReconId) => set((s) => (
+    forReconId !== undefined && forReconId !== s.activeReconId ? {} : { structuresData: data }
+  )),
   structureVisible: {},          // { key: bool }
   setStructureVisible: (key, v) => set(s => ({ structureVisible: { ...s.structureVisible, [key]: v } })),
   setStructureVisibleMany: (keys, v) =>
     set(s => ({ structureVisible: { ...s.structureVisible, ...Object.fromEntries(keys.map(k => [k, v])) } })),
+
+  // ── Brain render mode ────────────────────────────────────────────────────────
+  // 'structures' draws the ~78 nested translucent parcellation meshes (the
+  // default, and the mode for reviewing depth contacts, which stay visible
+  // through them). 'cortical' draws one opaque pial-like surface instead: sulci
+  // and gyri read clearly and the draw-order flicker is structurally impossible,
+  // but contacts inside the brain are occluded by design.
+  //
+  // Lives in the store rather than in a viewer because both Viewer3D and
+  // SeegViewer3D render it and the switch sits in the shared StructurePanel.
+  brainRenderMode: 'structures',
+  setBrainRenderMode: (m) => set({ brainRenderMode: m }),
+  corticalColorBy: 'plain',      // 'plain' (white, sulci shaded) | 'parcellation'
+  setCorticalColorBy: (c) => set({ corticalColorBy: c }),
+  // Decoded once and shared by both canvases so the typed arrays are not
+  // duplicated per viewer. null = not loaded, 'unavailable' = this reconstruction
+  // has no DKT volume, so the mode is hidden rather than offered and broken.
+  corticalData: null,
+  setCorticalData: (d, forReconId) => set((s) => (
+    forReconId !== undefined && forReconId !== s.activeReconId ? {} : { corticalData: d }
+  )),
 
   // ── sEEG functional mapping (decoupled from reconstruction/editor state) ──────
   seegRecordings: [],            // [{ id, task, filename, uploaded_at }]

@@ -80,6 +80,13 @@ export const getCtHistogram = (reconId, token) =>
 export const getStructures = (id, token) =>
   api.get(`/reconstructions/${id}/structures${token ? `?token=${token}` : ""}`);
 
+// Pial-like cortical surface for the 3D viewer's cortical render mode. Built on
+// demand from the T1 plus the DKT label volume, so it 404s until structures have
+// been computed for this reconstruction -- callers treat that as "mode not
+// available here", not as an error.
+export const getCorticalSurface = (id, token) =>
+  api.get(`/reconstructions/${id}/cortical-surface${token ? `?token=${token}` : ""}`);
+
 export const confirmRegistration = (id, confirmed) =>
   api.patch(`/reconstructions/${id}/registration-confirm`, { confirmed });
 

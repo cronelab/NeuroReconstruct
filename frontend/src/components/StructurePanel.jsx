@@ -41,7 +41,14 @@ export default function StructurePanel({
     structureVisible,
     setStructureVisible,
     setStructureVisibleMany,
+    brainRenderMode,
+    setBrainRenderMode,
+    corticalColorBy,
+    setCorticalColorBy,
+    corticalData,
   } = useAppStore();
+  const cortical = brainRenderMode === 'cortical';
+  const corticalUnavailable = corticalData === 'unavailable';
   const [loading, setLoading] = useState(false);
 
   const handleLoad = async () => {
@@ -72,7 +79,7 @@ export default function StructurePanel({
   return (
     <div style={{ borderBottom: '1px solid #1e2530', padding: '8px 14px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-        <span style={{ fontSize: 13, color: '#e8edf2', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase' }}>Structures</span>
+        <span style={{ fontSize: 13, color: '#e8edf2', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase' }}>Brain</span>
         {!structuresData && (
           <button
             onClick={handleLoad}
@@ -83,7 +90,55 @@ export default function StructurePanel({
         )}
       </div>
 
+      {/* Brain render mode. The cortical surface is derived from the same DKT
+          volume the structures come from, so it is only offered once they exist. */}
       {hasStructures && (
+        <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
+          {[['structures', 'Structures'], ['cortical', 'Cortical surface']].map(([mode, label]) => (
+            <button key={mode}
+              onClick={() => setBrainRenderMode(mode)}
+              disabled={mode === 'cortical' && corticalUnavailable}
+              title={mode === 'cortical'
+                ? (corticalUnavailable
+                    ? 'Not available for this reconstruction'
+                    : 'One opaque pial surface: sulci and gyri read clearly, but contacts inside the brain are hidden')
+                : 'Nested translucent parcellation meshes; depth contacts stay visible'}
+              style={{
+                flex: 1, fontSize: 11, padding: '4px 6px', borderRadius: 4, cursor:
+                  (mode === 'cortical' && corticalUnavailable) ? 'default' : 'pointer',
+                fontFamily: 'IBM Plex Mono, monospace',
+                background: brainRenderMode === mode ? '#16324a' : 'none',
+                border: `1px solid ${brainRenderMode === mode ? '#74C0FC' : '#1e2530'}`,
+                color: (mode === 'cortical' && corticalUnavailable) ? '#3d4757'
+                  : brainRenderMode === mode ? '#cfe6ff' : '#7a8a99',
+              }}>
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Cortical mode replaces the opacity slider and the structure tree: the
+          surface is opaque by design, and colour is the only choice left. */}
+      {hasStructures && cortical && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+          <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace' }}>Colour</span>
+          {[['plain', 'Plain'], ['parcellation', 'Parcellation']].map(([c, label]) => (
+            <button key={c} onClick={() => setCorticalColorBy(c)}
+              style={{
+                flex: 1, fontSize: 11, padding: '3px 6px', borderRadius: 4, cursor: 'pointer',
+                fontFamily: 'IBM Plex Mono, monospace',
+                background: corticalColorBy === c ? '#16324a' : 'none',
+                border: `1px solid ${corticalColorBy === c ? '#74C0FC' : '#1e2530'}`,
+                color: corticalColorBy === c ? '#cfe6ff' : '#7a8a99',
+              }}>
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {hasStructures && !cortical && (
         <div style={{ maxHeight, overflowY: 'auto' }}>
           {/* Master toggle — show/hide all brain structures (subcortical + cortical) at once */}
           {allKeys.length > 0 && (

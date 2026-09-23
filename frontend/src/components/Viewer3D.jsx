@@ -4,6 +4,7 @@ import { OrbitControls, Line, Html, PerspectiveCamera, Billboard } from '@react-
 import * as THREE from 'three';
 import { useAppStore } from '../store';
 import CTArtifactMesh from './CTArtifactMesh';
+import CorticalSurface, { useCorticalSurfaceData } from './CorticalSurface';
 import { isInsideMesh, structureAtPoint } from '../anatomy';
 
 // ── Brain Mesh ────────────────────────────────────────────────────────────────
@@ -207,8 +208,17 @@ function LoadingOverlay({ message }) {
 // editor's auto-label action so both derive a contact's region identically).
 
 export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLoading, onContactPlaced, showMri, mriOpacity, ctThreshold, ctOpacityOverride, activeContactNumber, structuresData, structureVisible, structureOpacity }) {
-  const { meshData, brainOpacity, reconstruction, isEditorMode, selectedShaftId, shaftVisibility, contactScale, placeMode } = useAppStore();
+  const { meshData, brainOpacity, reconstruction, isEditorMode, selectedShaftId, shaftVisibility, contactScale, placeMode,
+          brainRenderMode, corticalColorBy } = useAppStore();
   const [hoveredStruct, setHoveredStruct] = React.useState(null);
+  const [hoveredParcel, setHoveredParcel] = React.useState(null);
+
+  // Cortical surface mode: one opaque pial-like mesh instead of the nested
+  // translucent parcellation shells. Loaded lazily on first switch into the mode.
+  const cortical = brainRenderMode === 'cortical';
+  const { data: corticalSurface, loading: corticalLoading } =
+    useCorticalSurfaceData(reconstruction?.id, reconstruction?.share_token);
+  React.useEffect(() => { if (!cortical) setHoveredParcel(null); }, [cortical]);
 
   // Interaction mode has three states:
   //   'structure' → hover a structure surface, highlight the contacts inside it
@@ -296,13 +306,22 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
       <Canvas gl={{ antialias: true, alpha: false, logarithmicDepthBuffer: true }}>
         <PerspectiveCamera makeDefault fov={45} position={[0, 0, 300]} />
         <CameraSetup meshData={meshData} />
-        <SceneLights />
+        {/* Cortical mode brings its own rig (lower ambient + hemisphere + a
+            camera-attached key light); the flat default washes folds out. */}
+        {!cortical && <SceneLights />}
 
-        {loading && <LoadingOverlay message={loadingMessage} />}
+        {(loading || corticalLoading) && (
+          <LoadingOverlay message={corticalLoading ? 'Building cortical surface…' : loadingMessage} />
+        )}
 
-        {/* MRI brain surface — optional */}
-        {meshData && !loading && showMri && (
+        {/* MRI brain surface — replaced by the cortical surface in that mode */}
+        {meshData && !loading && showMri && !cortical && (
           <BrainMesh meshData={meshData} opacity={mriOpacity ?? brainOpacity} />
+        )}
+
+        {cortical && corticalSurface && (
+          <CorticalSurface data={corticalSurface} colorBy={corticalColorBy}
+            interactive={activeMode !== 'place'} onHover={setHoveredParcel} />
         )}
 
         {/* CT threshold mesh */}
@@ -314,8 +333,11 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
           s.vertices ? (
             <StructureMesh key={key} meshData={s} color={s.color}
               structKey={key} structLabel={s.label} opacity={structureOpacity ?? 0.45}
-              visible={structureVisible?.[key] !== false}
-              interactive={activeMode === 'structure'}
+              // Cortical mode hides them but MUST NOT unmount them: electrode-
+              // centric hover and the shared auto-label action raycast these
+              // meshes, and Mesh.raycast ignores `visible` (see the note above).
+              visible={!cortical && structureVisible?.[key] !== false}
+              interactive={!cortical && activeMode === 'structure'}
               onRegister={registerStructMesh}
               onHover={handleStructureHover} onUnhover={handleStructureUnhover} />
           ) : null
@@ -366,8 +388,10 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
         >
           <span>◎ PLACE CONTACTS MODE</span>
         </div>
-      ) : structuresData && Object.keys(structuresData).length > 0 && (
-        /* Hover-mode toggle — only meaningful once structures are loaded */
+      ) : !cortical && structuresData && Object.keys(structuresData).length > 0 && (
+        /* Hover-mode toggle — only meaningful once structures are loaded, and
+           only in structures mode: with an opaque cortex the contacts inside a
+           structure are occluded, so "highlight them" has nothing to show. */
         <button
           onClick={() => {
             setHoveredStruct(null);
@@ -419,6 +443,21 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
           ) : (
             <span style={{ color: '#7a8a99' }}>unlabelled</span>
           )}
+        </div>
+      )}
+
+      {/* Cortical-surface hover tooltip — the parcel under the cursor, read
+          straight off the hit face's per-vertex id rather than by raycasting
+          every structure mesh. */}
+      {cortical && hoveredParcel && (
+        <div style={{
+          position: 'absolute', top: 16, right: 16, pointerEvents: 'none',
+          background: 'rgba(10,12,16,0.92)', border: `1px solid ${hoveredParcel.color}`,
+          borderRadius: 4, padding: '6px 12px',
+          fontFamily: 'IBM Plex Mono, monospace', fontSize: 16.5,
+          boxShadow: `0 0 12px ${hoveredParcel.color}44`,
+        }}>
+          <span style={{ color: hoveredParcel.color }}>{hoveredParcel.label}</span>
         </div>
       )}
 

@@ -3,6 +3,8 @@ import { Canvas, useThree } from '@react-three/fiber';
 import { OrbitControls, Html, PerspectiveCamera, Billboard } from '@react-three/drei';
 import * as THREE from 'three';
 import { buildStructureMeshes, structureAtPoint } from '../anatomy';
+import CorticalSurface, { useCorticalSurfaceData } from './CorticalSurface';
+import { useAppStore } from '../store';
 import { shaftColorOf } from '../seegColors';
 
 // ── Diverging color scale (blue → white → red), modeled on webfm's dotColorScale ──
@@ -163,8 +165,16 @@ export default function SeegViewer3D({
   meshData, contacts = [], domain = 6, brainOpacity = 0.4,
   structuresData = null, structureVisible = {}, structureOpacity = 0.4,
   shaftColors = {}, hoveredChannel = null, onHoverContact, loading, loadingMessage,
+  reconId = null, shareToken = null,
 }) {
   const baseRadius = 1.8;
+
+  // Cortical surface mode, shared with the reconstruction viewer through the
+  // store so the two 3D views agree on which brain rendering is showing.
+  const { brainRenderMode, corticalColorBy } = useAppStore();
+  const cortical = brainRenderMode === 'cortical';
+  const { data: corticalSurface, loading: corticalLoading } =
+    useCorticalSurfaceData(reconId, shareToken);
 
   // Non-rendered meshes for the contact→structure raycast (electrode-centric hover).
   const structMeshes = useMemo(() => buildStructureMeshes(structuresData), [structuresData]);
@@ -198,13 +208,21 @@ export default function SeegViewer3D({
       <Canvas gl={{ antialias: true, alpha: false, logarithmicDepthBuffer: true }}>
         <PerspectiveCamera makeDefault fov={45} position={[0, 0, 300]} />
         <CameraSetup meshData={meshData} />
-        <SceneLights />
+        {/* Cortical mode brings its own light rig; the flat default washes
+            folds out. */}
+        {!cortical && <SceneLights />}
 
-        {loading && <LoadingOverlay message={loadingMessage} />}
+        {(loading || corticalLoading) && (
+          <LoadingOverlay message={corticalLoading ? 'Building cortical surface...' : loadingMessage} />
+        )}
 
-        {meshData && !loading && <BrainSurface meshData={meshData} opacity={brainOpacity} />}
+        {meshData && !loading && !cortical && <BrainSurface meshData={meshData} opacity={brainOpacity} />}
 
-        {structuresData && Object.entries(structuresData).map(([key, s]) => (
+        {cortical && corticalSurface && (
+          <CorticalSurface data={corticalSurface} colorBy={corticalColorBy} interactive={false} />
+        )}
+
+        {!cortical && structuresData && Object.entries(structuresData).map(([key, s]) => (
           s.vertices && structureVisible?.[key] !== false
             ? <StructureMesh key={key} meshData={s} color={s.color || '#6a7a8a'} opacity={structureOpacity} />
             : null

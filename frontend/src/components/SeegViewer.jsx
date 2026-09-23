@@ -832,6 +832,7 @@ export default function SeegViewer({ reconId, onBack }) {
         <SeegViewer3D
           meshData={surfaceMesh}
           contacts={contacts}
+          reconId={reconId}
           domain={domain}
           brainOpacity={seegBrainOpacity}
           structuresData={structuresData}
