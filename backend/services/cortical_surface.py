@@ -5,94 +5,77 @@ scalars: a sulcal-depth value that shades the fundi dark, and a DKT parcel id th
 recolors the surface by anatomy. Because it is a single opaque mesh it cannot show
 the draw-order flicker the nested translucent structure meshes do.
 
-GEOMETRY COMES FROM THE T1, NOT FROM THE LABELS. The DKT volume is a parcellation
-product -- antspynet runs inference on 96x112x96 (outer) and 160x192x160 (inner)
-template grids and resamples back (see dkt_lowmem.py), so its boundary precision is
-~1-2 mm whatever the scan's resolution. Measured on PY26N010 (recon_fa94010a,
-0.57 mm in-plane): 66.5% of pial vertices sit on label 0, i.e. the ribbon is eroded
-well inside the true pial boundary. So the two inputs split by what each is good
-for -- the labels supply the *region* and the intensity priors, the T1 supplies the
-*surface*. This is what LeGUI does with SPM tissue maps (LeG_genSurfaces.m), and
-the same idea already lives in mesh_extractor.py's sulci-recovery branch, which is
-currently gated to the morphological fallback path.
+THE DKT LABELS DECIDE WHERE CORTEX IS; THE T1 ONLY REFINES THE OUTER EDGE. The
+first five versions did it the other way round -- thresholded the T1 between the
+local grey and CSF levels, used the labels only as a working region, and fought the
+result with an opening, an intensity ceiling and a travel cap. On the scans this app
+actually gets (post-implant, often with weak grey/CSF contrast) that fails three
+ways, all measured on PY26N010_dev1, PY26N009_dev3, PY26N002 and PY26N005_dev1:
+
+  * Sulci never open. A sulcus 1-2 mm wide is partial-volumed well above the
+    GM/CSF midpoint (PY26N010_dev1: grey 146, CSF 78). Of the 170 cm3 DKT leaves
+    open between cortical banks there, 68% ended up in the old mask, so the lateral
+    convexity rendered as a lumpy sheet with hardly a sulcus in it.
+  * Extra-cerebral tissue next to cortex -- a ~2 mm slab of CSF, arachnoid and vein
+    over the temporal lobe -- sits at the grey level, so no intensity ceiling can
+    see it and no distance rule can tell it from cortex.
+  * Electrode tracks. These MRIs are acquired with the electrodes in: the T1 along
+    each shaft is 0.35-0.58x its value 4 mm away. A threshold follows the signal
+    void into the brain and the surface shows a crater at every entry site.
+
+The DKT network gets all three right: it leaves the sulci open, stops at the
+cortex, and labels straight through the voids. So the mask is now the labels plus
+the white matter they enclose, and the T1 may only add a thin, never-bright margin
+outside the labelled envelope, where DKT's 1-2 mm erosion clips real cortex.
+
+THE INTERIOR HAS TO BE SEALED EXPLICITLY. Cerebral white matter is not a DKT label
+(the inner model's tuple, dkt_lowmem.py:170-172, has no 2/41), and DKT leaves an
+unlabelled, WM-bright channel through the basal forebrain 3.2-3.5 mm from any
+label. The old fill_holes after a 3 mm dilation therefore never sealed: it added
+0-1 cm3 on every test scan and left 190-375 cm3 of deep WM out of the mask. Those
+surfaces were hollow, and the inner wall was ~870 of PY26N010_dev1's 2383 cm2 --
+which is why "area rises as tissue is removed" once looked like the signature of a
+good guard, and why tightening the travel cap once looked like perforation. Filling
+after a SEAL_MM dilation that also covers the posterior-fossa labels (otherwise the
+peduncles leak) and eroding back closes it on all four.
+
+White matter is then found by intensity and connectivity: unlabelled voxels inside
+that envelope brighter than WM_REL x the local grey level, kept where they connect
+to the deep structures. Connectivity never runs through cortex, which is not
+bright, so a vessel lying in a sulcus is its own small component and is dropped.
 
 Two facts about the label volume that the recipe depends on, both verified against
 real data rather than assumed:
-  * Cerebral white matter is NOT a label. The DKT inner model's tuple
-    (dkt_lowmem.py:170-172) contains no 2/41, so WM shares label 0 with background.
-    The cerebrum region therefore recovers WM by hole-filling a dilated ribbon.
+  * Cerebral white matter is NOT a label (above). WM shares label 0 with
+    background and with the CSF in the sulci.
   * Labels 630/631/632 are cerebellar vermal lobules -- midline, y -44..-58,
     z -32..-53, co-located with the cerebellum centroid. They are excluded with the
     cerebellum and brainstem, or the vermis is left dangling under a cut cerebrum.
 
-Three things the first version got wrong, each fixed by a step above and each
-worth keeping in mind before touching the parameters again:
+Two things from the T1-first versions that still hold and are kept for the margin:
+the GM->CSF threshold is a smooth local field (_gm_level_field; the per-lobe GM
+median varies +-15%), and every sigma is in voxels, because each scan here is
+anisotropic in a different axis.
 
-  * A single global GM->CSF threshold is not good enough. The per-lobe GM median
-    varies +-15% about the global one on these scans, and on a low-contrast T1
-    (PY26N010_dev1: GM/CSF separation 0.47 against 0.70 on a clean scan) that is
-    the difference between a lateral sulcus opening and welding shut. The
-    threshold is therefore a smooth field, _gm_level_field.
-  * Smoothing in millimetres fights the acquisition. Every scan here is
-    anisotropic in a different axis, so an mm-isotropic sigma under-smooths the
-    staircase and over-blurs in plane. Both sigmas are in voxels.
-  * Morphological closing and global opening both cost more than they bought --
-    the closing welded sub-millimetre sulcal CSF shut, the opening rounded gyral
-    ridges off. Closing is gone; opening survives only outside the labelled
-    cortex, where it is what removes the cortical veins and dura that the 3 mm
-    working region admits but the DKT parcellation never contained.
+Measured schema 5 -> 6 (area cm2 / genus; the schema-5 area includes the cavity wall):
 
-WHAT FREESURFER DOES ABOUT DURA, AND WHICH HALF OF IT TRANSPLANTS. FreeSurfer's
-pial is a deformation of the white surface along outward normals, capped at
-max_thickness (5 mm) and stiffened by spring and curvature terms, so a dural
-shelf is not a shape the surface can take at all. That structure does not
-transplant to a thresholded voxel mask, but two of its guard rails do, and both
-are applied here to the outer shell only -- outside CORE_MM -- so neither can
-cost a labelled grey-matter voxel:
+    PY26N010_dev1    2383 / 595  ->  2335 / 1352
+    PY26N009_dev3    2483 / 969  ->  1783 /  452
+    PY26N002         2715 / 590  ->  1708 /  391
+    PY26N005_dev1    2046 / 429  ->  1550 /  403
+    PY26N004         2388 / 595  ->  1633 /  370
 
-  * BORDER_HI, FreeSurfer's border_hi / MAX_BORDER_WHITE. Cortex is darker than
-    white matter, so the pial boundary cannot lie in tissue brighter than WM.
-    Measured on PY26N010_dev1 the tissue the mask picks up outside the labelled
-    cerebrum sits at 1.50x the local grey level (p25 1.36, p75 1.61) against
-    0.99 for labelled cortex -- it is not dura that happens to look like GM, it
-    is frankly brighter than either.
-  * TRAVEL_MM, FreeSurfer's max_thickness -- but measured as distance the
-    boundary has to TRAVEL through tissue, not as a straight line. The straight
-    line does nothing here and it is worth knowing why before trying it again:
-    the working region is dilated only REGION_DILATE_MM past the ribbon, so
-    every voxel in the mask is already within 3.9 mm of a label and an
-    EDT-based cap at 5, 6.5 or 8 mm changes the area by 0.1%. Along the mask
-    the same shelf is much further, because the path has to leave the cortex
-    and run back out along the plate.
+Every one is a single shell with 99.1-100% parcel coverage. Build 32-49 s and peak
+working set 1.59-2.05 GB at 4 threads (PY26N004, 126 Mvox, and PY26N010_dev1),
+against 52-54 s and 2.09-2.15 GB for schema 5 on the same two scans: the mask is
+twice as fast without the geodesic travel cap, which was also the old memory peak.
 
-Three other readings of the same idea were built and measured and do not work,
-so they are not here: a cap measured from a recovered white-matter mask (the
-dura is brighter than the local grey level, so it lands in the WM class itself
--- 23.6 of 24.0 cm3 of it -- and opening the class up to 1.6 mm does not cut it
-loose); a Taubin-smoothed reference surface to clamp protrusions against
-(Taubin is shrink-free, so the reference moves 1.6-2.8 mm and never separates);
-and intersecting with the brain-extraction envelope from mesh.json (it is a
-filled, closed mask of 1593 cm3 and contains every cubic centimetre of the
-tissue in question). T2/FLAIR dura vetoing, which is what FreeSurfer's -T2pial
-actually leans on, is not an option: only 1 of 13 reconstructions has a
-registered secondary scan.
-
-Measured over five recons, first against the original label-threshold surface
-and then with the two constraints above added:
-
-    recon       area cm2              labelled GM kept      tissue outside
-                                                            the cerebrum, cm3
-    959f59f5    1636 -> 2218 -> 2383    81.4 -> 82.7 -> 82.7    93 -> 52
-    fa94010a    1670 -> 2401 -> 2483    91.6 -> 91.3 -> 91.3    76 -> 47
-    6f1809b9    1909 -> 2652 -> 2715    80.2 -> 81.7 -> 81.7    96 -> 57
-    645376cf    1336 -> 1890 -> 2046    89.4 -> 89.6 -> 89.5    76 -> 41
-    04cfcec7            2209 -> 2388            88.5 -> 88.5    87 -> 46
-
-Area goes UP on every one while tissue is being removed, which is the signature
-to look for: the shelves were lying over folds, so taking them off exposes more
-surface than it deletes. Retention of labelled grey matter does not move,
-because both constraints are gated on CORE_MM. Mesh components 20-45 -> 1.
-Parcel coverage stays ~99.8%. Build 37-58 s, peak RSS 1.9 GB.
+Known costs. DKT's labels step in ~1 mm, which shows as a faceted texture at close
+zoom; blurring the mask by 0.8 mm or more would smooth it but also fuses the sulcal
+gaps the labels leave, so it is not done. The same steps leave pinholes, which is
+the genus above and shows as specks on the inferior surface. Any DKT labelling
+error is inherited, and where DKT is eroded the surface sits up to a millimetre
+inside the true pial boundary.
 
 Display surface only -- the label volume is untouched, so contact_labeling.py is
 unaffected. It is not a topologically-correct FreeSurfer pial surface: arbitrary
@@ -113,7 +96,6 @@ from scipy.ndimage import (binary_fill_holes, distance_transform_edt,
                            label as nd_label, zoom)
 from skimage import measure
 from skimage.filters import gaussian
-from skimage.graph import MCP_Geometric
 
 try:                                            # normal package import
     from services.structure_extractor import ALL_STRUCTURES
@@ -134,17 +116,36 @@ CSF = (24,)
 EXCLUDE = (6, 7, 8, 45, 46, 47, 16, 630, 631, 632)
 REGION = CORTICAL_GM + SUBCORTICAL + VENTRICLES
 
-# ── Parameters, each settled by the Step 0 sweep on real data ─────────────────
-REGION_DILATE_MM = 3.0      # region must contain the pial boundary the labels clipped
-EXCLUDE_DILATE_MM = 1.0     # keep that dilation from leaking across the tentorium
-THRESHOLD_FRAC = 0.5        # GM -> CSF midpoint, now against the LOCAL grey level
+# ── Parameters ────────────────────────────────────────────────────────────────
+# The cerebrum is sealed by filling after this dilation and eroding back. 3 mm
+# leaks through the unlabelled basal forebrain on every scan measured; 5 mm is
+# the smallest that sealed all four test scans once the fossa labels are included.
+SEAL_MM = 6.0
+EXCLUDE_DILATE_MM = 1.0     # keep the cerebrum clear of the tentorium / brainstem cut
+
+# White matter: unlabelled, inside the sealed envelope, and at least this bright
+# as a multiple of the LOCAL grey level. Deep WM sits at 1.28-1.81x on the test
+# scans, so 1.2 cut into it on the dimmest and left pits wherever the surface
+# dipped into the missing WM; 1.1 lowered the genus 24-47% on all four without
+# closing a sulcus. Labelled cortex is never a candidate, so a cut this close to
+# grey only admits unlabelled grey/white partial volume, which is inside anyway.
+WM_REL = 1.1
+
+# The T1 may extend the surface this far past the cortical labels, outside the
+# labelled envelope only -- that is where DKT's erosion clips real cortex -- and
+# never onto tissue brighter than MARGIN_CEIL x the local grey level (vessel, dura).
+# 0.5-1.5 mm made no visible difference; between the banks of a sulcus the labels
+# decide alone, because any margin there re-closes the gap they leave.
+MARGIN_MM = 1.0
+MARGIN_CEIL = 1.2
+THRESHOLD_FRAC = 0.5        # GM -> CSF midpoint for the margin, against the LOCAL grey level
 
 # Both smoothings are in VOXELS, not millimetres. The staircase this has to
 # suppress is an artifact of the acquisition grid, and every scan here is
 # anisotropic in a different axis (0.52/0.52/0.98 axial, 1.0/0.57/0.57 sagittal).
 # A millimetre-isotropic sigma therefore smooths least along the very axis that
-# needs it most, and to compensate it over-blurs in plane -- which is what welded
-# the lateral sulci shut on the axial scans.
+# needs it most, and to compensate it over-blurs in plane. Do not raise
+# MASK_SIGMA_VOX to hide the labels' facets: at 0.8 mm the blur fuses the sulci.
 DENOISE_VOX = 0.5           # on the T1, before thresholding
 MASK_SIGMA_VOX = 0.45       # on the binary mask, before marching cubes
 
@@ -156,20 +157,9 @@ BIAS_BLOCK_MM = 4.0         # grid the field is estimated on
 BIAS_SMOOTH_MM = 30.0       # how far the field is allowed to vary
 BIAS_CLIP = (0.55, 1.8)     # guard rails, as a multiple of the global GM median
 
-# Vessels and dura. The DKT parcellation contains none of this -- it appears only
-# because the working region is dilated 3 mm past the labels to reach the pial
-# boundary the labels clip. Opening the whole mask would also round off the gyral
-# ridges (measured: a 1 mm global opening costs ~4% of surface area and visibly
-# flattens folds), so the labelled cortex plus CORE_MM is exempted and only the
-# outer shell is opened -- where a cortical vein is a 2-3 mm tube and cortex is not.
-CORE_MM = 2.5               # labelled ribbon + margin, never eroded
-SHELL_OPEN_MM = 4.0         # opening radius outside that core
-
-# Two constraints borrowed from FreeSurfer's pial deformation, both applied only
-# outside CORE_MM so neither can cost a labelled grey-matter voxel. See the
-# docstring for why the obvious reading of each one does nothing here.
-BORDER_HI = 1.35            # ceiling, as a multiple of the LOCAL grey level
-TRAVEL_MM = 2.5             # how far the boundary may travel out THROUGH tissue
+# The cerebrum crop must hold the depth hull's closing ball plus the margin and
+# the Gaussian supports; SEAL_MM is well inside it.
+CROP_PAD_MM = 14.0
 
 CLOSE_FOR_DEPTH_MM = 7.0    # ball that bridges a sulcus to define the outer hull
 DEPTH_SMOOTH_VOX = 1.0      # de-terrace the depth field (see below)
@@ -185,7 +175,9 @@ VOTE_ITERS = 30
 #   2 -> 3  bias-corrected threshold, voxel-unit smoothing, shell-only opening
 #   3 -> 4  de-terraced sulcal depth field
 #   4 -> 5  FreeSurfer's intensity ceiling and travel cap on the outer shell
-SCHEMA_VERSION = 5
+#   5 -> 6  label-first mask with a sealed interior; ceiling, travel cap and
+#           shell opening removed
+SCHEMA_VERSION = 6
 CACHE_NAME = "cortical_surface.json"
 
 
@@ -198,43 +190,42 @@ def _erode(mask, r, vox):
     return distance_transform_edt(mask, sampling=vox) > r
 
 
-def _open(mask, r, vox):
-    return _dilate(_erode(mask, r, vox), r, vox) & mask
-
-
 def _close(mask, r, vox):
     return _erode(_dilate(mask, r, vox), r, vox)
 
 
-def _travel_reach(mask, seed, vox, budget):
-    """Voxels of `mask` within `budget` mm of `seed`, measured ALONG the mask.
+def _sealed_interior(ribbon, excl, vox):
+    """Everything the labelled ribbon encloses, as far as the labels reach.
 
-    The distinction from an EDT is the whole point: a dural shelf lying against
-    the temporal lobe is two or three millimetres from the cortex in a straight
-    line but much further along any path that stays in tissue, because the path
-    has to leave the cortex, squeeze through wherever the two touch, and run
-    back out along the plate. MCP is a Dijkstra over the voxel graph, so the
-    cost it returns is that path length.
-
-    This is the pipeline's memory peak: MCP allocates float64 cumulative costs
-    and a traceback beside our own float64 cost array, measured at 64-67 bytes
-    per voxel of the crop (1.18 GB on a 19.6 Mvox cerebrum), which is what puts
-    the build at ~2 GB. Two obvious economies were measured and do not pay:
-    passing `starts` as an ndarray instead of a list of tuples saves 1 MB
-    (skimage converts it straight back), and seeding only the ribbon's boundary
-    instead of its interior saves 40 MB but changes the answer -- an interior
-    seed is free to path through, a boundary-only one is not.
+    Filling after a SEAL_MM dilation closes the unlabelled basal-forebrain channel
+    that a 3 mm dilation leaves open; eroding back by the same radius returns to
+    the labels' own extent, bridging only concavities narrower than 2 * SEAL_MM --
+    sulci and fissures, which is why the margin is never added inside this set.
+    The fossa labels join the fill, or the cerebral peduncles leak instead; they
+    are cut back out afterwards.
     """
-    costs = np.where(mask, 1.0, np.inf)
-    starts = np.argwhere(seed & mask)
-    if not len(starts):
-        return mask
-    mcp = MCP_Geometric(costs, sampling=tuple(float(v) for v in vox),
-                        fully_connected=True)
-    del costs
-    dist, _ = mcp.find_costs(starts.tolist())
-    del mcp, starts
-    return np.asarray(dist) <= budget
+    filled = binary_fill_holes(_dilate(ribbon | excl, SEAL_MM, vox))
+    inner = _erode(filled, SEAL_MM, vox)
+    del filled
+    return inner & ~_dilate(excl, EXCLUDE_DILATE_MM, vox)
+
+
+def _white_matter(candidates, labels):
+    """The candidates connected to the deep structures, and nothing else.
+
+    Candidates are bright unlabelled voxels inside the envelope. Connectivity may
+    run through the subcortical and ventricle labels, so white matter that the
+    basal ganglia or a ventricle splits still counts as one piece, but never
+    through cortex, which is not bright: a vessel in a sulcus is its own small
+    component.
+    """
+    hub = np.isin(labels, SUBCORTICAL + VENTRICLES)
+    lab, n = nd_label(candidates | hub)
+    if n == 0:
+        return candidates
+    sizes = np.bincount(lab.ravel())
+    sizes[0] = 0
+    return (lab == sizes.argmax()) & candidates
 
 
 def _gm_level_field(mri, gm, vox):
@@ -391,7 +382,7 @@ def build_cortical_surface(mri_path, label_path, brain_mesh_path,
     # full-volume float32 copy is 463 MB on the largest scan here, and the EDTs
     # below allocate float64. Same argument as structure_extractor.py:264-272.
     nz = np.argwhere(ribbon)
-    pad = np.ceil((REGION_DILATE_MM + CLOSE_FOR_DEPTH_MM + 4.0) / vox).astype(int)
+    pad = np.ceil(CROP_PAD_MM / vox).astype(int)
     lo = np.maximum(nz.min(0) - pad, 0)
     hi = np.minimum(nz.max(0) + pad + 1, np.array(labels.shape))
     del nz, ribbon
@@ -403,13 +394,10 @@ def build_cortical_surface(mri_path, label_path, brain_mesh_path,
     if verbose:
         print(f"[CORTEX] crop {tuple(hi - lo)} vox {np.round(vox, 3)} mm")
 
-    # ── Cerebrum region: dilate the ribbon, fill to recover WM, drop the fossa ──
+    # ── The envelope the labels enclose, sealed (see the module docstring) ─────
     ribbon_c = np.isin(labels_c, REGION)
-    region = binary_fill_holes(_dilate(ribbon_c, REGION_DILATE_MM, vox))
     excl = np.isin(labels_c, EXCLUDE)
-    if excl.any():
-        region &= ~_dilate(excl, EXCLUDE_DILATE_MM, vox)
-    del excl
+    inner = _sealed_interior(ribbon_c, excl, vox)
 
     # ── Contrast direction from the data, never from the stored modality ───────
     # T2 uploads are supported (main.py passes modality into skull stripping) and
@@ -421,38 +409,41 @@ def build_cortical_surface(mri_path, label_path, brain_mesh_path,
     med_csf = float(np.median(mri_c[np.isin(labels_c, VENTRICLES + CSF)]))
     bright = med_gm > med_csf
 
-    # The threshold is a field, not a number: a global one is off by the local
-    # bias, and on a low-contrast scan that decides whether a sulcus opens.
+    # Both the margin's threshold and "brighter than grey matter" are measured
+    # against the LOCAL grey level, so they follow the bias field.
     gm_field = np.clip(_gm_level_field(mri_c, gm, vox),
                        BIAS_CLIP[0] * med_gm, BIAS_CLIP[1] * med_gm)
-    del gm
     thr = gm_field + THRESHOLD_FRAC * (med_csf - gm_field)
-    ceiling = BORDER_HI * gm_field if bright else gm_field / BORDER_HI
-    del gm_field
-
     smooth = gaussian(mri_c, sigma=np.full(3, DENOISE_VOX))
     del mri_c
-    paren = ((smooth > thr) if bright else (smooth < thr)) & region
-    del region, thr
-    hot = (smooth > ceiling) if bright else (smooth < ceiling)
-    del smooth, ceiling
+    tissue = (smooth > thr) if bright else (smooth < thr)
+    del thr
+    # rel > 1 always means "on the white-matter side of grey", whichever way the
+    # contrast runs.
+    rel = (smooth / gm_field) if bright else (gm_field / np.maximum(smooth, 1e-3))
+    del smooth, gm_field
 
-    # Strip vessels and dura from the outer shell only (see CORE_MM above).
-    core = binary_fill_holes(_dilate(ribbon_c, CORE_MM, vox))
-    paren = _open(paren, SHELL_OPEN_MM, vox) | (paren & core)
-    paren &= core | ~hot
-    del core, hot
+    # ── Labels + the white matter they enclose ───────────────────────────────
+    wm = _white_matter(inner & ~ribbon_c & (rel > WM_REL), labels_c)
+    wm_cm3 = wm.sum() * vox_vol / 1000.0
+    core = binary_fill_holes(ribbon_c | wm)
+    del wm, ribbon_c
+
+    # ── The T1 margin, outside the labelled envelope only ────────────────────
+    near_gm = distance_transform_edt(~gm, sampling=vox) <= MARGIN_MM
+    del gm
+    margin = tissue & (rel < MARGIN_CEIL) & near_gm & ~inner & ~core
+    del tissue, rel, near_gm, inner
+
+    paren = (core | margin) & ~_dilate(excl, EXCLUDE_DILATE_MM, vox)
+    del core, margin, excl
     paren = binary_fill_holes(paren)
     paren, ncc = _largest_cc(paren)
-    paren &= _travel_reach(paren, ribbon_c, vox, TRAVEL_MM)
-    del ribbon_c
-    paren = binary_fill_holes(paren)
-    paren, _ = _largest_cc(paren)
     vol_cm3 = paren.sum() * vox_vol / 1000.0
     if verbose:
         print(f"[CORTEX] GM {med_gm:.0f} CSF {med_csf:.0f} "
-              f"({'bright' if bright else 'dark'}) | {ncc} components | "
-              f"{vol_cm3:.0f} cm3")
+              f"({'bright' if bright else 'dark'}) | WM {wm_cm3:.0f} cm3 | "
+              f"{ncc} components | {vol_cm3:.0f} cm3")
 
     # ── Sulcal depth field: close the sulci, then EDT inside that hull ─────────
     # 0 on a gyral crown, several mm at a fundus. A Taubin-smoothed reference does
@@ -657,8 +648,9 @@ def get_or_build(recon_dir, target_faces=DEFAULT_TARGET_FACES, verbose=True):
 def get_or_build_isolated(recon_dir, target_faces=DEFAULT_TARGET_FACES):
     """get_or_build, run in a child process when a build is actually needed.
 
-    Measured peak RSS is 1.90-2.07 GB across four real scans spanning 38-126
-    Mvox -- flat in scan size, because everything works on the cerebrum crop, and
+    Measured peak working set is 1.59-2.05 GB (PY26N004 at 126 Mvox, and
+    PY26N010_dev1). It tracks how much surface a scan yields rather than its voxel
+    count, because everything works on the cerebrum crop and meshing is the peak --
     modest next to DKT's 13.02 GB. It is still transient allocation that CPython
     will not hand back
     to the OS, and this pipeline's OOM history is precisely about residual web-
