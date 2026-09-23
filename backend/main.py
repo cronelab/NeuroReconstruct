@@ -3018,5 +3018,21 @@ if os.path.isdir(_FRONTEND_BUILD):
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def _serve_react(full_path: str):
-        """Catch-all: serve index.html so React Router handles client-side navigation."""
-        return FileResponse(os.path.join(_FRONTEND_BUILD, "index.html"))
+        """Catch-all: serve index.html so React Router handles client-side navigation.
+
+        no-cache, because FileResponse sets last-modified and etag but no
+        Cache-Control, and a response with a validator and no explicit freshness
+        is HEURISTICALLY cached -- roughly a tenth of the file's age, which after
+        a few weeks is days. index.html is the one file that names the current
+        hashed bundles, so a stale copy keeps a browser on the previous
+        deployment's JavaScript indefinitely. "no-cache" does not forbid storing
+        it, it forbids REUSING it without revalidating first. Note that Starlette
+        only honours If-None-Match in StaticFiles, not in FileResponse, so each
+        revalidation re-sends index.html in full rather than answering 304 -- a
+        couple of kilobytes per page load, against serving a stale bundle.
+
+        Everything under /static is content-hashed by the CRA build, so those URLs
+        change whenever their contents do and are safe to cache as-is.
+        """
+        return FileResponse(os.path.join(_FRONTEND_BUILD, "index.html"),
+                            headers={"Cache-Control": "no-cache"})

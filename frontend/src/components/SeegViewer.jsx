@@ -229,7 +229,7 @@ export default function SeegViewer({ reconId, onBack }) {
       setSeegRecordings(r.data);
       if (r.data.length && !seegRecordingId) setSeegRecordingId(r.data[0].id);
     }).catch(() => {});
-    getMesh(reconId).then((r) => { setNativeMesh(r.data); setMeshData(r.data); })
+    getMesh(reconId).then((r) => { setNativeMesh(r.data); setMeshData(r.data, reconId); })
       .catch(() => setNativeMesh(null));
   }, [reconId]);
 
@@ -237,7 +237,7 @@ export default function SeegViewer({ reconId, onBack }) {
   // main viewer); reuses whatever is already cached in the store.
   const handleLoadStructures = async () => {
     const r = await getStructures(reconId);
-    setStructuresData(r.data || {});
+    setStructuresData(r.data || {}, reconId);
   };
 
   // ── Compute activity whenever recording / band / window changes ───────────────

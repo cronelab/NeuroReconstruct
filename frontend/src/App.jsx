@@ -10,7 +10,7 @@ import DeletedList from './components/DeletedList';
 import SeegViewer from './components/SeegViewer';
 
 export default function App() {
-  const { user, setUser, token, logout, setReconstruction, setMeshData } = useAppStore();
+  const { user, setUser, token, logout, setReconstruction, setActiveRecon } = useAppStore();
   const [page, setPage] = useState('list'); // 'list' | 'viewer' | 'login' | 'deleted' | 'seeg'
   const [selectedReconId, setSelectedReconId] = useState(null);
   const [shareToken, setShareToken] = useState(null);
@@ -23,6 +23,7 @@ export default function App() {
     const match = path.match(/^\/view\/(\d+)/);
     if (match) {
       setSelectedReconId(parseInt(match[1]));
+      setActiveRecon(parseInt(match[1]));
       setShareToken(params.get('token'));
       setPage('viewer');
     }
@@ -43,11 +44,16 @@ export default function App() {
   const navigateTo = (path) => {
     if (path === '/login') setPage('login');
     if (path === '/seeg') setPage('seeg');
-    if (path === '/list') { setPage('list'); setSelectedReconId(null); setReconstruction(null); setMeshData(null); }
+    if (path === '/list') { setPage('list'); setSelectedReconId(null); setReconstruction(null); setActiveRecon(null); }
   };
 
+  // Clearing here rather than in a viewer effect is deliberate: this runs
+  // synchronously in the event handler, so the store is already empty on the
+  // render that follows. An effect would fire after the loaders had captured the
+  // outgoing reconstruction's payloads in their closures and skipped the fetch.
   const handleSelectReconstruction = (id) => {
     setSelectedReconId(id);
+    setActiveRecon(id);
     setPage('viewer');
     window.history.pushState({}, '', `/view/${id}`);
   };
@@ -56,7 +62,7 @@ export default function App() {
     setPage('list');
     setSelectedReconId(null);
     setReconstruction(null);
-    setMeshData(null);
+    setActiveRecon(null);
     window.history.pushState({}, '', '/');
   };
 

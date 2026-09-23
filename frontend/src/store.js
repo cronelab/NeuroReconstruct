@@ -94,7 +94,28 @@ export const useAppStore = create((set, get) => ({
     return { visibleLayers: next.length ? next : s.visibleLayers };
   }),
 
-  // Mesh data cache
+  // ── Mesh data cache ──────────────────────────────────────────────────────────
+  // SCOPED TO ONE RECONSTRUCTION. These are large payloads shared by every
+  // canvas, and their loaders skip the fetch when the slot is already full, so
+  // an unscoped cache renders the previous patient's anatomy on the current
+  // patient's scan -- exactly what the backend refuses to do (see the comment on
+  // /cortical-surface in main.py). The viewers mount without remounting between
+  // reconstructions, so nothing else clears them.
+  //
+  // `setActiveRecon` is the single choke point: every entry point that knows a
+  // reconstruction id calls it, and switching id empties all three slots. The
+  // setters additionally take the id the data was fetched FOR and drop it if the
+  // user has moved on since the request went out -- a late response from the
+  // previous reconstruction must not land in the new one's slot.
+  activeReconId: null,
+  setActiveRecon: (id) => set((s) => (
+    s.activeReconId === id ? {} : {
+      activeReconId: id,
+      meshData: null,
+      structuresData: null,
+      corticalData: null,
+    }
+  )),
   meshData: null,
   setMeshData: (data) => set({ meshData: data }),
   structuresData: null,          // { key: { label, color, vertices, faces, ... } }

@@ -146,7 +146,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
     setLoadingMessage('Loading brain mesh...');
     try {
       const res = await getMesh(reconId, shareToken);
-      setMeshData(res.data);
+      setMeshData(res.data, reconId);
     } catch (e) {
       console.warn('Could not load mesh', e);
     } finally {
@@ -202,7 +202,7 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
     setStructuresLoading(true);
     try {
       const res = await getStructures(reconId, shareToken);
-      setStructuresData(res.data);
+      setStructuresData(res.data, reconId);
     } catch (e) { console.warn('Structures load failed', e); }
     finally { setStructuresLoading(false); }
   }, [reconId, shareToken, structuresData, structuresLoading]);
