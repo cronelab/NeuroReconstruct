@@ -2276,7 +2276,8 @@ async def delete_secondary_scan(
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db),
 ):
-    """Remove a secondary scan and both of its files."""
+    """Remove a secondary scan and its files: the upload, its resampled copy
+    and, for a DTI map, the b=0 volume its registration was driven by."""
     scan = (await db.execute(
         select(SecondaryScan)
         .where(SecondaryScan.id == scan_id, SecondaryScan.reconstruction_id == recon_id)
@@ -2284,7 +2285,7 @@ async def delete_secondary_scan(
     if not scan:
         raise HTTPException(status_code=404, detail="Secondary scan not found")
 
-    for rel in (scan.stored_path, scan.resampled_path):
+    for rel in (scan.stored_path, scan.resampled_path, scan.reference_path):
         path = _abs(rel) if rel else None
         if not path:
             continue
