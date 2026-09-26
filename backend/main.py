@@ -38,7 +38,7 @@ import numpy as np
 from PIL import Image
 from fastapi.responses import Response as FastAPIResponse
 
-# â”€â”€ In-memory NIfTI slice cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── In-memory NIfTI slice cache ─────────────────────────────────────────────
 #
 # These caches used to be plain dicts that only ever grew. Keyed by file path
 # they are shared across users, so ten people looking at one scan cost what one
@@ -204,7 +204,7 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
     inv_affine, vol_shape, px_w_mm, px_h_mm, plane_normal, plane_offset), cached.
     px_w_mm/px_h_mm are the physical mm-per-pixel along the displayed width/height,
     for aspect-correct rendering of anisotropic voxels. plane_normal/plane_offset
-    define the slice plane exactly â€” see the comment on their computation below."""
+    define the slice plane exactly — see the comment on their computation below."""
     vol = _get_mri_volume(mri_path)
     data = vol["data"]
     affine = vol["affine"]
@@ -236,25 +236,25 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
     voxel_size_mm = float(voxel_sizes[ax])
     inv_affine = np.linalg.inv(affine)
 
-    # â”€â”€ Slice plane geometry in world RAS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Slice plane geometry in world RAS ─────────────────────────────────────
     # A constant-voxel-index plane is perpendicular to a world axis only when the
     # affine is axis-aligned. Oblique acquisitions (AC-PC tilt and friends) are
-    # rotated, so "the world coordinate of this slice" is not one number â€” it
+    # rotated, so "the world coordinate of this slice" is not one number — it
     # varies across the plane. On this project's own data a constant-index axial
     # plane sweeps ~18 mm of world z, i.e. ~31 slices. Hence two values:
     #
-    #   world_coord  â€” the value at the CENTRE of the plane. A representative
+    #   world_coord  — the value at the CENTRE of the plane. A representative
     #                  figure for labels and readouts, and identical to the old
     #                  corner-voxel formula whenever the affine is axis-aligned.
     #
-    #   plane_normal / plane_offset â€” the plane itself, as  normal Â· P = offset
-    #                  with |normal| == 1. So |normal Â· P - offset| is the exact
+    #   plane_normal / plane_offset — the plane itself, as  normal · P = offset
+    #                  with |normal| == 1. So |normal · P - offset| is the exact
     #                  perpendicular distance in mm from any world point P to
     #                  this slice, for any affine.
     #
     # To test whether a point lies on this slice, use plane_normal/plane_offset.
     # Never compare a point's world x/y/z against world_coord.
-    row = inv_affine[ax, :3]                  # âˆ‡(voxel index `ax`) w.r.t. world
+    row = inv_affine[ax, :3]                  # ∇(voxel index `ax`) w.r.t. world
     row_norm = float(np.linalg.norm(row))
     plane_normal = (row / row_norm).tolist()
     plane_offset = float((slice_idx - inv_affine[ax, 3]) / row_norm)
@@ -281,8 +281,8 @@ def _render_slice(mri_path: str, axis: str, slice_idx: int):
 from services.electrode_service import autofill_contacts
 from services.ct_electrode_extractor import build_threshold_mesh, snap_to_blob_centroid, _resolve_ct_path, compute_ct_histogram
 
-# â”€â”€ Fusion (CT-in-MRI-space) slice cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Fixed bone/metal window for the registration-QA fusion view â€” this is for
+# ── Fusion (CT-in-MRI-space) slice cache ──────────────────────────────────────
+# Fixed bone/metal window for the registration-QA fusion view — this is for
 # visually checking alignment (skull outline, ventricles), not diagnostic
 # reading, so a fixed window is simpler and more consistent across patients
 # than a per-volume percentile (which metal artifacts would skew).
@@ -311,7 +311,7 @@ def _render_fusion_slice(mri_path: str, ct_path: str, transform: np.ndarray, axi
     Resample the CT onto the exact MRI slice plane at (axis, slice_idx) and render
     as a grayscale PNG that is pixel-for-pixel aligned with /mri-slice's output.
 
-    Unlike the structure overlay (which picks the nearest same-axis slice â€” a valid
+    Unlike the structure overlay (which picks the nearest same-axis slice — a valid
     shortcut only because DKT labels share the MRI's own axes), the CT is related to
     the MRI by an arbitrary rigid rotation, so an MRI slice plane generally maps to
     an OBLIQUE plane through the CT volume. This does true 3D trilinear resampling
@@ -374,7 +374,7 @@ def _render_fusion_slice(mri_path: str, ct_path: str, transform: np.ndarray, axi
     return result
 
 
-# â”€â”€ Structure overlay slice cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Structure overlay slice cache ─────────────────────────────────────────────
 _struct_overlay_cache = _VolumeCache("labels")  # label_path -> {"data", "affine"}
 
 def _get_label_volume(label_path: str):
@@ -411,7 +411,7 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
 
     from services.structure_extractor import ALL_STRUCTURES
 
-    # Build label index â†’ RGBA lookup filtered by visibility
+    # Build label index → RGBA lookup filtered by visibility
     label_rgba: dict[int, tuple] = {}
     for key, info in ALL_STRUCTURES.items():
         if visible_keys is not None and key not in visible_keys:
@@ -419,13 +419,13 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
         h = info["color"].lstrip("#")
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         for lbl in info["labels"]:
-            label_rgba[lbl] = (r, g, b, 180)  # 180/255 â‰ˆ 70% opacity in the overlay layer
+            label_rgba[lbl] = (r, g, b, 180)  # 180/255 ≈ 70% opacity in the overlay layer
 
     vol = _get_label_volume(label_path)
     ldata  = vol["data"]
     laff   = vol["affine"]
 
-    # Map axis name â†’ array axis index
+    # Map axis name → array axis index
     ax = {"sagittal": 0, "coronal": 1, "axial": 2}[axis]
 
     # Get MRI slice world coordinate for alignment
@@ -437,7 +437,7 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
         slice_idx = n_mri // 2
 
     # Find the DKT voxel index matching this MRI slice. Go through world space with
-    # the full affines rather than each volume's [ax, ax] diagonal term â€” the
+    # the full affines rather than each volume's [ax, ax] diagonal term — the
     # diagonal shortcut silently assumes both grids are axis-aligned, which oblique
     # acquisitions are not. In practice the DKT labels are resampled onto the MRI's
     # own grid, so this resolves to dkt_idx == slice_idx; doing it properly just
@@ -490,7 +490,7 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
     pil.save(buf, format="PNG", optimize=False, compress_level=1)
     return buf.getvalue()
 
-# â”€â”€â”€ App Setup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── App Setup ───────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Brain Reconstruction Viewer", version="0.1.0")
 
@@ -538,7 +538,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# â”€â”€ Path helper: works in both normal dev mode and PyInstaller frozen mode â”€â”€â”€â”€
+# ── Path helper: works in both normal dev mode and PyInstaller frozen mode ────
 def _get_runtime_dir():
     """Returns the directory next to the .exe (frozen) or next to main.py (dev)."""
     if getattr(sys, 'frozen', False):
@@ -693,7 +693,7 @@ async def startup():
             print("[STARTUP] Created default admin user.")
 
 
-# â”€â”€â”€ Pydantic Schemas â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Pydantic Schemas ─────────────────────────────────────────────────────────
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -761,7 +761,7 @@ class AutofillRequest(BaseModel):
     hu_threshold: Optional[float] = None  # if set, snap autofilled contacts to CT blobs
 
 
-# â”€â”€â”€ Auth Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Auth Routes ──────────────────────────────────────────────────────────────
 
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(form: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
@@ -791,7 +791,7 @@ async def me(current_user: User = Depends(get_current_user)):
     return {"username": current_user.username, "role": current_user.role}
 
 
-# â”€â”€â”€ Reconstruction Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Reconstruction Routes ────────────────────────────────────────────────────
 
 @app.get("/api/reconstructions")
 async def list_reconstructions(
@@ -1035,7 +1035,7 @@ async def upload_reconstruction_files(
     return {"status": "processing"}
 
 
-# â”€â”€ Registration mode metadata (sidecar next to ct_to_mri.npy) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Registration mode metadata (sidecar next to ct_to_mri.npy) ──────────────────
 # We record whether the stored transform came from the fast multithreaded path or
 # the deterministic single-threaded path. A JSON sidecar avoids a DB migration
 # (the app uses SQLAlchemy create_all, no Alembic) and travels with the transform.
@@ -1058,7 +1058,7 @@ def _write_reg_meta(ct_abs: str, threads: int, deterministic: bool) -> None:
 
 
 def _read_reg_deterministic(ct_abs: Optional[str]) -> bool:
-    """True if the stored transform is deterministic (or unknown/legacy â†’ assume
+    """True if the stored transform is deterministic (or unknown/legacy → assume
     deterministic, since the historical default was single-threaded)."""
     if not ct_abs:
         return True
@@ -1074,9 +1074,9 @@ def _read_reg_deterministic(ct_abs: Optional[str]) -> bool:
 
 async def _run_registration(recon_id: int, mri_path: str, ct_abs: str,
                             ct_preregistered: bool, threads: int):
-    """Register CTâ†’MRI for a recon, write the mode sidecar, and (re)generate the
+    """Register CT→MRI for a recon, write the mode sidecar, and (re)generate the
     masked CT. Shared by the initial pipeline (fast, multithreaded) and the
-    deterministic re-run endpoint (threads=1). Manages the 'registering'â†’'ready'
+    deterministic re-run endpoint (threads=1). Manages the 'registering'→'ready'
     status transition and resets any prior manual confirmation."""
     from database import AsyncSessionLocal
 
@@ -1096,7 +1096,7 @@ async def _run_registration(recon_id: int, mri_path: str, ct_abs: str,
         if ct_preregistered:
             np.save(transform_path, np.eye(4))
             _write_reg_meta(ct_abs, threads=1, deterministic=True)  # identity is trivially reproducible
-            print(f"[REG] CT pre-registered â€” identity transform saved for recon {recon_id}")
+            print(f"[REG] CT pre-registered — identity transform saved for recon {recon_id}")
         else:
             # threads passed positionally (4th arg) to avoid functools.partial
             await loop.run_in_executor(
@@ -1119,7 +1119,7 @@ async def _run_registration(recon_id: int, mri_path: str, ct_abs: str,
             await db2.commit()
 
 
-# â”€â”€ Multi-start "precise" registration: candidate-basin storage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Multi-start "precise" registration: candidate-basin storage ─────────────────
 # The precise re-run enumerates the distinct MI basins (no metric can rank them)
 # and stores one candidate transform per basin as sidecar files next to
 # ct_to_mri.npy, plus a candidates.json summary, for the reviewer to pick from.
@@ -1164,7 +1164,7 @@ async def _run_multistart_registration(recon_id: int, mri_path: str, ct_abs: str
     """Precise re-run: run the jittered multi-start, cluster into <=2 basins, and
     store one candidate transform per basin for human selection. If only one basin
     is found, apply it directly (like a normal registration). Never auto-picks
-    between multiple basins â€” the reviewer chooses in the fusion viewer."""
+    between multiple basins — the reviewer chooses in the fusion viewer."""
     from database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
@@ -1181,12 +1181,12 @@ async def _run_multistart_registration(recon_id: int, mri_path: str, ct_abs: str
         basins = await loop.run_in_executor(None, run_multistart, mri_path, ct_abs)
 
         if len(basins) <= 1:
-            # Single basin â€” apply directly, no picker needed.
+            # Single basin — apply directly, no picker needed.
             np.save(transform_path, basins[0]["transform"])
             _write_reg_meta(ct_abs, threads=8, deterministic=False)
             print(f"[MULTISTART] recon {recon_id}: single basin, applied directly")
         else:
-            # Multiple basins â€” persist candidates for the reviewer to choose.
+            # Multiple basins — persist candidates for the reviewer to choose.
             cdir = _candidates_dir(ct_abs)
             os.makedirs(cdir, exist_ok=True)
             summary = []
@@ -1448,7 +1448,7 @@ async def reregister(
     current_user: User = Depends(require_editor),
     db: AsyncSession = Depends(get_db),
 ):
-    """Re-run CTâ†’MRI registration when a reviewer judges the fast result poor.
+    """Re-run CT→MRI registration when a reviewer judges the fast result poor.
 
     mode='precise' (default): jittered multi-start, enumerate the distinct MI basins
       into up to 2 candidates for the reviewer to choose (see /registration-candidates).
@@ -1518,7 +1518,7 @@ async def select_registration_candidate(
     return {"selected": idx, "awaiting_basin_selection": False}
 
 
-# â”€â”€ MNI export pipeline â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── MNI export pipeline ─────────────────────────────────────────────────────────
 
 @app.post("/api/reconstructions/{recon_id}/export")
 async def start_mni_export(
@@ -1528,7 +1528,7 @@ async def start_mni_export(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Kick off the MNI152 export pipeline (MRI/CT/electrodes â†’ MNI space).
+    Kick off the MNI152 export pipeline (MRI/CT/electrodes → MNI space).
     Only available once the reconstruction is marked complete. Re-runnable.
     """
     result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
@@ -1636,7 +1636,7 @@ async def download_mni_export(
         raise HTTPException(status_code=404, detail="No export available")
     export_dir = os.path.join(os.path.dirname(_abs(recon.mesh_path)), "export")
     if not os.path.isdir(export_dir):
-        raise HTTPException(status_code=404, detail="No export available â€” run the export first")
+        raise HTTPException(status_code=404, detail="No export available — run the export first")
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1655,7 +1655,7 @@ async def download_mni_export(
     )
 
 
-# â”€â”€ sEEG functional mapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── sEEG functional mapping ─────────────────────────────────────────────────
 # Upload NeurosEEGRead h5 files and render per-electrode band activity on a
 # brain surface. Fully parallel to the reconstruction pipeline: activity comes
 # from the h5, coordinates from this reconstruction (joined to channels by name).
@@ -2339,11 +2339,11 @@ async def get_mri_slice(
             "X-Slice-Count": str(count),
             "X-Slice-Width": str(shape[1]),
             "X-Slice-Height": str(shape[0]),
-            # Plane centre â€” for display only. To test whether a world point is on
+            # Plane centre — for display only. To test whether a world point is on
             # this slice, use the plane headers below; on an oblique volume this
             # value is only correct at the middle of the image.
             "X-Slice-World-Coord": str(world_coord),
-            # Exact slice plane: |normal Â· P - offset| = mm from P to this slice.
+            # Exact slice plane: |normal · P - offset| = mm from P to this slice.
             "X-Slice-Plane-Normal": json.dumps(plane_normal),
             "X-Slice-Plane-Offset": str(plane_offset),
             "X-Voxel-Size-Mm": str(voxel_size_mm),
@@ -2403,7 +2403,7 @@ async def get_fusion_slice(
 ):
     """
     Return a grayscale PNG of the CT resampled into the MRI slice plane, for
-    visual registration QA. Pixel-aligned with /mri-slice at the same axis/slice_idx â€”
+    visual registration QA. Pixel-aligned with /mri-slice at the same axis/slice_idx —
     the frontend composites the two directly on top of each other.
 
     When `candidate` is set, render that precise-mode candidate basin
@@ -2631,7 +2631,7 @@ async def get_share_link(
     return {"share_url": f"/view/{recon_id}?token={recon.share_token}"}
 
 
-# â”€â”€â”€ Electrode Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Electrode Routes ─────────────────────────────────────────────────────────
 
 @app.post("/api/reconstructions/{recon_id}/shafts")
 async def create_shaft(
@@ -2682,7 +2682,7 @@ async def add_contact(
     x_mm, y_mm, z_mm = data.x, data.y, data.z  # fallback
 
     if data.is_world_mm:
-        # Coords already in world mm â€” use directly
+        # Coords already in world mm — use directly
         x_mm, y_mm, z_mm = data.x, data.y, data.z
     elif recon and recon.ct_path and os.path.exists(_abs(recon.ct_path)):
         import nibabel as nib
@@ -2791,7 +2791,7 @@ async def init_contacts(
 ):
     """
     Create empty placeholder contacts for all N slots on a shaft.
-    Contacts have no position yet (x_mm=None) â€” they get positions
+    Contacts have no position yet (x_mm=None) — they get positions
     as the fellow clicks on the CT.
     """
     result = await db.execute(select(ElectrodeShaft).where(ElectrodeShaft.id == shaft_id))
@@ -2848,7 +2848,7 @@ async def autofill_shaft(
         grid_cols=data.grid_cols or 1,
     )
 
-    # Track range of manually placed contacts â€” only snap interpolated contacts,
+    # Track range of manually placed contacts — only snap interpolated contacts,
     # not extrapolated ones beyond the manual range (those may be in the bolt)
     manual_numbers = {c.contact_number for c in data.manual_contacts}
     manual_min = min(manual_numbers)
@@ -2962,7 +2962,7 @@ async def delete_contact(
     return {"message": "Deleted"}
 
 
-# â”€â”€â”€ Delete / Trash Routes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Delete / Trash Routes ────────────────────────────────────────────────────
 
 @app.patch("/api/reconstructions/{recon_id}/soft-delete")
 async def soft_delete_reconstruction(
@@ -3048,7 +3048,7 @@ async def permanently_delete_reconstruction(
                     shutil.rmtree(recon_dir)
                 except Exception as e:
                     print(f"[DELETE] Could not remove dir {recon_dir}: {e}")
-            break  # All files are in the same folder â€” only need to delete once
+            break  # All files are in the same folder — only need to delete once
 
     await db.delete(recon)
     await db.commit()
@@ -3068,7 +3068,7 @@ async def get_ct_threshold_mesh(
 ):
     """
     Return a surface mesh of CT voxels within the HU window (`threshold`,
-    `ceiling`]. `ceiling` is optional â€” omit it for a floor-only (open-top)
+    `ceiling`]. `ceiling` is optional — omit it for a floor-only (open-top)
     threshold. The user adjusts the window interactively until only electrode
     metal is visible, then clicks on the mesh to place contacts.
     Results are cached per (threshold, ceiling) value to avoid redundant work.
@@ -3147,7 +3147,7 @@ async def get_ct_histogram(
     return JSONResponse(hist)
 
 
-# â”€â”€â”€ Serve React frontend (added for standalone .exe build) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─── Serve React frontend (added for standalone .exe build) ──────────────────
 # This block serves the React build folder when running as a PyInstaller bundle.
 # In normal dev mode (npm start on port 3000), this folder won't exist and the
 # block is safely skipped.
