@@ -18,7 +18,11 @@ export const useAppStore = create((set, get) => ({
   },
   logout: () => {
     localStorage.removeItem('token');
-    set({ user: null, token: null });
+    // Editing belongs to whoever switched it on: the next person to sign in at
+    // this workstation starts out viewing. Leaving the open reconstruction is
+    // App's job -- it can tell a sign-out from the startup check dropping a
+    // stale token, which must not disturb a share link the URL just opened.
+    set({ user: null, token: null, isEditorMode: false, placeMode: false });
   },
 
   // Current reconstruction

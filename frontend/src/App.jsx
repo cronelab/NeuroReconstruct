@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import './index.css';
 import { useAppStore } from './store';
 import { getMe } from './api';
@@ -65,6 +65,17 @@ export default function App() {
     setActiveRecon(null);
     window.history.pushState({}, '', '/');
   };
+
+  // Signing out ends the session, not just the credentials: whoever signs in
+  // next lands on the list, not in the previous user's reconstruction, which
+  // the header would otherwise keep showing. Only a signed-in -> signed-out
+  // transition counts; the startup check also calls logout() to drop a stale
+  // token, and a share link the URL has just opened must survive that.
+  const wasSignedIn = useRef(false);
+  useEffect(() => {
+    if (wasSignedIn.current && !user) handleBack();
+    wasSignedIn.current = !!user;
+  }, [user]);
 
   if (authLoading) {
     return (
