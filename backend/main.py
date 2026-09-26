@@ -1622,12 +1622,19 @@ async def _export_mni_background(recon_id: int):
 @app.get("/api/reconstructions/{recon_id}/export/download")
 async def download_mni_export(
     recon_id: int,
-    current_user: User = Depends(require_editor),
+    current_user: Optional[User] = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Download the MNI export artifacts as a zip."""
+    """Download the MNI export artifacts as a zip.
+
+    Any signed-in role may download, viewers included: reading a finished
+    export changes nothing. Starting or re-running one stays editor-only, and a
+    share link alone is not enough -- the zip carries the patient's imaging.
+    """
     import zipfile
 
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Login required")
     result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
     recon = result.scalar_one_or_none()
     if not recon:

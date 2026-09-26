@@ -117,6 +117,18 @@ export default function Header({ onBack, onNavigate }) {
     }
   };
 
+  // Downloading a finished export is open to every signed-in role; starting or
+  // re-running one stays an editor action. The backend enforces both.
+  const downloadExportButton = (
+    <button
+      onClick={handleDownloadExport}
+      style={{ ...s.btn, background: '#002233', color: '#00d4ff', border: '1px solid #00d4ff44' }}
+      title="Download MNI-space NIfTIs, transforms, and electrode coordinates"
+    >
+      ⬇ Download MNI export
+    </button>
+  );
+
   const handleShare = async () => {
     if (!reconstruction) return;
     try {
@@ -233,6 +245,9 @@ export default function Header({ onBack, onNavigate }) {
         );
       })()}
 
+      {/* Viewers get the finished MNI export, without the controls that make one */}
+      {reconstruction && user && !canEdit && isComplete && exportStatus === 'exported' && downloadExportButton}
+
       {/* Actions — only in viewer */}
       {reconstruction && canEdit && (<>
 
@@ -290,13 +305,7 @@ export default function Header({ onBack, onNavigate }) {
         )}
         {isComplete && exportStatus === 'exported' && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-            <button
-              onClick={handleDownloadExport}
-              style={{ ...s.btn, background: '#002233', color: '#00d4ff', border: '1px solid #00d4ff44' }}
-              title="Download MNI-space NIfTIs, transforms, and electrode coordinates"
-            >
-              ⬇ Download MNI export
-            </button>
+            {downloadExportButton}
             <button
               disabled={busy}
               onClick={handleExport}
