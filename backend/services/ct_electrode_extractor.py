@@ -108,13 +108,21 @@ def build_threshold_mesh(
     Returns:
         dict with vertices, faces, vertex_count, face_count
     """
-    # Cache key includes whether a transform is applied and the ceiling value
-    reg_flag = "reg" if transform is not None else "noreg"
+    # The key covers everything the vertices depend on: the HU window, the
+    # transform itself, the brain-mesh centre and the CT file actually read. It
+    # used to carry only a "reg"/"noreg" flag, so after a re-registration replaced
+    # ct_to_mri.npy the mesh built with the OLD transform kept being served -- the
+    # metal drawn millimetres from where snapping and the fusion view put it.
     ceil_flag = "open" if hu_ceiling is None else f"{hu_ceiling:g}"
 
     if cache_dir:
+        reg_flag = "noreg" if transform is None else hashlib.md5(
+            np.ascontiguousarray(transform, dtype=np.float64).tobytes()).hexdigest()[:12]
+        center_flag = ",".join(f"{c:.4f}" for c in mesh_center)
+        src = os.stat(_resolve_ct_path(ct_path))
         cache_key = hashlib.md5(
-            f"{ct_path}_{hu_threshold}_{ceil_flag}_{reg_flag}".encode()
+            f"{ct_path}_{hu_threshold}_{ceil_flag}_{reg_flag}_{center_flag}_"
+            f"{src.st_size}_{src.st_mtime_ns}".encode()
         ).hexdigest()[:12]
         cache_path = os.path.join(cache_dir, f"ct_threshold_{cache_key}.json")
         if os.path.exists(cache_path):

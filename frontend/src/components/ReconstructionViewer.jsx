@@ -192,6 +192,20 @@ export default function ReconstructionViewer({ reconId, shareToken }) {
     }
   }, [isEditorMode, isLocked, reconstruction?.id]);
 
+  // A re-registration moves the CT relative to the MRI, so a metal mesh already
+  // on screen stays where the old registration put it until it is fetched again.
+  // updated_at is the version the fusion view reloads on too. Refetch the window
+  // the user is looking at, and only when THIS reconstruction changed -- opening
+  // a different one is the effect above's job.
+  const shownVersion = useRef({ id: null, at: null });
+  useEffect(() => {
+    const prev = shownVersion.current;
+    shownVersion.current = { id: reconstruction?.id, at: reconstruction?.updated_at };
+    if (ctMeshData && prev.id === reconstruction?.id && prev.at && prev.at !== reconstruction?.updated_at) {
+      loadCtMesh(currentThreshold, currentCeiling);
+    }
+  }, [reconstruction?.id, reconstruction?.updated_at]); // eslint-disable-line
+
   // Keep showCt in sync with editor mode
   useEffect(() => {
     if (isEditorMode) setShowCt(true);
