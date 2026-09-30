@@ -10,6 +10,7 @@ import uuid
 import json
 import hashlib
 import asyncio
+import contextlib
 from typing import List, Optional
 from datetime import datetime
 
@@ -606,6 +607,25 @@ async def startup():
             await db.commit()
             print(f"[STARTUP] Reset {result.rowcount} orphaned export(s) to 'error'.")
 
+    # Registrations run in-process too, so a row still "registering" at startup
+    # lost its worker the same way, and /reregister refuses to start over it. Its
+    # mesh finished before registration began, so it goes back to "ready" -- not
+    # "error", which the viewer reads as a failed mesh and will not open -- with a
+    # note that the fusion review bar shows beside its Re-run button. Same
+    # single-instance assumption as above.
+    async with AsyncSessionLocal() as db:
+        stuck = (await db.execute(
+            select(Reconstruction).where(Reconstruction.status == "registering")
+        )).scalars().all()
+        for recon in stuck:
+            if recon.ct_path:
+                _write_reg_error(_abs(recon.ct_path),
+                                 "Interrupted: the server restarted while it was running")
+            recon.status = "ready"
+        if stuck:
+            await db.commit()
+            print(f"[STARTUP] Reset {len(stuck)} interrupted registration(s) to 'ready'.")
+
     # Lightweight column migration: create_all does not ALTER existing tables, so
     # add seeg_recordings.content_hash (used for upload dedup) if it's missing.
     # SQLite only -- both PRAGMA and "ADD COLUMN" are SQLite spellings, and the
@@ -866,6 +886,7 @@ async def list_reconstructions(
             "registration_deterministic": _read_reg_deterministic(_abs(recon.ct_path)) if recon.ct_path else None,
             "registration_candidates": _read_candidates(_abs(recon.ct_path)) if recon.ct_path else [],
             "awaiting_basin_selection": bool(_read_candidates(_abs(recon.ct_path))) if recon.ct_path else False,
+            "registration_error": _read_reg_error(_abs(recon.ct_path)) if recon.ct_path else None,
             "registration_confirmed": getattr(recon, "registration_confirmed", False) or False,
             "export_status": getattr(recon, "export_status", "none") or "none",
             "exported_at": getattr(recon, "exported_at", None),
@@ -1072,12 +1093,79 @@ def _read_reg_deterministic(ct_abs: Optional[str]) -> bool:
     return True
 
 
+# ── Registration failure note (sidecar next to ct_to_mri.npy) ───────────────────
+# A failed or interrupted registration leaves the reconstruction "ready": its mesh
+# is fine, and "error" would tell the viewer the mesh failed and keep it closed. The
+# failure is recorded here instead, beside whatever transform is still stored (the
+# previous one, or none after a failed first run), for the fusion review bar to
+# show next to its Re-run button. Cleared when a run starts and on confirmation.
+
+def _reg_error_path(ct_abs: str) -> str:
+    return os.path.join(os.path.dirname(ct_abs), "ct_to_mri.error.json")
+
+
+def _write_reg_error(ct_abs: str, message: str) -> None:
+    # ITK errors lead with a source-file location and end with the part worth
+    # reading; the backend log keeps the whole message.
+    lines = [line.strip() for line in message.splitlines() if line.strip()]
+    try:
+        with open(_reg_error_path(ct_abs), "w") as f:
+            json.dump({
+                "error": (lines[-1] if lines else "Registration failed")[:300],
+                "at": datetime.utcnow().isoformat(),
+            }, f)
+    except Exception as e:
+        print(f"[REG] could not record the registration failure: {e}")
+
+
+def _clear_reg_error(ct_abs: str) -> None:
+    try:
+        os.remove(_reg_error_path(ct_abs))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[REG] could not clear the registration failure note: {e}")
+
+
+def _read_reg_error(ct_abs: Optional[str]) -> Optional[str]:
+    """The last run's failure message, or None if it succeeded (or none ran)."""
+    if not ct_abs:
+        return None
+    p = _reg_error_path(ct_abs)
+    if os.path.exists(p):
+        try:
+            with open(p) as f:
+                return json.load(f).get("error") or "Registration failed"
+        except Exception:
+            return "Registration failed"
+    return None
+
+
+# CT→MRI registrations run on this process's thread pool, each on up to 8 ITK
+# threads of its own. Past two at once they only divide the same cores, so later
+# ones wait here, still showing "registering" -- which also keeps /reregister from
+# queueing a second run for the same reconstruction. MAX_CONCURRENT_REGISTRATIONS
+# overrides the cap.
+MAX_CONCURRENT_REGISTRATIONS = max(1, int(os.environ.get("MAX_CONCURRENT_REGISTRATIONS", "2")))
+_registration_slots = asyncio.Semaphore(MAX_CONCURRENT_REGISTRATIONS)
+
+
+@contextlib.asynccontextmanager
+async def _registration_slot(recon_id: int):
+    if _registration_slots.locked():
+        print(f"[REG] recon {recon_id}: {MAX_CONCURRENT_REGISTRATIONS} registration(s) "
+              f"already running -- queued until one finishes")
+    async with _registration_slots:
+        yield
+
+
 async def _run_registration(recon_id: int, mri_path: str, ct_abs: str,
                             ct_preregistered: bool, threads: int):
     """Register CT→MRI for a recon, write the mode sidecar, and (re)generate the
     masked CT. Shared by the initial pipeline (fast, multithreaded) and the
     deterministic re-run endpoint (threads=1). Manages the 'registering'→'ready'
-    status transition and resets any prior manual confirmation."""
+    status transition and resets any prior manual confirmation. A failed run also
+    ends 'ready', with its failure note written (see _write_reg_error)."""
     from database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
@@ -1087,6 +1175,7 @@ async def _run_registration(recon_id: int, mri_path: str, ct_abs: str,
             .values(status="registering", registration_confirmed=False, updated_at=datetime.utcnow())
         )
         await db.commit()
+    _clear_reg_error(ct_abs)
     try:
         from services.registration import (
             register_ct_to_mri, get_transform_path, preprocess_ct, get_masked_ct_path,
@@ -1098,17 +1187,27 @@ async def _run_registration(recon_id: int, mri_path: str, ct_abs: str,
             _write_reg_meta(ct_abs, threads=1, deterministic=True)  # identity is trivially reproducible
             print(f"[REG] CT pre-registered — identity transform saved for recon {recon_id}")
         else:
-            # threads passed positionally (4th arg) to avoid functools.partial
-            await loop.run_in_executor(
-                None, register_ct_to_mri, mri_path, ct_abs, transform_path, threads
-            )
+            async with _registration_slot(recon_id):
+                # threads passed positionally (4th arg) to avoid functools.partial
+                await loop.run_in_executor(
+                    None, register_ct_to_mri, mri_path, ct_abs, transform_path, threads
+                )
             _write_reg_meta(ct_abs, threads=threads, deterministic=(threads == 1))
             print(f"[REG] Registration complete for recon {recon_id} (threads={threads})")
-        # Preprocess CT to strip table/air regardless of registration path
-        masked_ct_path = get_masked_ct_path(ct_abs)
-        await loop.run_in_executor(None, preprocess_ct, ct_abs, masked_ct_path)
     except Exception as e:
+        import traceback
         print(f"[REG] Registration failed for recon {recon_id}: {e}")
+        traceback.print_exc()
+        _write_reg_error(ct_abs, str(e) or type(e).__name__)
+    else:
+        # Preprocess CT to strip table/air regardless of registration path. Its
+        # failure is logged, not reported as a failed registration: the transform
+        # above is already saved.
+        try:
+            masked_ct_path = get_masked_ct_path(ct_abs)
+            await loop.run_in_executor(None, preprocess_ct, ct_abs, masked_ct_path)
+        except Exception as e:
+            print(f"[CT PREP] Masking failed for recon {recon_id}: {e}")
     finally:
         async with AsyncSessionLocal() as db2:
             await db2.execute(
@@ -1173,12 +1272,14 @@ async def _run_multistart_registration(recon_id: int, mri_path: str, ct_abs: str
             .values(status="registering", registration_confirmed=False, updated_at=datetime.utcnow())
         )
         await db.commit()
+    _clear_reg_error(ct_abs)
     try:
         from services.registration import run_multistart, get_transform_path
         transform_path = get_transform_path(ct_abs)
         _clear_candidates(ct_abs)
         loop = asyncio.get_event_loop()
-        basins = await loop.run_in_executor(None, run_multistart, mri_path, ct_abs)
+        async with _registration_slot(recon_id):
+            basins = await loop.run_in_executor(None, run_multistart, mri_path, ct_abs)
 
         if len(basins) <= 1:
             # Single basin — apply directly, no picker needed.
@@ -1199,7 +1300,10 @@ async def _run_multistart_registration(recon_id: int, mri_path: str, ct_abs: str
                 json.dump({"basins": summary, "created_at": datetime.utcnow().isoformat()}, f)
             print(f"[MULTISTART] recon {recon_id}: {len(basins)} basins -> awaiting selection")
     except Exception as e:
+        import traceback
         print(f"[MULTISTART] failed for recon {recon_id}: {e}")
+        traceback.print_exc()
+        _write_reg_error(ct_abs, str(e) or type(e).__name__)
     finally:
         async with AsyncSessionLocal() as db2:
             await db2.execute(
@@ -1377,6 +1481,7 @@ async def get_reconstruction(
         "registration_deterministic": _read_reg_deterministic(_abs(recon.ct_path)) if recon.ct_path else None,
         "registration_candidates": _read_candidates(_abs(recon.ct_path)) if recon.ct_path else [],
         "awaiting_basin_selection": bool(_read_candidates(_abs(recon.ct_path))) if recon.ct_path else False,
+        "registration_error": _read_reg_error(_abs(recon.ct_path)) if recon.ct_path else None,
         "registration_confirmed": getattr(recon, "registration_confirmed", False) or False,
         "export_status": getattr(recon, "export_status", "none") or "none",
         "exported_at": getattr(recon, "exported_at", None),
@@ -1437,6 +1542,10 @@ async def confirm_registration(
         raise HTTPException(status_code=404, detail="Reconstruction not found")
     recon.registration_confirmed = confirmed
     await db.commit()
+    # Confirming says the stored transform is right, which settles any failed
+    # re-run the review bar was still reporting.
+    if confirmed and recon.ct_path:
+        _clear_reg_error(_abs(recon.ct_path))
     return {"registration_confirmed": recon.registration_confirmed}
 
 

@@ -44,17 +44,26 @@ export default function MultiViewLayout({ reconId, viewer3D, shareToken }) {
   const [previewCandidate, setPreviewCandidate] = useState(0);
   const [selectBusy, setSelectBusy] = useState(false);
 
-  // Fusion view is only meaningful when a CT is registered to the MRI.
-  const hasFusion = !!reconstruction?.has_ct && !!reconstruction?.has_registration;
+  // A precise re-run that found >1 distinct MI basin leaves candidates for the
+  // reviewer to pick between (no metric can auto-select the correct one).
+  const candidates = reconstruction?.registration_candidates || [];
+  const awaitingBasin = !!reconstruction?.awaiting_basin_selection && candidates.length > 1;
+  const hasRegistration = !!reconstruction?.has_registration;
+  // Set when the last registration run failed or was interrupted. A transform
+  // from before it, if there is one, is still stored and still what fusion shows.
+  const regError = reconstruction?.registration_error || '';
+  // A re-run in progress supersedes the last run's failure (the backend has
+  // already cleared the note); only the tab has to stay reachable meanwhile.
+  const regFailed = !!regError && !reRegBusy;
+  // Fusion view is only meaningful when a CT is registered to the MRI -- but it is
+  // also where registration is reviewed and re-run, so a failed FIRST run, which
+  // leaves no transform at all, keeps the tab.
+  const hasFusion = !!reconstruction?.has_ct && (hasRegistration || awaitingBasin || !!regError);
   const VIEWS = hasFusion ? [FUSION_VIEW, ...BASE_VIEWS] : BASE_VIEWS;
   const regConfirmed = !!reconstruction?.registration_confirmed;
   // false = the stored transform came from the fast multithreaded path (unverified);
   // true/undefined = deterministic or legacy.
   const regDeterministic = reconstruction?.registration_deterministic !== false;
-  // A precise re-run that found >1 distinct MI basin leaves candidates for the
-  // reviewer to pick between (no metric can auto-select the correct one).
-  const candidates = reconstruction?.registration_candidates || [];
-  const awaitingBasin = !!reconstruction?.awaiting_basin_selection && candidates.length > 1;
 
   const handleConfirmRegistration = useCallback(async (value) => {
     if (!reconstruction || confirmBusy) return;
@@ -300,12 +309,14 @@ export default function MultiViewLayout({ reconId, viewer3D, shareToken }) {
             ) : (
             /* Registration review / confirm bar */
             <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12, padding: '8px 14px', background: regConfirmed ? '#0d2a1a' : '#1a1000', borderBottom: `1px solid ${regConfirmed ? '#00e67633' : '#ffab4033'}` }}>
-              <span style={{ fontSize: 12, fontFamily: 'IBM Plex Sans, sans-serif', color: regConfirmed ? '#00e676' : '#ffab40', fontWeight: 600 }}>
-                {regConfirmed ? '✓ Registration reviewed & confirmed' : '⚠ Registration not yet reviewed'}
+              <span style={{ fontSize: 12, fontFamily: 'IBM Plex Sans, sans-serif', color: regConfirmed ? '#00e676' : regFailed ? '#ff5252' : '#ffab40', fontWeight: 600 }}>
+                {regConfirmed ? '✓ Registration reviewed & confirmed' : regFailed ? '⚠ Registration failed' : '⚠ Registration not yet reviewed'}
               </span>
               <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Sans, sans-serif', flex: 1 }}>
                 {reRegError
                   ? <span style={{ color: '#ff5252' }}>{reRegError}</span>
+                  : (regFailed && !regConfirmed)
+                    ? <span style={{ color: '#ff5252' }}>{regError}{hasRegistration ? ' — showing the registration from before that run.' : ''}</span>
                   : (!regConfirmed && !regDeterministic)
                     ? 'Fast registration — review carefully. Sweep the MRI↔CT blend; if edges jump, re-run precise.'
                     : 'Sweep the MRI↔CT blend and check that skull, ventricle, and midline edges stay aligned.'}
@@ -330,21 +341,26 @@ export default function MultiViewLayout({ reconId, viewer3D, shareToken }) {
                     title="Re-run registration with a jittered multi-start and pick between the distinct results (~7–8 min)"
                     style={{ fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 4, cursor: 'pointer', background: 'transparent', color: '#ffab40', border: '1px solid #ffab4066', fontFamily: 'IBM Plex Sans, sans-serif' }}
                   >
-                    ↻ Looks off — Re-run precise
+                    {regFailed ? '↻ Re-run precise' : '↻ Looks off — Re-run precise'}
                   </button>
-                  <button
-                    onClick={() => handleConfirmRegistration(true)}
-                    disabled={confirmBusy}
-                    style={{ fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 4, cursor: 'pointer', background: '#0d2a1a', color: '#00e676', border: '1px solid #00e67655', fontFamily: 'IBM Plex Sans, sans-serif', opacity: confirmBusy ? 0.6 : 1 }}
-                  >
-                    ✓ Looks correct — Confirm
-                  </button>
+                  {/* Nothing to confirm after a failed first run */}
+                  {hasRegistration && (
+                    <button
+                      onClick={() => handleConfirmRegistration(true)}
+                      disabled={confirmBusy}
+                      style={{ fontSize: 12, fontWeight: 600, padding: '5px 14px', borderRadius: 4, cursor: 'pointer', background: '#0d2a1a', color: '#00e676', border: '1px solid #00e67655', fontFamily: 'IBM Plex Sans, sans-serif', opacity: confirmBusy ? 0.6 : 1 }}
+                    >
+                      ✓ Looks correct — Confirm
+                    </button>
+                  )}
                 </>
               )}
             </div>
             )}
             <div style={{ flex: 1, minHeight: 0 }}>
-              {activeView === 'fusion' && <FusionSliceViewer reconId={reconId} version={reconstruction?.updated_at} candidate={awaitingBasin ? previewCandidate : undefined} />}
+              {activeView === 'fusion' && ((hasRegistration || awaitingBasin)
+                ? <FusionSliceViewer reconId={reconId} version={reconstruction?.updated_at} candidate={awaitingBasin ? previewCandidate : undefined} />
+                : <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#4a5568', fontSize: 12, fontFamily: 'IBM Plex Sans, sans-serif' }}>No CT registration to show yet.</div>)}
             </div>
           </div>
         )}

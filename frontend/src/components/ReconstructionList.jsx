@@ -80,6 +80,13 @@ function ReconCard({ recon, onSelect, canEdit, onDelete }) {
         </div>
       )}
 
+      {/* The last registration run failed or was interrupted; re-run from the fusion view */}
+      {recon.registration_error && (
+        <div title={recon.registration_error} style={{ fontSize: 11, color: '#ff5252', fontFamily: mono, letterSpacing: '0.04em', marginBottom: 10 }}>
+          ⚠ CT registration failed
+        </div>
+      )}
+
       {/* Co-reg block popup */}
       {coregBlock && (
         <div

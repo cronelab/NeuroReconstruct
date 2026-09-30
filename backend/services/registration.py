@@ -11,6 +11,10 @@ Usage:
     # apply: mri_world = matrix @ [ct_x, ct_y, ct_z, 1]
 """
 
+import collections
+import contextlib
+import threading
+
 import numpy as np
 import os
 import time
@@ -19,6 +23,53 @@ import time
 # before this import so ITK initializes its thread pool with 1 thread.
 import SimpleITK as sitk
 sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
+
+
+# ── The thread count is process-wide, so registrations share it ───────────────
+# A registration's thread count can only be set through SimpleITK's process-wide
+# default, and it is read inside Execute(), where ITK builds the metric and the
+# pyramid filters. A count set on the ImageRegistrationMethod alone leaves
+# Execute on one core (measured: 8.7 s on 1.0 cores, against 2.1 s on 5.2 with
+# the default raised). Each run used to raise the default and reset it to 1 in
+# a `finally`, so when two overlapped, whichever finished first dropped the
+# other to one thread for the rest of its run.
+#
+# Runs therefore lease the setting. Runs wanting the same count share it, and
+# it returns to 1 only when the last of them leaves; a run wanting a different
+# count waits for it to come free. Leases go in arrival order, so a single-
+# threaded run is never starved by multithreaded ones, and never runs with
+# another run's threads.
+_threads = threading.Condition()
+_threads_queue = collections.deque()    # waiting requests, oldest first
+_threads_holders = 0
+_threads_count = 1
+
+
+@contextlib.contextmanager
+def _itk_threads(n: int):
+    """Hold SimpleITK's process-wide thread count at n for the duration."""
+    global _threads_holders, _threads_count
+    request = object()
+    with _threads:
+        _threads_queue.append(request)
+        while not (_threads_queue[0] is request
+                   and (_threads_holders == 0 or _threads_count == n)):
+            _threads.wait()
+        _threads_queue.popleft()
+        if _threads_holders == 0:
+            sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(n)
+            _threads_count = n
+        _threads_holders += 1
+        _threads.notify_all()           # the next in line may be able to share
+    try:
+        yield
+    finally:
+        with _threads:
+            _threads_holders -= 1
+            if _threads_holders == 0:
+                sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
+                _threads_count = 1
+            _threads.notify_all()
 
 
 def register_ct_to_mri(mri_path: str, ct_path: str, out_path: str, threads: int = 1,
@@ -43,14 +94,12 @@ def register_ct_to_mri(mri_path: str, ct_path: str, out_path: str, threads: int 
         (4, 4) numpy array: CT world RAS -> MRI world RAS
     """
     # Per-call thread control. The module/launcher pin the global default to 1;
-    # here we raise it only for the duration of this registration, then restore
-    # it in the finally so nothing else inherits a nondeterministic default.
+    # this registration holds it at `threads` (shared with any concurrent run that
+    # wants the same count, see _itk_threads), and it returns to 1 afterwards so
+    # nothing else inherits a nondeterministic default.
     threads = max(1, int(threads))
-    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
-    try:
+    with _itk_threads(threads):
         return _register_ct_to_mri_impl(mri_path, ct_path, out_path, threads, init_jitter)
-    finally:
-        sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
 
 
 def _make_registration_method():
@@ -252,8 +301,7 @@ def run_multistart(mri_path: str, ct_path: str, k: int = 11, threads: int = 8,
     presents each basin for human selection — no automatic winner is chosen,
     because no metric can rank the near-degenerate basins."""
     threads = max(1, int(threads))
-    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
-    try:
+    with _itk_threads(threads):
         mri_sitk = sitk.ReadImage(mri_path, sitk.sitkFloat32)
         ct_sitk = sitk.ReadImage(ct_path, sitk.sitkFloat32)
         transforms, metrics = [], []
@@ -273,8 +321,6 @@ def run_multistart(mri_path: str, ct_path: str, k: int = 11, threads: int = 8,
             transforms.append(_final_to_ct_to_mri(final, metric, allow_identity=False))
             metrics.append(metric)
             print(f"[MULTISTART] start {s+1}/{k}: {time.perf_counter()-_t0:.0f} s, metric {metric:.4f}")
-    finally:
-        sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
 
     points = _anatomy_world_points(ct_path)
     basins = cluster_basins(transforms, points, metrics=metrics,
@@ -419,8 +465,7 @@ def register_secondary_to_primary(primary_path: str, secondary_path: str,
         volume already carries the alignment.
     """
     threads = max(1, int(threads))
-    sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(threads)
-    try:
+    with _itk_threads(threads):
         fixed_raw = sitk.ReadImage(primary_path, sitk.sitkFloat32)
         moving_raw = read_scan_for_registration(secondary_path)
         is_rgb = moving_raw.GetNumberOfComponentsPerPixel() > 1
@@ -488,8 +533,6 @@ def register_secondary_to_primary(primary_path: str, secondary_path: str,
         print(f"[SEC REG] Resampled secondary written to {out_path}")
 
         return np.linalg.inv(_sitk_transform_to_ras_matrix(final_transform))
-    finally:
-        sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
 
 
 def load_transform(transform_path: str) -> np.ndarray:
