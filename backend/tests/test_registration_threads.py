@@ -20,10 +20,10 @@ What these cover:
   2. A run wanting a different count waits its turn, in arrival order.
   3. Real registrations side by side each run on the count they asked for,
      and a single-threaded one never overlaps a multithreaded one.
-
-Results are not compared bit for bit: metric sampling is seeded from the clock
-(SetMetricSamplingPercentage's default), so even two single-threaded runs of one
-pair differ slightly.
+  4. A single-threaded registration repeats bit for bit. Metric sampling used to
+     be seeded from the clock (SetMetricSamplingPercentage's default), so the
+     "deterministic" re-run was nothing of the kind: three of PY26N013 landed up
+     to 17 mm apart.
 """
 
 import concurrent.futures
@@ -177,8 +177,26 @@ def test_registrations_run_on_the_count_they_asked_for():
     print("test_registrations_run_on_the_count_they_asked_for OK")
 
 
+def test_single_threaded_registration_repeats_exactly():
+    with tempfile.TemporaryDirectory() as d:
+        head = _phantom_path(d)
+        img = sitk.ReadImage(head, sitk.sitkFloat32)
+        pose = sitk.Euler3DTransform()
+        pose.SetRotation(np.radians(1.0), 0.0, 0.0)
+        pose.SetTranslation((2.0, 0.0, 0.0))
+        moved = os.path.join(d, "moved.nii.gz")
+        sitk.WriteImage(sitk.Resample(img, img, pose, sitk.sitkLinear, 0.0), moved)
+
+        first, second = (register_ct_to_mri(head, moved, os.path.join(d, f"{i}.npy"), 1) for i in "ab")
+        # Identity would mean nothing was optimised, and would repeat trivially.
+        assert not np.allclose(first, np.eye(4)), "phantom did not register"
+        assert np.array_equal(first, second), f"single-threaded runs differ:\n{first}\nvs\n{second}"
+    print("test_single_threaded_registration_repeats_exactly OK")
+
+
 if __name__ == "__main__":
     test_shared_count_is_held_until_the_last_run_leaves()
     test_a_different_count_waits_its_turn()
     test_registrations_run_on_the_count_they_asked_for()
+    test_single_threaded_registration_repeats_exactly()
     print("\nAll registration-thread tests passed.")

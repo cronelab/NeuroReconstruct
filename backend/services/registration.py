@@ -110,8 +110,11 @@ def _make_registration_method():
     # Mattes mutual information — best for multi-modal MRI/CT
     reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=100)
     reg.SetMetricSamplingStrategy(reg.REGULAR)
-    # 50% sampling: enough signal to avoid local minima, still deterministic
-    reg.SetMetricSamplingPercentage(0.50)
+    # 50% sampling: enough signal to avoid local minima. ITK jitters even REGULAR
+    # sample points, and SimpleITK seeds that from the wall clock unless given a
+    # seed -- which left single-threaded runs unrepeatable (three of PY26N013 landed
+    # up to 17 mm apart). Seeded, a single-threaded run is the same bits every time.
+    reg.SetMetricSamplingPercentage(0.50, seed=1234)
     reg.SetInterpolator(sitk.sitkLinear)
     # Gradient descent with tighter convergence
     reg.SetOptimizerAsGradientDescent(
