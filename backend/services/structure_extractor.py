@@ -480,10 +480,15 @@ def _structures_complete(output_dir: str) -> bool:
 
 
 def _load_cached_structures(output_dir: str) -> dict:
-    """Structure meshes already written to disk for this reconstruction."""
+    """Structure meshes already written to disk for this reconstruction.
+
+    Each file carries the colour the catalog had when it was extracted. The
+    catalog wins: recolouring a structure must not need a re-extraction, which is
+    an 8.9 GB parcellation per reconstruction.
+    """
     structures_dir = os.path.join(output_dir, "structures")
     cached = {}
-    for key in ALL_STRUCTURES:
+    for key, info in ALL_STRUCTURES.items():
         out_path = os.path.join(structures_dir, f"{key}.json")
         if os.path.exists(out_path):
             try:
@@ -493,6 +498,8 @@ def _load_cached_structures(output_dir: str) -> dict:
                 # A file half-written by a process that was killed mid-dump.
                 # Treat it as absent so it gets recomputed.
                 print(f"[STRUCT] Ignoring unreadable cache entry: {out_path}")
+                continue
+            cached[key]["color"] = info["color"]
     return cached
 
 

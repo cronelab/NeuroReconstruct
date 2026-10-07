@@ -609,6 +609,10 @@ def _load_valid_cache(recon_dir):
     # so it gains one, rather than trusting it for the rest of its life.
     if got.get("inputs") != _inputs_fingerprint(recon_dir):
         return None
+    # Colours come from the catalog as it is now, not as it was at build time,
+    # so recolouring a parcel does not cost every reconstruction a rebuild.
+    parcel_colors, _ = _cortical_catalog()
+    got["parcel_colors"] = {str(k): c for k, c in parcel_colors.items()}
     return got
 
 
