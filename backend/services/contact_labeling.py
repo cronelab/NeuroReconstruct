@@ -57,6 +57,20 @@ NON_CATALOG_LABELS = {
     31: "Left choroid plexus",
     63: "Right choroid plexus",
     77: "White matter hypointensity",
+    # FreeSurfer's aseg has these; the fast DKT network never emits them, so
+    # they only appear once a FreeSurfer parcellation is the active source.
+    30: "Left vessel",
+    62: "Right vessel",
+    72: "5th ventricle",
+    80: "Non-WM hypointensity",
+    85: "Optic chiasm",
+    251: "Corpus callosum (posterior)",
+    252: "Corpus callosum (mid-posterior)",
+    253: "Corpus callosum (central)",
+    254: "Corpus callosum (mid-anterior)",
+    255: "Corpus callosum (anterior)",
+    1000: "Left cortex (unlabeled)",
+    2000: "Right cortex (unlabeled)",
 }
 
 DEFAULT_SEARCH_RADIUS_MM = 2.0
@@ -190,12 +204,15 @@ def label_contacts(label_volume_path: str, contacts_world_ras,
     return out
 
 
-def write_contact_structure_csv(csv_path: str, contacts: list, labels: list) -> dict:
+def write_contact_structure_csv(csv_path: str, contacts: list, labels: list,
+                                parcellation: str = "fast") -> dict:
     """
     Write ``electrodes_structures.csv``.
 
-    contacts: dicts with shaft_name / contact_number (same order as labels)
-    labels:   output of ``label_contacts``
+    contacts:     dicts with shaft_name / contact_number (same order as labels)
+    labels:       output of ``label_contacts``
+    parcellation: which label volume they came from ("fast" | "freesurfer"),
+                  written on every row so the CSV is self-describing
 
     Returns summary counts for the manifest/logs.
     """
@@ -205,7 +222,7 @@ def write_contact_structure_csv(csv_path: str, contacts: list, labels: list) -> 
     with open(csv_path, "w", newline="") as f:
         w = _csv.writer(f)
         w.writerow(["shaft_name", "contact_number", "structure", "group",
-                    "distance_mm", "vote_share", "voxel_content"])
+                    "distance_mm", "vote_share", "voxel_content", "parcellation"])
         for c, lab in zip(contacts, labels):
             d = lab["distance_mm"]
             if d == 0.0:
@@ -221,6 +238,7 @@ def write_contact_structure_csv(csv_path: str, contacts: list, labels: list) -> 
                 "" if d is None else f"{d:.2f}",
                 "" if vs is None else f"{vs:.2f}",
                 lab["voxel_content"],
+                parcellation,
             ])
 
     return {"inside_structure": n_inside,

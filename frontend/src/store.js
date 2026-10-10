@@ -119,6 +119,8 @@ export const useAppStore = create((set, get) => ({
       structuresData: null,
       corticalData: null,
       structureVisibleSaved: null,
+      parcellation: null,
+      corticalAtlas: 'dkt',
     }
   )),
   meshData: null,
@@ -163,6 +165,19 @@ export const useAppStore = create((set, get) => ({
   setBrainRenderMode: (m) => set({ brainRenderMode: m }),
   corticalColorBy: 'plain',      // 'plain' (white, sulci shaded) | 'parcellation'
   setCorticalColorBy: (c) => set({ corticalColorBy: c }),
+  // Which parcellation colours the surface when corticalColorBy is
+  // 'parcellation'. The fast surface only has 'dkt'; a FreeSurfer import also
+  // carries 'desikan' and 'destrieux' (whichever its zip included).
+  corticalAtlas: 'dkt',
+  setCorticalAtlas: (a) => set({ corticalAtlas: a }),
+  // Which parcellation this reconstruction's structures, contact labels and
+  // cortical surface come from, plus the FreeSurfer import's status:
+  // { parcellation_source: 'fast'|'freesurfer', freesurfer: {...}|null }, the
+  // shape GET /freesurfer returns. Scoped to activeReconId like the meshes.
+  parcellation: null,
+  setParcellation: (p, forReconId) => set((s) => (
+    forReconId !== undefined && forReconId !== s.activeReconId ? {} : { parcellation: p }
+  )),
   // Decoded once and shared by both canvases so the typed arrays are not
   // duplicated per viewer. null = not loaded, 'unavailable' = this reconstruction
   // has no DKT volume, so the mode is hidden rather than offered and broken.

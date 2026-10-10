@@ -69,7 +69,16 @@ function parcelPalette(parcelColors) {
   return out;
 }
 
-function writeColors(attr, { sulc, parcel, sulcRangeMm, parcelColors }, colorBy) {
+// The parcellation a colour/hover should use: the chosen atlas when this
+// surface has it, else DKT (every surface has that one).
+function atlasOf(data, atlas) {
+  const a = data?.atlases?.[atlas] || data?.atlases?.dkt;
+  return a || { parcel: data?.parcel, colors: data?.parcelColors, labels: data?.parcelLabels };
+}
+
+function writeColors(attr, data, colorBy, atlas) {
+  const { sulc, sulcRangeMm } = data;
+  const { parcel, colors: parcelColors } = atlasOf(data, atlas);
   const shade = shadeFactors(sulc, sulcRangeMm);
   const arr = attr.array;
   if (colorBy === 'parcellation') {
@@ -165,6 +174,7 @@ export function useCorticalSurfaceData(reconId, token) {
  */
 export default function CorticalSurface({ data, colorBy = 'plain', onHover, interactive = true }) {
   const meshRef = useRef();
+  const corticalAtlas = useAppStore(s => s.corticalAtlas);
 
   const geometry = useMemo(() => {
     if (!data?.positions) return null;
@@ -182,8 +192,8 @@ export default function CorticalSurface({ data, colorBy = 'plain', onHover, inte
   // Recolor in place. Allocating a fresh BufferAttribute on every toggle would
   // orphan a GPU buffer each time, and this one is ~1.5 MB.
   useEffect(() => {
-    if (geometry && data) writeColors(geometry.getAttribute('color'), data, colorBy);
-  }, [geometry, data, colorBy]);
+    if (geometry && data) writeColors(geometry.getAttribute('color'), data, colorBy, corticalAtlas);
+  }, [geometry, data, colorBy, corticalAtlas]);
 
   // Three.js does not garbage-collect GPU buffers. At 250k faces this is the
   // first mesh in the app large enough that leaking it on every mode switch
@@ -191,14 +201,15 @@ export default function CorticalSurface({ data, colorBy = 'plain', onHover, inte
   useEffect(() => () => geometry?.dispose(), [geometry]);
 
   const handleMove = React.useCallback((e) => {
-    if (!onHover || !data?.parcel || !e.face) return;
+    const { parcel, colors, labels } = atlasOf(data, corticalAtlas);
+    if (!onHover || !parcel || !e.face) return;
     e.stopPropagation();
-    const id = data.parcel[e.face.a];
+    const id = parcel[e.face.a];
     onHover(id ? {
-      label: data.parcelLabels?.[id] || `label ${id}`,
-      color: data.parcelColors?.[id] || '#c8d4e0',
+      label: labels?.[id] || `label ${id}`,
+      color: colors?.[id] || '#c8d4e0',
     } : null);
-  }, [onHover, data]);
+  }, [onHover, data, corticalAtlas]);
 
   const handleOut = React.useCallback(() => onHover?.(null), [onHover]);
 

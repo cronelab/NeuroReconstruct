@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useAppStore } from '../store';
+import FreeSurferSource from './FreeSurferSource';
 
 // Checkbox that can render a dash (indeterminate) when only some descendants are checked
 export function TriStateCheckbox({ checked, indeterminate, onChange, onClick, style }) {
@@ -46,7 +47,10 @@ export default function StructurePanel({
     setBrainRenderMode,
     corticalColorBy,
     setCorticalColorBy,
+    corticalAtlas,
+    setCorticalAtlas,
     corticalData,
+    parcellation,
   } = useAppStore();
   const cortical = brainRenderMode === 'cortical';
   const corticalUnavailable = corticalData === 'unavailable';
@@ -59,6 +63,46 @@ export default function StructurePanel({
   };
 
   const hasStructures = structuresData && Object.keys(structuresData).length > 0;
+  // A FreeSurfer import ships its own pial surface, so the cortical mode does
+  // not have to wait for the structure meshes the fast surface is built from.
+  const fsActive = parcellation?.parcellation_source === 'freesurfer';
+  const offerModes = hasStructures || fsActive;
+
+  // Switching parcellation source drops the structure meshes (they were built
+  // from the other label volume). If they were showing, rebuild them from the
+  // new one rather than leaving the user to notice and press Load again.
+  const hadStructures = useRef(false);
+  useEffect(() => { if (hasStructures) hadStructures.current = true; }, [hasStructures]);
+  const reloadPending = useRef(false);
+  const loadRef = useRef(handleLoad);
+  loadRef.current = handleLoad;
+  const handleSourceChanged = useCallback(() => {
+    reloadPending.current = hadStructures.current;
+    hadStructures.current = false;
+  }, []);
+  useEffect(() => {
+    if (reloadPending.current && !structuresData) {
+      reloadPending.current = false;
+      loadRef.current();
+    }
+  }, [structuresData]);
+
+  // Colour choices: the fast surface has one parcellation (DKT); a FreeSurfer
+  // surface carries every atlas its zip had.
+  const atlases = corticalData && corticalData !== 'unavailable' && corticalData.atlases
+    ? Object.entries(corticalData.atlases) : [];
+  const colourChoices = atlases.length > 1
+    ? [['plain', 'Plain'], ...atlases.map(([key, a]) => [`atlas:${key}`, a.name])]
+    : [['plain', 'Plain'], ['atlas:dkt', 'Parcellation']];
+  const colourActive = (c) => (c === 'plain'
+    ? corticalColorBy === 'plain'
+    : corticalColorBy === 'parcellation'
+      && (atlases.length > 1 ? `atlas:${corticalAtlas}` === c : true));
+  const pickColour = (c) => {
+    if (c === 'plain') { setCorticalColorBy('plain'); return; }
+    setCorticalAtlas(c.slice('atlas:'.length));
+    setCorticalColorBy('parcellation');
+  };
   const allKeys = hasStructures
     ? Object.entries(structuresData).filter(([, s]) => s.vertices).map(([k]) => k)
     : [];
@@ -91,9 +135,12 @@ export default function StructurePanel({
         )}
       </div>
 
-      {/* Brain render mode. The cortical surface is derived from the same DKT
-          volume the structures come from, so it is only offered once they exist. */}
-      {hasStructures && (
+      <FreeSurferSource onSourceChanged={handleSourceChanged} />
+
+      {/* Brain render mode. The fast cortical surface is derived from the same
+          DKT volume the structures come from, so it is only offered once they
+          exist -- or straight away when FreeSurfer's own surface is active. */}
+      {offerModes && (
         <div style={{ display: 'flex', gap: 4, marginBottom: 8 }}>
           {[['structures', 'Structures'], ['cortical', 'Cortical surface']].map(([mode, label]) => (
             <button key={mode}
@@ -102,7 +149,9 @@ export default function StructurePanel({
               title={mode === 'cortical'
                 ? (corticalUnavailable
                     ? 'Not available for this reconstruction'
-                    : 'One opaque pial surface: sulci and gyri read clearly, but contacts inside the brain are hidden')
+                    : fsActive
+                  ? "FreeSurfer's lh/rh pial surfaces: opaque, so contacts inside the brain are hidden"
+                  : 'One opaque pial surface: sulci and gyri read clearly, but contacts inside the brain are hidden')
                 : 'Nested translucent parcellation meshes; depth contacts stay visible'}
               style={{
                 flex: 1, fontSize: 11, padding: '4px 6px', borderRadius: 4, cursor:
@@ -121,17 +170,17 @@ export default function StructurePanel({
 
       {/* Cortical mode replaces the opacity slider and the structure tree: the
           surface is opaque by design, and colour is the only choice left. */}
-      {hasStructures && cortical && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+      {offerModes && cortical && (
+        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginBottom: 4 }}>
           <span style={{ fontSize: 11, color: '#7a8a99', fontFamily: 'IBM Plex Mono, monospace' }}>Colour</span>
-          {[['plain', 'Plain'], ['parcellation', 'Parcellation']].map(([c, label]) => (
-            <button key={c} onClick={() => setCorticalColorBy(c)}
+          {colourChoices.map(([c, label]) => (
+            <button key={c} onClick={() => pickColour(c)}
               style={{
                 flex: 1, fontSize: 11, padding: '3px 6px', borderRadius: 4, cursor: 'pointer',
-                fontFamily: 'IBM Plex Mono, monospace',
-                background: corticalColorBy === c ? '#16324a' : 'none',
-                border: `1px solid ${corticalColorBy === c ? '#74C0FC' : '#1e2530'}`,
-                color: corticalColorBy === c ? '#cfe6ff' : '#7a8a99',
+                fontFamily: 'IBM Plex Mono, monospace', whiteSpace: 'nowrap',
+                background: colourActive(c) ? '#16324a' : 'none',
+                border: `1px solid ${colourActive(c) ? '#74C0FC' : '#1e2530'}`,
+                color: colourActive(c) ? '#cfe6ff' : '#7a8a99',
               }}>
               {label}
             </button>

@@ -201,7 +201,8 @@ off. At least one pane always stays on.
 | `ct_electrode_extractor.py` | CT mesh generation (HU threshold + marching cubes). `snap_to_blob_centroid()` snaps a clicked world position to the nearest bright CT blob centroid within 8mm. |
 | `electrode_service.py` | Autofill: cubic spline fit parameterized by contact number. Interpolates between placed contacts, linear extrapolation beyond the manual range. Blob-snap applied to interpolated contacts only. |
 | `mni_registration.py` | Results-export pipeline. Registers the patient MRI to MNI152 via **ANTs** affine + SyN (`SyNRA`), warps the CT into MNI using the existing `ct_to_mri.npy`, and maps electrode contacts (RAS points, LPS-flipped for ANTs) into MNI space. Writes `MRI_mni.nii.gz`, `CT_mni.nii.gz`, transforms, `electrodes_mni.csv`/`.json`, and `export_manifest.json` to `<recon>/export/`. CPU-only, deterministic. |
-| `contact_labeling.py` | Labels each contact with the patient-specific DKT structure it sits in — or, for white-matter contacts, a plurality vote among structure voxels within a 2mm radius (reports structure, group, `distance_mm`, `vote_share`, `voxel_content`), leaving genuinely off-structure contacts unassigned. Native MRI space (no atlas warp); uses the cached `structures_cortical.nii.gz`. Writes `electrodes_structures.csv`. |
+| `contact_labeling.py` | Labels each contact with the patient-specific DKT structure it sits in — or, for white-matter contacts, a plurality vote among structure voxels within a 2mm radius (reports structure, group, `distance_mm`, `vote_share`, `voxel_content`), leaving genuinely off-structure contacts unassigned. Native MRI space (no atlas warp); uses the cached `structures_cortical.nii.gz`. Writes `electrodes_structures.csv`, whose `parcellation` column says which source (fast / freesurfer) the labels came from. |
+| `freesurfer_import.py` | Imports uploaded **FreeSurfer outputs** (a zipped recon-all or FastSurfer subject folder) as an alternative parcellation source: converts lh/rh pial from tkr-RAS to the app frame using `orig.mgz`'s full matrices, resamples `aparc.DKTatlas+aseg` onto the MRI grid, and checks/repairs alignment against `mri.nii.gz`. `activate_source` swaps which label volume `structures_cortical.nii.gz` holds. See [FreeSurfer outputs](#freesurfer-outputs-gold-standard-surfaces--parcellation). |
 | `seeg_service.py` | sEEG **functional mapping**. Reads a [NeurosEEGRead](https://github.com/cronelab/NeuroRead) HDF5 recording, computes a per-channel band-power envelope (Butterworth bandpass + Hilbert), and renders it on the brain by joining h5 channels to localized contacts **by shaft name + contact number** (the h5 carries no coordinates). Trial-averaged (event-related z-score) or continuous modes. See the [sEEG Functional Mapping](#seeg-functional-mapping) section. The Hilbert envelope is cached on disk per (file, band); computed results are memoized in-process. |
 
 ### Results export
@@ -310,6 +311,47 @@ User clicks "Load" button
   → Returns structure meshes as vertices/faces in world RAS space
   → Viewer3D renders each structure as a semi-transparent mesh
 ```
+
+### FreeSurfer outputs (gold-standard surfaces + parcellation)
+
+The in-app parcellation (the **Fast** source) is a DKT network plus a display
+surface built from its labels. It is quick, but it is not a FreeSurfer pial
+surface. To use real FreeSurfer surfaces, run FreeSurfer **outside the app**:
+the companion repo [`cronelab/fspipe`](https://github.com/cronelab/fspipe) (`fspipe run … --export`) runs
+recon-all 8.2 or FastSurfer on a local GPU workstation. Then upload the zip it
+produces, or a zip of any recon-all subject folder:
+**Brain panel → Source → ⇪ Upload FreeSurfer (.zip)** (editors).
+
+```
+POST /freesurfer (zip, streamed to disk; central directory vetted in-request)
+  → background worker (services/freesurfer_import.py, HEAVY_JOB_LOCK):
+      extract whitelisted files → orig.mgz-vs-mri.nii.gz correlation
+      (rigid registration if FreeSurfer ran on another T1) →
+      lh+rh pial → app frame (full-resolution, ~300k vertices) + DKT /
+      Desikan / Destrieux per-vertex parcels → freesurfer/cortical_surface.json
+      aparc.DKTatlas+aseg → nearest-neighbour onto the MRI grid →
+      freesurfer/labels_dkt_on_mri.nii.gz
+  → activate "freesurfer": structures_cortical.nii.gz ← FreeSurfer labels
+    (fast labels kept as structures_cortical.fast.nii.gz), structure meshes and
+    the fast surface cache dropped, MNI export marked stale
+```
+
+- **Everything follows the switch.** Structure meshes, contact hover/auto-labels,
+  the 2D overlay and `electrodes_structures.csv` all read
+  `structures_cortical.nii.gz`. They therefore follow the **Fast ⇄ FreeSurfer**
+  toggle with no code of their own.
+- **The cortical surface.** In FreeSurfer mode the cortical-surface view serves
+  the imported pial surface. Its colour row offers every atlas the zip contained.
+- **Which source is active.** `structures_cortical.source` records it. There is
+  no DB column; like the rest of the structures state it lives with the files.
+- **Replacing the primary MRI** removes the import, because it was placed against
+  the old grid.
+
+Endpoints:
+- `GET /api/reconstructions/{id}/freesurfer`
+- `POST /api/reconstructions/{id}/freesurfer` (multipart `fs_zip`)
+- `DELETE /api/reconstructions/{id}/freesurfer`
+- `POST /api/reconstructions/{id}/parcellation-source` `{"source": "fast"|"freesurfer"}`
 
 ---
 
@@ -461,4 +503,4 @@ Register users via the API: `POST /api/auth/register`
 - [ ] Share link read-only viewer (token exists in DB, UI not fully wired)
 - [ ] Cloud deployment (JH Research Computing / AWS)
 - [ ] Postgres migration for multi-user cloud deployment
-- [ ] FreeSurfer surface import (upload lh.pial/rh.pial instead of marching cubes)
+- [x] FreeSurfer surface import — shipped: upload a zipped recon-all/FastSurfer subject; real lh/rh pial surfaces and FreeSurfer's DKT parcellation become a switchable source. See [FreeSurfer outputs](#freesurfer-outputs-gold-standard-surfaces--parcellation).

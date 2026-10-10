@@ -626,6 +626,22 @@ async def startup():
             await db.commit()
             print(f"[STARTUP] Reset {len(stuck)} interrupted registration(s) to 'ready'.")
 
+    # FreeSurfer imports run in-process too (their worker is a child of this
+    # one), so a status still "processing" at startup will never finish. Its
+    # staging directory is discarded by the next import; an earlier good import,
+    # if any, is untouched.
+    try:
+        import glob as _glob
+        from services.freesurfer_import import STATUS_NAME, read_status, write_status
+        for status_path in _glob.glob(os.path.join(DATA_DIR, "*", STATUS_NAME)):
+            recon_dir = os.path.dirname(status_path)
+            if (read_status(recon_dir) or {}).get("state") == "processing":
+                write_status(recon_dir, "error",
+                             "Interrupted: the server restarted during the import; upload again")
+                print(f"[STARTUP] Reset interrupted FreeSurfer import in {recon_dir}")
+    except Exception as e:
+        print(f"[STARTUP] Could not check FreeSurfer imports: {e}")
+
     # Lightweight column migration: create_all does not ALTER existing tables, so
     # add seeg_recordings.content_hash (used for upload dedup) if it's missing.
     # SQLite only -- both PRAGMA and "ADD COLUMN" are SQLite spellings, and the
@@ -890,6 +906,7 @@ async def list_reconstructions(
             "registration_confirmed": getattr(recon, "registration_confirmed", False) or False,
             "export_status": getattr(recon, "export_status", "none") or "none",
             "exported_at": getattr(recon, "exported_at", None),
+            "parcellation_source": _parcellation_source(recon),
             "electrode_shafts": shafts_data,
         })
     return out
@@ -1008,6 +1025,15 @@ async def upload_reconstruction_files(
             f.write(await mri_file.read())
         # Invalidate MRI volume cache so new file is loaded
         _mri_volume_cache.pop(mri_path, None)
+
+        # Imported FreeSurfer outputs were placed against the old MRI's grid and
+        # the old mesh centre; neither survives a replacement. Drop the import
+        # (falling back to the fast parcellation) rather than misplace it.
+        from services import freesurfer_import as _fsi
+        if _fsi.summary(recon_dir) is not None:
+            _fsi.remove(recon_dir)
+            _struct_overlay_cache.pop(os.path.join(recon_dir, _fsi.ACTIVE_LABELS), None)
+            print(f"[FS] primary MRI replaced -- removed FreeSurfer import for recon {recon_id}")
 
         # Every secondary is stored resampled into the grid of the MRI it was
         # registered against. A replacement generally has a different shape, so
@@ -1486,6 +1512,7 @@ async def get_reconstruction(
         "export_status": getattr(recon, "export_status", "none") or "none",
         "exported_at": getattr(recon, "exported_at", None),
         "secondary_scans": await _list_secondary_payloads(db, recon_id),
+        **_freesurfer_fields(recon),
         "electrode_shafts": shafts_data,
     }
 
@@ -2695,9 +2722,17 @@ async def get_cortical_surface(
         raise HTTPException(status_code=404, detail="Brain mesh not ready yet")
 
     from services.cortical_surface import get_or_build_isolated
+    from services import freesurfer_import as fsi
     recon_dir = os.path.dirname(mesh_abs)
 
     loop = asyncio.get_event_loop()
+    if fsi.active_source(recon_dir) == "freesurfer":
+        # The real pial surfaces, imported whole; nothing to build.
+        payload = await loop.run_in_executor(None, fsi.load_surface, recon_dir)
+        if payload is not None:
+            return JSONResponse(payload)
+        print(f"[CORTEX] recon {recon.id}: FreeSurfer source active but no surface; "
+              "falling back to the fast build")
     try:
         payload = await loop.run_in_executor(
             None, get_or_build_isolated, recon_dir
@@ -2711,6 +2746,206 @@ async def get_cortical_surface(
             status_code=404,
             detail="Cortical surface needs brain structures; load them first")
     return JSONResponse(payload)
+
+
+# -- FreeSurfer outputs (alternative parcellation + cortical surface) ----------
+#
+# The fast parcellation above runs in-app. FreeSurfer runs wherever its user
+# runs it (the separate `freesurfer` pipeline repo, or any recon-all) and only
+# its outputs arrive here, as a zip. services/freesurfer_import.py turns them
+# into the same two artifacts the fast path makes -- a label volume on the MRI
+# grid and a cortical-surface payload -- and switching source swaps which label
+# volume structures_cortical.nii.gz holds. Every consumer of that file
+# (structure meshes, contact labels, the slice overlay, the MNI export CSV)
+# therefore follows the switch with no changes of its own.
+
+def _parcellation_source(recon: Reconstruction) -> str:
+    from services.freesurfer_import import active_source
+    recon_dir = _recon_dir_for(recon)
+    return active_source(recon_dir) if recon_dir else "fast"
+
+
+def _freesurfer_fields(recon: Reconstruction) -> dict:
+    from services.freesurfer_import import active_source, summary
+    recon_dir = _recon_dir_for(recon)
+    if not recon_dir:
+        return {"parcellation_source": "fast", "freesurfer": None}
+    return {"parcellation_source": active_source(recon_dir),
+            "freesurfer": summary(recon_dir)}
+
+
+def _swap_labels_locked(recon_dir: str, source: str):
+    """activate_source under the heavy-job lock, so a structure-mesh or surface
+    worker never reads the label volume while it is being replaced."""
+    from services.freesurfer_import import activate_source
+    from services.worker_mem import HEAVY_JOB_LOCK
+    with HEAVY_JOB_LOCK:
+        activate_source(recon_dir, source)
+    _struct_overlay_cache.pop(os.path.join(recon_dir, "structures_cortical.nii.gz"), None)
+
+
+def _remove_freesurfer_locked(recon_dir: str):
+    from services.freesurfer_import import remove
+    from services.worker_mem import HEAVY_JOB_LOCK
+    with HEAVY_JOB_LOCK:
+        remove(recon_dir)
+    _struct_overlay_cache.pop(os.path.join(recon_dir, "structures_cortical.nii.gz"), None)
+
+
+async def _mark_export_stale(recon_id: int):
+    """Contact labels come from the parcellation, so an existing MNI export no
+    longer describes the reconstruction once the parcellation changes."""
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            update(Reconstruction)
+            .where(Reconstruction.id == recon_id, Reconstruction.export_status == "exported")
+            .values(export_status="stale")
+        )
+        await db.commit()
+
+
+async def _import_freesurfer_background(recon_id: int, recon_dir: str, zip_path: str):
+    from services import freesurfer_import as fsi
+    loop = asyncio.get_event_loop()
+    try:
+        info = await loop.run_in_executor(None, fsi.import_isolated, recon_dir, zip_path)
+        # An upload is a request to use it: make it the active source.
+        await loop.run_in_executor(None, _swap_labels_locked, recon_dir, "freesurfer")
+    except fsi.FreeSurferImportError as e:
+        print(f"[FS] Import rejected for recon {recon_id}: {e}")
+        fsi.write_status(recon_dir, "error", str(e)[:500])
+        return
+    except Exception as e:
+        print(f"[FS] Import failed for recon {recon_id}: {type(e).__name__}: {e}")
+        fsi.write_status(recon_dir, "error", "Import failed; see the server log")
+        return
+    finally:
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+    await _mark_export_stale(recon_id)
+    fsi.write_status(recon_dir, "ready", None)
+    print(f"[FS] recon {recon_id}: FreeSurfer import ready "
+          f"({info.get('engine')}, {info.get('vertex_count')} vertices) and active")
+
+
+async def _recon_dir_or_404(db: AsyncSession, recon_id: int, token=None, current_user=None,
+                            need_editor=False) -> str:
+    recon = (await db.execute(
+        select(Reconstruction).where(Reconstruction.id == recon_id)
+    )).scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not need_editor and not current_user and recon.share_token != token:
+        raise HTTPException(status_code=403, detail="Access denied")
+    mesh_abs = _abs(recon.mesh_path) if recon.mesh_path else None
+    if not mesh_abs or not os.path.exists(mesh_abs):
+        raise HTTPException(status_code=409, detail="Brain mesh not ready yet")
+    return os.path.dirname(mesh_abs)
+
+
+def _freesurfer_response(recon_dir: str) -> dict:
+    from services.freesurfer_import import active_source, summary
+    return {"parcellation_source": active_source(recon_dir), "freesurfer": summary(recon_dir)}
+
+
+@app.get("/api/reconstructions/{recon_id}/freesurfer")
+async def get_freesurfer(
+    recon_id: int,
+    token: Optional[str] = None,
+    current_user: Optional[User] = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Import status/provenance and the active parcellation source. Polled by
+    the viewer while an import is processing."""
+    recon_dir = await _recon_dir_or_404(db, recon_id, token, current_user)
+    return _freesurfer_response(recon_dir)
+
+
+@app.post("/api/reconstructions/{recon_id}/freesurfer")
+async def upload_freesurfer(
+    recon_id: int,
+    fs_zip: UploadFile = File(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Accept a zipped FreeSurfer subject (recon-all or FastSurfer) and import it
+    in the background. On success it becomes the active parcellation source."""
+    import shutil
+    from services import freesurfer_import as fsi
+
+    recon_dir = await _recon_dir_or_404(db, recon_id, need_editor=True)
+    status = fsi.read_status(recon_dir)
+    if status and status.get("state") == "processing":
+        raise HTTPException(status_code=409, detail="A FreeSurfer import is already running")
+
+    zip_path = os.path.join(recon_dir, fsi.UPLOAD_NAME)
+    part = zip_path + ".part"
+
+    def _save():
+        # Streamed: a full recon-all subject zip can be close to a gigabyte, and
+        # the other upload handlers' f.read() would hold all of it in memory.
+        with open(part, "wb") as out:
+            shutil.copyfileobj(fs_zip.file, out, 1 << 20)
+        os.replace(part, zip_path)
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, _save)
+    try:
+        await loop.run_in_executor(None, fsi.inspect_zip, zip_path)
+    except fsi.FreeSurferImportError as e:
+        os.remove(zip_path)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    fsi.write_status(recon_dir, "processing", None)
+    background_tasks.add_task(_import_freesurfer_background, recon_id, recon_dir, zip_path)
+    return _freesurfer_response(recon_dir)
+
+
+@app.delete("/api/reconstructions/{recon_id}/freesurfer")
+async def delete_freesurfer(
+    recon_id: int,
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove the FreeSurfer import and fall back to the fast parcellation."""
+    from services import freesurfer_import as fsi
+    recon_dir = await _recon_dir_or_404(db, recon_id, need_editor=True)
+    status = fsi.read_status(recon_dir)
+    if status and status.get("state") == "processing":
+        raise HTTPException(status_code=409, detail="A FreeSurfer import is still running")
+    was_active = fsi.active_source(recon_dir) == "freesurfer"
+    await asyncio.get_event_loop().run_in_executor(None, _remove_freesurfer_locked, recon_dir)
+    if was_active:
+        await _mark_export_stale(recon_id)
+    return _freesurfer_response(recon_dir)
+
+
+@app.post("/api/reconstructions/{recon_id}/parcellation-source")
+async def set_parcellation_source(
+    recon_id: int,
+    source: str = Body(..., embed=True),
+    current_user: User = Depends(require_editor),
+    db: AsyncSession = Depends(get_db),
+):
+    """Switch between the fast (in-app DKT network) and FreeSurfer parcellations.
+    Structure meshes and the cortical surface rebuild from the newly active one
+    the next time they are requested."""
+    from services import freesurfer_import as fsi
+    if source not in fsi.SOURCES:
+        raise HTTPException(status_code=400, detail=f"source must be one of {fsi.SOURCES}")
+    recon_dir = await _recon_dir_or_404(db, recon_id, need_editor=True)
+    if fsi.active_source(recon_dir) == source:
+        return _freesurfer_response(recon_dir)
+    if source == "freesurfer":
+        summ = fsi.summary(recon_dir)
+        if not summ or not summ["ready"]:
+            raise HTTPException(status_code=409, detail="No FreeSurfer import is ready")
+    await asyncio.get_event_loop().run_in_executor(None, _swap_labels_locked, recon_dir, source)
+    await _mark_export_stale(recon_id)
+    return _freesurfer_response(recon_dir)
 
 
 @app.get("/api/reconstructions/{recon_id}/mesh")

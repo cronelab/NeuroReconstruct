@@ -87,6 +87,31 @@ export const getStructures = (id, token) =>
 export const getCorticalSurface = (id, token) =>
   api.get(`/reconstructions/${id}/cortical-surface${token ? `?token=${token}` : ""}`);
 
+// ── FreeSurfer outputs (alternative parcellation + real pial surfaces) ─────────
+// FreeSurfer runs outside the app (the separate `freesurfer` pipeline repo, or
+// any recon-all); its zipped subject folder is uploaded here and imported in the
+// background. Responses are { parcellation_source: 'fast'|'freesurfer',
+// freesurfer: { state, message, ready, info } | null }.
+export const getFreeSurfer = (id, token) =>
+  api.get(`/reconstructions/${id}/freesurfer${token ? `?token=${token}` : ''}`);
+
+export const uploadFreeSurfer = (id, file, onProgress) => {
+  const form = new FormData();
+  form.append('fs_zip', file);
+  return api.post(`/reconstructions/${id}/freesurfer`, form, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 1800000,
+    onUploadProgress: onProgress
+      ? (e) => onProgress(e.total ? e.loaded / e.total : null)
+      : undefined,
+  });
+};
+
+export const deleteFreeSurfer = (id) => api.delete(`/reconstructions/${id}/freesurfer`);
+
+export const setParcellationSource = (id, source) =>
+  api.post(`/reconstructions/${id}/parcellation-source`, { source });
+
 export const confirmRegistration = (id, confirmed) =>
   api.patch(`/reconstructions/${id}/registration-confirm`, { confirmed });
 

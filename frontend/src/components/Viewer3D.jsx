@@ -209,7 +209,9 @@ function LoadingOverlay({ message }) {
 
 export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLoading, onContactPlaced, showMri, mriOpacity, ctThreshold, ctOpacityOverride, activeContactNumber, structuresData, structureVisible, structureOpacity }) {
   const { meshData, brainOpacity, reconstruction, isEditorMode, selectedShaftId, shaftVisibility, contactScale, placeMode,
-          brainRenderMode, corticalColorBy } = useAppStore();
+          brainRenderMode, corticalColorBy, parcellation } = useAppStore();
+  const corticalLoadingMessage = parcellation?.parcellation_source === 'freesurfer'
+    ? 'Loading FreeSurfer surface…' : 'Building cortical surface…';
   const [hoveredStruct, setHoveredStruct] = React.useState(null);
   const [hoveredParcel, setHoveredParcel] = React.useState(null);
 
@@ -311,7 +313,7 @@ export default function Viewer3D({ loading, loadingMessage, ctMeshData, ctMeshLo
         {!cortical && <SceneLights />}
 
         {(loading || corticalLoading) && (
-          <LoadingOverlay message={corticalLoading ? 'Building cortical surface…' : loadingMessage} />
+          <LoadingOverlay message={corticalLoading ? corticalLoadingMessage : loadingMessage} />
         )}
 
         {/* MRI brain surface — replaced by the cortical surface in that mode */}

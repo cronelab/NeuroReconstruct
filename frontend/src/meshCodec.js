@@ -36,20 +36,40 @@ export function decodeTyped(value, dtype) {
  * Decode a cortical-surface payload into typed arrays ready for BufferAttributes.
  *
  * Returns { positions, indices, sulc, parcel, sulcRangeMm, parcelColors, bounds,
- *           center, stats, vertexCount, faceCount }
+ *           center, stats, vertexCount, faceCount, source, atlases }
  * where `sulc` is uint8 over `sulcRangeMm` (it only drives a shading ramp, so
  * 1/255 of the range is far finer than the eye resolves).
+ *
+ * `atlases` maps atlas key -> { name, parcel, colors, labels }. The fast surface
+ * has only 'dkt' (its top-level parcel); a FreeSurfer import adds its
+ * `parcellations` (Desikan, Destrieux) alongside.
  */
 export function decodeCorticalSurface(payload) {
   if (!payload) return null;
+  const parcel = decodeTyped(payload.parcel, 'uint16');
+  const parcelColors = payload.parcel_colors || {};
+  const parcelLabels = payload.parcel_labels || {};
+  const atlases = {
+    dkt: { name: payload.atlas_name || 'DKT', parcel, colors: parcelColors, labels: parcelLabels },
+  };
+  for (const [key, p] of Object.entries(payload.parcellations || {})) {
+    atlases[key] = {
+      name: p.name || key,
+      parcel: decodeTyped(p.parcel, 'uint16'),
+      colors: p.colors || {},
+      labels: p.labels || {},
+    };
+  }
   return {
     positions: decodeTyped(payload.vertices, 'float32'),
     indices: decodeTyped(payload.faces, 'uint32'),
     sulc: decodeTyped(payload.sulc, 'uint8'),
-    parcel: decodeTyped(payload.parcel, 'uint16'),
+    parcel,
     sulcRangeMm: payload.sulc_range_mm || [0, 1],
-    parcelColors: payload.parcel_colors || {},
-    parcelLabels: payload.parcel_labels || {},
+    parcelColors,
+    parcelLabels,
+    atlases,
+    source: payload.source || 'fast',
     bounds: payload.bounds,
     center: payload.center,
     stats: payload.stats || {},

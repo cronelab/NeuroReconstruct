@@ -625,36 +625,41 @@ def extract_all_structures(mri_mesh_path: str, output_dir: str,
 
     print(f"[STRUCT] Running patient-specific segmentation on {mri_nifti_path}")
 
-    # Segmentation runs on CPU only. Hide any GPU from TensorFlow before antspynet
-    # imports it — benchmarking showed the GPU gives no speedup for this pipeline
-    # (the cost is CPU-bound ANTs preprocessing + mesh extraction, not the small
-    # GPU-able inference), so CPU keeps the environment simple and deterministic.
-    os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-
-    try:
-        import ants
-        import antspynet
-    except ImportError as e:
-        if cached:
-            print(f"[STRUCT] antspynet not available ({e}), returning {len(cached)} cached structures")
-            return cached
-        raise ImportError(f"antspynet not available: {e}")
-
-    # Load MRI as ANTs image via ants.image_read so that ANTs handles the
-    # NIfTI RAS → ITK LPS axis convention flip correctly.
-    # Using ants.from_numpy with a nibabel RAS affine causes ANTs to interpret
-    # RAS metadata as LPS, flipping L/R and A/P — making the DKT model assign
-    # left-hemisphere labels to the right side of the brain.
-    ants_img = ants.image_read(mri_nifti_path)
-    print(f"[STRUCT DEBUG] ANTs input spacing : {ants_img.spacing}")
-    print(f"[STRUCT DEBUG] ANTs input origin  : {ants_img.origin}")
-    print(f"[STRUCT DEBUG] ANTs input shape   : {ants_img.shape}")
-
     results = dict(cached)  # start with whatever was cached
 
     # ── Pass 1: DKT parcellation (contains both cortical AND subcortical labels) ─
+    # ants/antspynet are only needed to COMPUTE the labels. When the volume is
+    # already there -- cached, or imported from FreeSurfer -- meshing it needs
+    # neither, which is what lets the PyInstaller build (no antspynet) mesh an
+    # imported parcellation instead of failing over to borrowing another
+    # reconstruction's structures.
     cortical_label_path = os.path.join(output_dir, "structures_cortical.nii.gz")
     if not os.path.exists(cortical_label_path):
+        # Segmentation runs on CPU only. Hide any GPU from TensorFlow before antspynet
+        # imports it — benchmarking showed the GPU gives no speedup for this pipeline
+        # (the cost is CPU-bound ANTs preprocessing + mesh extraction, not the small
+        # GPU-able inference), so CPU keeps the environment simple and deterministic.
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+        try:
+            import ants
+            import antspynet
+        except ImportError as e:
+            if cached:
+                print(f"[STRUCT] antspynet not available ({e}), returning {len(cached)} cached structures")
+                return cached
+            raise ImportError(f"antspynet not available: {e}")
+
+        # Load MRI as ANTs image via ants.image_read so that ANTs handles the
+        # NIfTI RAS → ITK LPS axis convention flip correctly.
+        # Using ants.from_numpy with a nibabel RAS affine causes ANTs to interpret
+        # RAS metadata as LPS, flipping L/R and A/P — making the DKT model assign
+        # left-hemisphere labels to the right side of the brain.
+        ants_img = ants.image_read(mri_nifti_path)
+        print(f"[STRUCT DEBUG] ANTs input spacing : {ants_img.spacing}")
+        print(f"[STRUCT DEBUG] ANTs input origin  : {ants_img.origin}")
+        print(f"[STRUCT DEBUG] ANTs input shape   : {ants_img.shape}")
+
         print("[STRUCT] Running cortical parcellation (DKT)...")
         # Stock antspynet peaks at 56.96 GB resident / 158.66 GB commit on a
         # 126 Mvox clinical T1 -- it collects all 63 native-resolution
