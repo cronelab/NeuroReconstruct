@@ -317,7 +317,7 @@ User clicks "Load" button
 The in-app parcellation (the **Fast** source) is a DKT network plus a display
 surface built from its labels. It is quick, but it is not a FreeSurfer pial
 surface. To use real FreeSurfer surfaces, run FreeSurfer **outside the app**:
-the companion repo [`freesurfer`](../freesurfer) (`fspipe run … --export`) runs
+the companion repo [`cronelab/fspipe`](https://github.com/cronelab/fspipe) (`fspipe run … --export`) runs
 recon-all 8.2 or FastSurfer on a local GPU workstation. Then upload the zip it
 produces, or a zip of any recon-all subject folder:
 **Brain panel → Source → ⇪ Upload FreeSurfer (.zip)** (editors).
