@@ -244,7 +244,7 @@ So `main` already contains all of the above; **PR #4** (`mni-registration`, stil
 6. **Fill the 6 missing DKT structures** — accumbens, frontal pole, temporal pole (bilateral) report "no voxels"; verify label indices vs. the antspynet DKT scheme
 7. **Test with more multi-patient data** — multiple shafts, verify autofill and slice projections across cases
 8. **Share link review mode** — read-only viewer for completed reconstructions without login (token generated, endpoint exists, UI not fully wired)
-9. **FreeSurfer surface import** — upload lh.pial/rh.pial as brain surface instead of marching cubes
+9. ~~**FreeSurfer surface import**~~ — **DONE**: upload a zipped recon-all/FastSurfer subject (from the companion `freesurfer` repo's `fspipe export`, or any recon-all run); its lh/rh pial and DKT parcellation become a switchable "FreeSurfer" source (`services/freesurfer_import.py`)
 10. **AWS deployment** — behind JHU VPN IP allowlist, HTTPS, proper secret management; migrate SQLite → Postgres for multi-user
 
 ---

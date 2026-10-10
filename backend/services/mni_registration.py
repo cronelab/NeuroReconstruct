@@ -306,10 +306,13 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
     # ~2-3 min, but cached afterwards and reused by the viewer).
     _t = time.perf_counter()
     structure_summary = None
+    parcellation = "fast"
     try:
         from services.contact_labeling import (
             get_label_volume_path, label_contacts, write_contact_structure_csv,
         )
+        from services.freesurfer_import import active_source
+        parcellation = active_source(recon_dir)
         label_path = get_label_volume_path(recon_dir)
         if not os.path.exists(label_path):
             print("[MNI] Structure labels not cached - running segmentation "
@@ -321,7 +324,8 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
         if os.path.exists(label_path) and len(world):
             labels = label_contacts(label_path, world)
             structure_summary = write_contact_structure_csv(
-                os.path.join(out_dir, "electrodes_structures.csv"), placed, labels
+                os.path.join(out_dir, "electrodes_structures.csv"), placed, labels,
+                parcellation=parcellation,
             )
             print(f"[MNI] Contact structures: {structure_summary['inside_structure']} inside a "
                   f"structure, {structure_summary['near_structure']} near one, "
@@ -350,6 +354,7 @@ def export_reconstruction_to_mni(recon_dir: str, mri_path: str, ct_path: str,
         "has_ct_mni": ct_written,
         "has_structure_labels": structure_summary is not None,
         "contact_structures": structure_summary,
+        "parcellation_source": parcellation,
         "durations_sec": durations,
         "artifacts": sorted(
             fn for fn in os.listdir(out_dir) if not fn.startswith("_")

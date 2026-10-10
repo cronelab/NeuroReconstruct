@@ -171,8 +171,10 @@ export default function SeegViewer3D({
 
   // Cortical surface mode, shared with the reconstruction viewer through the
   // store so the two 3D views agree on which brain rendering is showing.
-  const { brainRenderMode, corticalColorBy } = useAppStore();
+  const { brainRenderMode, corticalColorBy, parcellation } = useAppStore();
   const cortical = brainRenderMode === 'cortical';
+  const corticalLoadingMessage = parcellation?.parcellation_source === 'freesurfer'
+    ? 'Loading FreeSurfer surface...' : 'Building cortical surface...';
   const { data: corticalSurface, loading: corticalLoading } =
     useCorticalSurfaceData(reconId, shareToken);
 
@@ -213,7 +215,7 @@ export default function SeegViewer3D({
         {!cortical && <SceneLights />}
 
         {(loading || corticalLoading) && (
-          <LoadingOverlay message={corticalLoading ? 'Building cortical surface...' : loadingMessage} />
+          <LoadingOverlay message={corticalLoading ? corticalLoadingMessage : loadingMessage} />
         )}
 
         {meshData && !loading && !cortical && <BrainSurface meshData={meshData} opacity={brainOpacity} />}
