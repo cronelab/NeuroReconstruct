@@ -8,6 +8,7 @@ import ReconstructionList from './components/ReconstructionList';
 import ReconstructionViewer from './components/ReconstructionViewer';
 import DeletedList from './components/DeletedList';
 import SeegViewer from './components/SeegViewer';
+import UserGuideModal, { guideSeen, markGuideSeen } from './components/UserGuideModal';
 
 export default function App() {
   const { user, setUser, token, logout, setReconstruction, setActiveRecon } = useAppStore();
@@ -77,6 +78,14 @@ export default function App() {
     wasSignedIn.current = !!user;
   }, [user]);
 
+  // The user guide: opens by itself on the first sign-in in this browser, and
+  // from the header's Guide button after that. 'welcome' = the automatic open.
+  const [guide, setGuide] = useState(null);   // null | 'welcome' | 'manual'
+  useEffect(() => {
+    if (user && !guideSeen()) setGuide('welcome');
+  }, [user]);
+  const closeGuide = () => { markGuideSeen(); setGuide(null); };
+
   if (authLoading) {
     return (
       <div style={{
@@ -114,7 +123,9 @@ export default function App() {
       <Header
         onBack={page !== 'list' ? handleBack : null}
         onNavigate={navigateTo}
+        onOpenGuide={() => setGuide('manual')}
       />
+      {guide && <UserGuideModal welcome={guide === 'welcome'} onClose={closeGuide} />}
 
       <div style={{ flex: 1, display: 'flex', overflow: 'auto', minWidth: 0 }}>
         {page === 'list' && (

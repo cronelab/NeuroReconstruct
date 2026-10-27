@@ -3,6 +3,7 @@ import SliceViewer from './SliceViewer';
 import { isColorLayer } from '../scanTypes';
 import FusionSliceViewer from './FusionSliceViewer';
 import ScanLayerBar from './ScanLayerBar';
+import SliceOverlayBar from './SliceOverlayBar';
 import { useAppStore } from '../store';
 import { uploadReconstructionFiles, confirmRegistration, preciseReregister, selectRegistrationCandidate, getReconstruction } from '../api';
 
@@ -372,6 +373,9 @@ export default function MultiViewLayout({ reconId, viewer3D, shareToken }) {
         }}>
           {reconstruction?.has_mri !== false && (
             <ScanLayerBar reconId={reconId} shareToken={shareToken} />
+          )}
+          {reconstruction?.has_mri !== false && reconstruction?.has_mesh && (
+            <SliceOverlayBar reconId={reconId} shareToken={shareToken} />
           )}
           <div style={{ flex: 1, position: 'relative', minWidth: 0, minHeight: 0 }}>
         {['sagittal', 'axial', 'coronal'].map(ax => (

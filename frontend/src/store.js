@@ -7,6 +7,14 @@ function pruneLayers(layers, scans) {
   return kept.length ? kept : ['primary'];
 }
 
+// Set or clear one flag per key in a { key: true } map. Cleared keys are
+// deleted rather than stored false, so "absent" keeps meaning the default.
+function withFlags(map, keys, on) {
+  const next = { ...map };
+  keys.forEach(k => { if (on) next[k] = true; else delete next[k]; });
+  return next;
+}
+
 export const useAppStore = create((set, get) => ({
   // Auth
   user: null,
@@ -121,6 +129,7 @@ export const useAppStore = create((set, get) => ({
       structureVisibleSaved: null,
       parcellation: null,
       corticalAtlas: 'dkt',
+      corticalRegionOff: {},
     }
   )),
   meshData: null,
@@ -163,13 +172,26 @@ export const useAppStore = create((set, get) => ({
   // SeegViewer3D render it and the switch sits in the shared StructurePanel.
   brainRenderMode: 'structures',
   setBrainRenderMode: (m) => set({ brainRenderMode: m }),
-  corticalColorBy: 'plain',      // 'plain' (white, sulci shaded) | 'parcellation'
+  // DKT colours by default; Plain and the other atlases are the extras.
+  corticalColorBy: 'parcellation', // 'plain' (white, sulci shaded) | 'parcellation'
   setCorticalColorBy: (c) => set({ corticalColorBy: c }),
   // Which parcellation colours the surface when corticalColorBy is
   // 'parcellation'. The fast surface only has 'dkt'; a FreeSurfer import also
   // carries 'desikan' and 'destrieux' (whichever its zip included).
   corticalAtlas: 'dkt',
   setCorticalAtlas: (a) => set({ corticalAtlas: a }),
+  // Parcels whose colour is switched off on the cortical surface, keyed
+  // '<atlas>:<parcel id>' (see regions.js); they draw white, sulci still shaded.
+  // Absent = coloured, so everything starts coloured.
+  corticalRegionOff: {},
+  setCorticalRegionsOff: (keys, off) => set(s => ({ corticalRegionOff: withFlags(s.corticalRegionOff, keys, off) })),
+
+  // ── 2D atlas overlay ─────────────────────────────────────────────────────────
+  // Whether the slice panes paint the atlas over the MRI at all. WHICH regions
+  // they paint is structureVisible, shared with the 3D structure meshes, so the
+  // Brain panel's list and the overlay bar's list are one set of choices.
+  sliceOverlayOn: true,
+  setSliceOverlayOn: (v) => set({ sliceOverlayOn: v }),
   // Which parcellation this reconstruction's structures, contact labels and
   // cortical surface come from, plus the FreeSurfer import's status:
   // { parcellation_source: 'fast'|'freesurfer', freesurfer: {...}|null }, the

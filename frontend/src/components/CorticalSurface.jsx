@@ -4,6 +4,7 @@ import * as THREE from 'three';
 import { useAppStore } from '../store';
 import { decodeCorticalSurface } from '../meshCodec';
 import { getCorticalSurface } from '../api';
+import { effectiveAtlas, parcelOn } from '../regions';
 
 // ── Cortical surface render mode ──────────────────────────────────────────────
 // One opaque pial-like mesh, shaded so sulci and gyri read clearly, optionally
@@ -76,13 +77,21 @@ function atlasOf(data, atlas) {
   return a || { parcel: data?.parcel, colors: data?.parcelColors, labels: data?.parcelLabels };
 }
 
-function writeColors(attr, data, colorBy, atlas) {
+// A parcel whose colour is switched off draws as Plain does: white, with the
+// sulcal shading still on it, so the folds read the same either way.
+const PLAIN = [1, 1, 1];
+
+function writeColors(attr, data, colorBy, atlas, structureVisible, regionOff) {
   const { sulc, sulcRangeMm } = data;
   const { parcel, colors: parcelColors } = atlasOf(data, atlas);
   const shade = shadeFactors(sulc, sulcRangeMm);
   const arr = attr.array;
   if (colorBy === 'parcellation') {
     const pal = parcelPalette(parcelColors);
+    const atlasKey = effectiveAtlas(data, atlas);
+    for (const id of pal.keys()) {
+      if (!parcelOn(atlasKey, id, structureVisible, regionOff)) pal.set(id, PLAIN);
+    }
     for (let i = 0; i < shade.length; i++) {
       const rgb = pal.get(parcel ? parcel[i] : 0) || UNLABELED;
       const s = shade[i];
@@ -175,6 +184,8 @@ export function useCorticalSurfaceData(reconId, token) {
 export default function CorticalSurface({ data, colorBy = 'plain', onHover, interactive = true }) {
   const meshRef = useRef();
   const corticalAtlas = useAppStore(s => s.corticalAtlas);
+  const corticalRegionOff = useAppStore(s => s.corticalRegionOff);
+  const structureVisible = useAppStore(s => s.structureVisible);
 
   const geometry = useMemo(() => {
     if (!data?.positions) return null;
@@ -192,8 +203,11 @@ export default function CorticalSurface({ data, colorBy = 'plain', onHover, inte
   // Recolor in place. Allocating a fresh BufferAttribute on every toggle would
   // orphan a GPU buffer each time, and this one is ~1.5 MB.
   useEffect(() => {
-    if (geometry && data) writeColors(geometry.getAttribute('color'), data, colorBy, corticalAtlas);
-  }, [geometry, data, colorBy, corticalAtlas]);
+    if (geometry && data) {
+      writeColors(geometry.getAttribute('color'), data, colorBy, corticalAtlas,
+        structureVisible, corticalRegionOff);
+    }
+  }, [geometry, data, colorBy, corticalAtlas, structureVisible, corticalRegionOff]);
 
   // Three.js does not garbage-collect GPU buffers. At 250k faces this is the
   // first mesh in the app large enough that leaking it on every mode switch

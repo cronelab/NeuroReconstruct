@@ -62,7 +62,7 @@ const statusColors = {
   error:      { bg: '#2a0d0d', color: '#ff5252', border: '#5a1a1a' },
 };
 
-export default function Header({ onBack, onNavigate }) {
+export default function Header({ onBack, onNavigate, onOpenGuide }) {
   const { reconstruction, user, logout, isEditorMode, setEditorMode, setReconstruction } = useAppStore();
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -346,6 +346,16 @@ export default function Header({ onBack, onNavigate }) {
         </button>
 
       </>)}
+
+      {onOpenGuide && (
+        <button
+          onClick={onOpenGuide}
+          title="Open the user guide"
+          style={{ ...s.btn, background: 'transparent', color: '#7a8a99', border: '1px solid #2a3340' }}
+        >
+          ? Guide
+        </button>
+      )}
 
       <div style={s.divider} />
 

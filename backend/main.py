@@ -464,7 +464,14 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
     mri_sl    = np.fliplr(np.rot90(mri_sl, k=1))
     tgt_h, tgt_w = mri_sl.shape
 
-    # Build RGBA array
+    return _label_slice_png(sl, label_rgba, style, (tgt_h, tgt_w))
+
+
+def _label_slice_png(sl, label_rgba: dict, style: str, target_hw) -> bytes:
+    """RGBA PNG of a display-oriented label slice: each label in label_rgba
+    painted its colour ("fill"), or white borders around them ("outline"),
+    resized to target_hw (the MRI slice's pixel size) so it overlays exactly."""
+    tgt_h, tgt_w = target_hw
     rgba = np.zeros((*sl.shape, 4), dtype=np.uint8)
     if style == "outline":
         shown = np.isin(sl, list(label_rgba)) if label_rgba else np.zeros(sl.shape, bool)
@@ -490,6 +497,126 @@ def _render_structure_slice(mri_path: str, label_path: str, axis: str, slice_idx
     buf = io.BytesIO()
     pil.save(buf, format="PNG", optimize=False, compress_level=1)
     return buf.getvalue()
+
+
+# ── Atlas overlay for the cortical-surface mode ───────────────────────────────
+# The 2D counterpart of the cortical surface's colouring: the surface's own
+# atlas (DKT, Desikan-Killiany or Destrieux), cortex only, in the surface's own
+# colours. The volume label ids equal the surface parcel ids for all three
+# (1000/2000 + aparc index; 11100/12100 + Destrieux index), so the one id list
+# the viewer colours the surface by also picks what the slices paint.
+_ATLAS_VOLUMES = {"desikan": "aparc+aseg.mgz", "destrieux": "aparc.a2009s+aseg.mgz"}
+_atlas_color_cache: dict = {}   # (surface json, mtime) -> {atlas: {id: (r, g, b)}}
+
+
+def _hex_rgb(h: str) -> tuple:
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _atlas_colors(recon_dir: str, atlas: str) -> dict | None:
+    """{parcel id: (r, g, b)} -- the colours the cortical surface draws `atlas` in."""
+    if atlas == "dkt":
+        # Both surfaces colour DKT from the catalog (freesurfer_import.load_surface
+        # refreshes it the same way), so the catalog is the surface's palette.
+        from services.structure_extractor import ALL_STRUCTURES
+        return {lb: _hex_rgb(info["color"])
+                for info in ALL_STRUCTURES.values() for lb in info["labels"] if lb >= 1000}
+    from services import freesurfer_import as fsi
+    path = os.path.join(recon_dir, fsi.FS_DIR, fsi.SURFACE_NAME)
+    if not os.path.exists(path):
+        return None
+    key = (path, os.path.getmtime(path))
+    if key not in _atlas_color_cache:
+        payload = fsi.load_surface(recon_dir) or {}
+        _atlas_color_cache[key] = {
+            name: {int(k): _hex_rgb(c) for k, c in p.get("colors", {}).items()}
+            for name, p in payload.get("parcellations", {}).items()
+        }
+    return _atlas_color_cache[key].get(atlas)
+
+
+def _atlas_label_source(recon_dir: str, atlas: str):
+    """(label volume path, orig_to_mri or None). DKT is the active label volume,
+    already on the MRI grid; the other two are FreeSurfer's own volumes in its
+    conformed space, placed by the import's alignment transform."""
+    if atlas == "dkt":
+        return os.path.join(recon_dir, "structures_cortical.nii.gz"), None
+    from services import freesurfer_import as fsi
+    path = os.path.join(recon_dir, fsi.FS_DIR, "subject", "mri", _ATLAS_VOLUMES[atlas])
+    m = ((fsi.read_info(recon_dir) or {}).get("alignment") or {}).get("orig_to_mri")
+    return path, (np.asarray(m, dtype=np.float64) if m else None)
+
+
+def _sample_label_slice(mri_path: str, label_path: str, orig_to_mri, axis: str,
+                        slice_idx: int):
+    """The label volume's ids on one MRI slice, display-oriented and at the MRI
+    slice's pixel size: each pixel sampled through world space (nearest
+    neighbour). Sampling only the plane on screen, rather than resampling the
+    whole volume onto the MRI grid, keeps a FreeSurfer-space volume usable with
+    no stored copy of it. None when the volume does not exist."""
+    if not os.path.exists(label_path):
+        return None
+    vol = _get_label_volume(label_path)
+    ldata, laff = vol["data"], vol["affine"]
+    mri_vol = _get_mri_volume(mri_path)
+    mri_aff = mri_vol["affine"]
+    shape = mri_vol["data"].shape[:3]
+
+    ax = {"sagittal": 0, "coronal": 1, "axial": 2}[axis]
+    if slice_idx < 0 or slice_idx >= shape[ax]:
+        slice_idx = shape[ax] // 2
+    a0, a1 = [i for i in range(3) if i != ax]
+    u, v = np.meshgrid(np.arange(shape[a0]), np.arange(shape[a1]), indexing="ij")
+    ijk = np.empty((u.size, 4))
+    ijk[:, ax] = slice_idx
+    ijk[:, a0] = u.ravel()
+    ijk[:, a1] = v.ravel()
+    ijk[:, 3] = 1.0
+
+    # MRI voxel -> world -> (FreeSurfer world) -> label voxel
+    m = np.linalg.inv(laff)
+    if orig_to_mri is not None:
+        m = m @ np.linalg.inv(orig_to_mri)
+    m = m @ mri_aff
+    src = np.rint(ijk @ m.T)[:, :3].astype(np.int64)
+    ok = np.all((src >= 0) & (src < np.array(ldata.shape[:3])), axis=1)
+    vals = np.zeros(len(src), np.int32)
+    g = src[ok]
+    vals[ok] = ldata[g[:, 0], g[:, 1], g[:, 2]]
+
+    # Same orientation flip as the MRI slices
+    return np.fliplr(np.rot90(vals.reshape(u.shape), k=1))
+
+
+def _render_atlas_slice(mri_path: str, label_path: str, orig_to_mri, axis: str,
+                        slice_idx: int, colors: dict, visible_ids: set | None,
+                        style: str = "fill") -> bytes | None:
+    """RGBA PNG of `colors`' labels on one MRI slice (see _sample_label_slice)."""
+    sl = _sample_label_slice(mri_path, label_path, orig_to_mri, axis, slice_idx)
+    if sl is None:
+        return None
+    label_rgba = {lbl: (*rgb, 180) for lbl, rgb in colors.items()
+                  if visible_ids is None or lbl in visible_ids}
+    return _label_slice_png(sl, label_rgba, style, sl.shape)
+
+
+def _render_label_ids(mri_path: str, label_path: str, orig_to_mri, axis: str,
+                      slice_idx: int):
+    """(PNG, ids present) of one slice's raw label ids, for naming the region
+    under the cursor in the browser: id = R * 256 + G, alpha always opaque so
+    no browser premultiplies the values away. Label maps compress to a few KB."""
+    sl = _sample_label_slice(mri_path, label_path, orig_to_mri, axis, slice_idx)
+    if sl is None:
+        return None, None
+    ids = np.clip(sl, 0, 65535).astype(np.uint16)
+    rgba = np.zeros((*ids.shape, 4), dtype=np.uint8)
+    rgba[..., 0] = ids >> 8
+    rgba[..., 1] = ids & 0xFF
+    rgba[..., 3] = 255
+    buf = io.BytesIO()
+    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=False, compress_level=6)
+    return buf.getvalue(), np.unique(ids)
 
 # ─── App Setup ───────────────────────────────────────────────────────────────
 
@@ -2533,6 +2660,90 @@ async def get_structure_slice(
         raise HTTPException(status_code=404, detail="Structure labels not available for this reconstruction")
 
     return FastAPIResponse(content=png_bytes, media_type="image/png")
+
+
+@app.get("/api/reconstructions/{recon_id}/atlas-slice")
+async def get_atlas_slice(
+    recon_id: int,
+    axis: str = "axial",
+    slice_idx: int = -1,
+    atlas: str = "dkt",              # dkt | desikan | destrieux -- the surface's colouring
+    visible: Optional[str] = None,   # comma-separated parcel ids; omit = all
+    style: str = "fill",             # fill | outline (see _label_slice_png)
+    token: Optional[str] = None,
+    current_user: Optional[User] = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """RGBA PNG overlay of a cortical-surface atlas at the given MRI slice: the
+    slice view's counterpart of the cortical surface mode. Cortex only -- the
+    surface has no subcortical structures, so neither does this."""
+    if atlas != "dkt" and atlas not in _ATLAS_VOLUMES:
+        raise HTTPException(status_code=400, detail=f"Unknown atlas {atlas!r}")
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Not found")
+    mri_abs = _abs(recon.mri_path) if recon.mri_path else None
+    if not mri_abs or not os.path.exists(mri_abs):
+        raise HTTPException(status_code=404, detail="MRI not available")
+
+    recon_dir = os.path.dirname(mri_abs)
+    colors = _atlas_colors(recon_dir, atlas)
+    if not colors:
+        raise HTTPException(status_code=404, detail=f"No {atlas} atlas for this reconstruction")
+    label_path, orig_to_mri = _atlas_label_source(recon_dir, atlas)
+    try:
+        visible_ids = {int(x) for x in visible.split(",") if x} if visible is not None else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="visible must be comma-separated parcel ids")
+
+    loop = asyncio.get_event_loop()
+    png_bytes = await loop.run_in_executor(
+        None, _render_atlas_slice, mri_abs, label_path, orig_to_mri, axis, slice_idx,
+        colors, visible_ids, "outline" if style == "outline" else "fill"
+    )
+    if png_bytes is None:
+        raise HTTPException(status_code=404, detail=f"No {atlas} label volume for this reconstruction")
+    return FastAPIResponse(content=png_bytes, media_type="image/png")
+
+
+@app.get("/api/reconstructions/{recon_id}/label-ids")
+async def get_label_ids(
+    recon_id: int,
+    axis: str = "axial",
+    slice_idx: int = -1,
+    atlas: str = "dkt",              # dkt (the active label volume) | desikan | destrieux
+    token: Optional[str] = None,
+    current_user: Optional[User] = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """One slice of raw label ids as a PNG (id = R * 256 + G), so the slice view
+    can name the region under the cursor without a request per mouse move.
+
+    X-Label-Keys maps each id on the slice that the structure catalog knows to
+    its catalog key -- what the Structures list and its overlay go by."""
+    if atlas != "dkt" and atlas not in _ATLAS_VOLUMES:
+        raise HTTPException(status_code=400, detail=f"Unknown atlas {atlas!r}")
+    result = await db.execute(select(Reconstruction).where(Reconstruction.id == recon_id))
+    recon = result.scalar_one_or_none()
+    if not recon:
+        raise HTTPException(status_code=404, detail="Not found")
+    mri_abs = _abs(recon.mri_path) if recon.mri_path else None
+    if not mri_abs or not os.path.exists(mri_abs):
+        raise HTTPException(status_code=404, detail="MRI not available")
+
+    label_path, orig_to_mri = _atlas_label_source(os.path.dirname(mri_abs), atlas)
+    loop = asyncio.get_event_loop()
+    png_bytes, present = await loop.run_in_executor(
+        None, _render_label_ids, mri_abs, label_path, orig_to_mri, axis, slice_idx)
+    if png_bytes is None:
+        raise HTTPException(status_code=404, detail=f"No {atlas} label volume for this reconstruction")
+
+    from services.structure_extractor import ALL_STRUCTURES
+    by_label = {lb: key for key, info in ALL_STRUCTURES.items() for lb in info["labels"]}
+    keys = {str(int(i)): by_label[int(i)] for i in present if int(i) in by_label}
+    return FastAPIResponse(content=png_bytes, media_type="image/png",
+                           headers={"X-Label-Keys": json.dumps(keys, separators=(",", ":"))})
 
 
 @app.get("/api/reconstructions/{recon_id}/fusion-slice")

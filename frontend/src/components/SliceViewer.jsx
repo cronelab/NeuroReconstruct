@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { useAppStore } from '../store';
 import { buildStructureMeshes, structureAtPoint } from '../anatomy';
+import { coloredParcelIds } from '../regions';
 import { shaftColorOf } from '../seegColors';
 import { activityColor } from './SeegViewer3D';
 import LocatorOverlay from './LocatorOverlay';
@@ -36,6 +37,33 @@ function getStructureMeshes(structuresData) {
   return _structMeshes;
 }
 
+// The atlas overlay follows the 3D brain mode. Structures mode paints the
+// structure catalog (subcortical and cortical) by the Structures list; cortical
+// surface mode paints what the surface is coloured by -- its atlas, cortex
+// only, the parcels left coloured. Null = nothing to paint.
+function overlayUrl(st, reconId, axis, idx, style) {
+  if (!st.sliceOverlayOn) return null;
+  const base = `/api/reconstructions/${reconId}`;
+  if (st.brainRenderMode === 'cortical') {
+    const sel = coloredParcelIds(st);
+    if (!sel || !sel.ids.length) return null;
+    return `${base}/atlas-slice?axis=${axis}&slice_idx=${idx}&atlas=${sel.atlas}`
+      + `&visible=${sel.ids.join(',')}&style=${style}`;
+  }
+  const sd = st.structuresData;
+  const keys = sd ? Object.keys(sd).filter(k => sd[k].vertices && st.structureVisible[k] !== false) : [];
+  if (!keys.length) return null;
+  return `${base}/structure-slice?axis=${axis}&slice_idx=${idx}`
+    + `&visible=${encodeURIComponent(keys.join(','))}&style=${style}`;
+}
+
+// Whether there is an overlay source loaded to ask for at all.
+function overlayAvailable(st) {
+  return st.brainRenderMode === 'cortical'
+    ? !!st.corticalData && st.corticalData !== 'unavailable'
+    : !!st.structuresData;
+}
+
 export default function SliceViewer({
   reconId, axis = 'axial', isThumbnail = false, onSliceChange, locator,
   // Which volume to draw: null for the primary MRI, otherwise a secondary
@@ -63,7 +91,10 @@ export default function SliceViewer({
   hoveredChannel = null,
   onHoverContact,
 }) {
-  const { reconstruction, meshData, structuresData, structureVisible } = useAppStore();
+  const {
+    reconstruction, meshData, structuresData, structureVisible, sliceOverlayOn,
+    brainRenderMode, corticalData, corticalColorBy, corticalAtlas, corticalRegionOff,
+  } = useAppStore();
   const canvasRef = useRef(null);
 
   // Secondaries are stored resampled into the primary's grid, so this changes
@@ -97,6 +128,20 @@ export default function SliceViewer({
   const overlayRef = useRef(null);
   const overlayCacheRef = useRef(new Map());   // slice_idx -> ImageBitmap
   const overlayInFlightRef = useRef(new Set());
+  // Bumped whenever the overlay's regions or style change. Clicking regions on
+  // and off fires overlapping requests whose responses can land out of order;
+  // each carries the generation it was asked under and is dropped if a newer
+  // choice has been made since, or the last one to arrive would win.
+  const overlayGenRef = useRef(0);
+
+  // Region hover: where the slice image sits on the canvas, and per slice a
+  // map of the label id under every pixel ('<atlas>:<idx>' -> { w, h, ids,
+  // keys }), fetched the first time the cursor crosses that slice.
+  const drawRectRef = useRef(null);
+  const labelMapsRef = useRef(new Map());
+  const labelMapInFlightRef = useRef(new Set());
+  const lastMouseRef = useRef(null);
+  const [hoveredRegion, setHoveredRegion] = useState(null);
 
   // MRI affine (inverse) and volume shape — received from backend headers once
   const invAffineRef = useRef(null);   // flat 16-element array (row-major)
@@ -140,26 +185,21 @@ export default function SliceViewer({
       return;
     }
     overlayInFlightRef.current.add(idx);
+    const gen = overlayGenRef.current;
     try {
       const token = localStorage.getItem('token');
-      // Build visible keys param from current store state
-      const { structuresData: sd, structureVisible: sv } = useAppStore.getState();
-      const visibleKeys = sd
-        ? Object.keys(sd).filter(k => sd[k].vertices && sv[k] !== false).join(',')
-        : '';
-      if (!visibleKeys) { overlayRef.current = null; triggerDraw(); return; }
-
-      const style = structureStyleRef.current;
-      const res = await fetch(
-        `/api/reconstructions/${reconId}/structure-slice?axis=${axis}&slice_idx=${idx}&visible=${encodeURIComponent(visibleKeys)}&style=${style}`,
-        { headers: token ? { Authorization: `Bearer ${token}` } : {} }
-      );
+      const url = overlayUrl(useAppStore.getState(), reconId, axis, idx, structureStyleRef.current);
+      if (!url) {
+        if (sliceIdxRef.current === idx) { overlayRef.current = null; triggerDraw(); }
+        return;
+      }
+      const res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
       if (res.ok) {
         const blob = await res.blob();
         const bitmap = await createImageBitmap(blob);
-        // The style changed while this was in flight: a fill landing in an
-        // outline pane would put coloured patches back over the colour FA.
-        if (style !== structureStyleRef.current) return;
+        // The regions or style changed while this was in flight (a fill landing
+        // in an outline pane would put coloured patches back over the colour FA).
+        if (gen !== overlayGenRef.current) return;
         overlayCacheRef.current.set(idx, bitmap);
         if (sliceIdxRef.current === idx) {
           overlayRef.current = bitmap;
@@ -167,7 +207,9 @@ export default function SliceViewer({
         }
       }
     } catch (_) { /* ignore */ } finally {
-      overlayInFlightRef.current.delete(idx);
+      // A superseded request must not clear the in-flight mark of the one
+      // that replaced it.
+      if (gen === overlayGenRef.current) overlayInFlightRef.current.delete(idx);
     }
   }, [reconId, axis, isThumbnail, triggerDraw]);
 
@@ -199,6 +241,7 @@ export default function SliceViewer({
     const dx = (W - dw) / 2;
     const dy = (H - dh) / 2;
     ctx.drawImage(bitmap, dx, dy, dw, dh);
+    drawRectRef.current = { dx, dy, dw, dh };
 
     // Structure overlay
     const overlay = overlayRef.current;
@@ -473,7 +516,7 @@ export default function SliceViewer({
 
     // Point the overlay at THIS slice (cached bitmap or nothing) so we never
     // paint a different slice's shading over the new base while it loads.
-    if (useAppStore.getState().structuresData) {
+    if (overlayAvailable(useAppStore.getState())) {
       overlayRef.current = overlayCacheRef.current.get(clamped) || null;
     }
 
@@ -482,6 +525,7 @@ export default function SliceViewer({
       currentEntryRef.current = entry;
       setStatus('ok');
       triggerDraw();
+      hoverRefreshRef.current?.();   // the cursor now sits over another slice
     };
 
     if (cacheRef.current.has(clamped)) {
@@ -498,7 +542,7 @@ export default function SliceViewer({
     processQueue();
 
     // Fetch structure overlay for this slice if structures are loaded
-    if (useAppStore.getState().structuresData) fetchOverlay(clamped);
+    if (overlayAvailable(useAppStore.getState())) fetchOverlay(clamped);
   }, [doFetch, triggerDraw, processQueue, onSliceChange, fetchOverlay]);
 
   // Structure geometry changed -> drop cached contact regions and any active hover
@@ -509,18 +553,21 @@ export default function SliceViewer({
     setHoveredContact(null);
   }, [structuresData]);
 
-  // When structuresData loads/unloads or visibility changes, clear cache and re-fetch
+  // When the overlay's source, mode or regions change, clear cache and re-fetch
   useEffect(() => {
     if (isThumbnail) return;
+    overlayGenRef.current += 1;
     overlayCacheRef.current.clear();
     overlayInFlightRef.current.clear();
     overlayRef.current = null;
-    if (structuresData) {
+    if (overlayAvailable(useAppStore.getState())) {
       fetchOverlay(sliceIdxRef.current);
     } else {
       triggerDraw();
     }
-  }, [structuresData, structureVisible, structureStyle, fetchOverlay, isThumbnail, triggerDraw]);
+  }, [structuresData, structureVisible, sliceOverlayOn, brainRenderMode, corticalData,
+      corticalColorBy, corticalAtlas, corticalRegionOff,
+      structureStyle, fetchOverlay, isThumbnail, triggerDraw]);
 
   // Initial load
   useEffect(() => {
@@ -562,7 +609,7 @@ export default function SliceViewer({
       // for slice 0 rather than the slice we actually landed on. Ask again now
       // that the index is known, or the pane draws bare greyscale next to
       // siblings that have the parcellation on them.
-      if (useAppStore.getState().structuresData) fetchOverlay(actual);
+      if (overlayAvailable(useAppStore.getState())) fetchOverlay(actual);
     });
   }, [reconId, axis]); // eslint-disable-line
 
@@ -635,8 +682,89 @@ export default function SliceViewer({
     goToSlice(sliceIdxRef.current + dir);
   }, [isThumbnail, goToSlice]);
 
-  // Electrode-centric hover: pick the nearest contact under the cursor, name the
-  // structure it sits in, and ring it -- the same interaction as the 3D viewer.
+  // One slice's label-id map (see the backend's /label-ids): the id under every
+  // pixel of the slice image, plus which catalog key each id stands for. Kept
+  // for the most recent slices; a lookup in it costs nothing per mouse move.
+  const fetchLabelMap = useCallback(async (atlas, idx) => {
+    const key = `${atlas}:${idx}`;
+    if (!reconId || labelMapsRef.current.has(key) || labelMapInFlightRef.current.has(key)) return;
+    labelMapInFlightRef.current.add(key);
+    try {
+      const token = localStorage.getItem('token');
+      const res = await fetch(
+        `/api/reconstructions/${reconId}/label-ids?axis=${axis}&slice_idx=${idx}&atlas=${atlas}`,
+        { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+      if (!res.ok) return;
+      const keys = JSON.parse(res.headers.get('X-Label-Keys') || '{}');
+      // Ids ride in the red and green bytes, so nothing may touch the colours.
+      const bmp = await createImageBitmap(await res.blob(),
+        { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
+      const cv = document.createElement('canvas');
+      cv.width = bmp.width;
+      cv.height = bmp.height;
+      const ctx = cv.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(bmp, 0, 0);
+      const px = ctx.getImageData(0, 0, bmp.width, bmp.height).data;
+      const ids = new Uint16Array(bmp.width * bmp.height);
+      for (let i = 0; i < ids.length; i++) ids[i] = (px[i * 4] << 8) | px[i * 4 + 1];
+      const maps = labelMapsRef.current;
+      maps.set(key, { w: bmp.width, h: bmp.height, ids, keys });
+      if (maps.size > 24) maps.delete(maps.keys().next().value);   // oldest first
+      hoverRefreshRef.current?.();
+    } catch (_) { /* no region names on this slice */ } finally {
+      labelMapInFlightRef.current.delete(key);
+    }
+  }, [reconId, axis]);
+
+  // The painted region under a canvas point, or null. Only what the overlay
+  // shows is named: the overlay must be on, and the region one of those painted.
+  const regionAt = useCallback((mx, my) => {
+    const st = useAppStore.getState();
+    const r = drawRectRef.current;
+    const entry = currentEntryRef.current;
+    if (!r || !entry || !overlayAvailable(st) || !overlayUrl(st, reconId, axis, 0, 'fill')) return null;
+    const u = (mx - r.dx) / r.dw;
+    const v = (my - r.dy) / r.dh;
+    if (u < 0 || u >= 1 || v < 0 || v >= 1) return null;
+    const cortical = st.brainRenderMode === 'cortical';
+    const sel = cortical ? coloredParcelIds(st) : { atlas: 'dkt' };
+    if (!sel) return null;
+    const idx = entry.sliceIdx ?? sliceIdxRef.current;
+    const map = labelMapsRef.current.get(`${sel.atlas}:${idx}`);
+    if (!map) { fetchLabelMap(sel.atlas, idx); return null; }
+    const id = map.ids[Math.floor(v * map.h) * map.w + Math.floor(u * map.w)];
+    if (!id) return null;
+    if (cortical) {
+      if (!sel.ids.includes(id)) return null;
+      const atlas = st.corticalData.atlases?.[sel.atlas];
+      const label = atlas?.labels?.[id];
+      return label ? { label: label.replace(/_/g, ' '), color: atlas.colors?.[id] || '#c8d4e0' } : null;
+    }
+    const key = map.keys[id];
+    const s = key && st.structuresData?.[key];
+    if (!s?.vertices || st.structureVisible[key] === false) return null;
+    return { label: s.label, color: s.color };
+  }, [reconId, axis, fetchLabelMap]);
+
+  const showRegionAt = useCallback((mx, my) => {
+    const reg = regionAt(mx, my);
+    setHoveredRegion(prev => (reg ? { ...reg, x: mx, y: my } : prev && null));
+  }, [regionAt]);
+
+  // Re-name the region at the last cursor position: after a label map lands,
+  // and after the wheel brings a new slice under a cursor that has not moved.
+  const hoverRefreshRef = useRef(null);
+  hoverRefreshRef.current = () => {
+    const m = lastMouseRef.current;
+    if (m && hoveredIdRef.current === null) showRegionAt(m.x, m.y);
+  };
+
+  // A source switch or a fresh load replaces the label volumes the maps came from.
+  useEffect(() => { labelMapsRef.current.clear(); }, [structuresData, corticalData]);
+
+  // Hover: over a contact, the contact and the structure it sits in, ringed --
+  // the same interaction as the 3D viewer; anywhere else on the overlay, the
+  // region under the cursor.
   const handleMouseMove = useCallback((e) => {
     if (isThumbnail) return;
     const canvas = canvasRef.current;
@@ -644,6 +772,7 @@ export default function SliceViewer({
     const rect = canvas.getBoundingClientRect();
     const mx = e.clientX - rect.left;
     const my = e.clientY - rect.top;
+    lastMouseRef.current = { x: mx, y: my };
 
     let best = null, bestD = Infinity;
     for (const h of contactHitsRef.current) {
@@ -656,8 +785,10 @@ export default function SliceViewer({
       if (hoveredIdRef.current !== null) {
         hoveredIdRef.current = null; setHoveredContact(null); onHoverContact?.(null); triggerDraw();
       }
+      showRegionAt(mx, my);
       return;
     }
+    setHoveredRegion(null);
     if (best.id === hoveredIdRef.current) {
       setHoveredContact(hc => (hc ? { ...hc, x: mx, y: my } : hc));  // track cursor
       return;
@@ -676,9 +807,11 @@ export default function SliceViewer({
       value: best.value, x: mx, y: my });
     onHoverContact?.(best.id);
     triggerDraw();
-  }, [isThumbnail, triggerDraw, onHoverContact]);
+  }, [isThumbnail, triggerDraw, onHoverContact, showRegionAt]);
 
   const handleMouseLeave = useCallback(() => {
+    lastMouseRef.current = null;
+    setHoveredRegion(null);
     if (hoveredIdRef.current !== null) {
       hoveredIdRef.current = null; setHoveredContact(null); onHoverContact?.(null); triggerDraw();
     }
@@ -776,6 +909,17 @@ export default function SliceViewer({
           ) : (
             <span style={{ color: '#7a8a99', fontSize: 15 }}>unlabelled</span>
           )}
+        </div>
+      )}
+      {!isThumbnail && hoveredRegion && !hoveredContact && (
+        <div style={{
+          position: 'absolute', left: hoveredRegion.x + 12, top: hoveredRegion.y + 12,
+          pointerEvents: 'none', zIndex: 6, whiteSpace: 'nowrap',
+          background: 'rgba(10,12,16,0.92)', border: `1px solid ${hoveredRegion.color}`,
+          borderRadius: 4, padding: '6px 12px',
+          fontFamily: 'IBM Plex Mono, monospace', fontSize: 17, color: hoveredRegion.color,
+        }}>
+          {hoveredRegion.label}
         </div>
       )}
       {!isThumbnail && locator && status === 'ok' && (
