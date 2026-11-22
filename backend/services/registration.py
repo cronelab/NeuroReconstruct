@@ -2,7 +2,8 @@
 MRI-CT Co-registration Service
 
 Rigidly registers the post-implant CT to the pre-op MRI using SimpleITK
-mutual information. Produces a 4x4 affine transform matrix (CT world RAS
+mutual information, then refines that on the cranial bone band alone
+(refine_on_skull). Produces a 4x4 affine transform matrix (CT world RAS
 -> MRI world RAS) saved as a .npy file next to the CT.
 
 Usage:
@@ -194,9 +195,139 @@ def _register_ct_to_mri_impl(mri_path: str, ct_path: str, out_path: str, threads
           f"CT(moving) size {ct_sitk.GetSize()}, threads={_thr}")
 
     matrix = _final_to_ct_to_mri(final_transform, reg.GetMetricValue())
+    if SKULL_REFINE and not np.array_equal(matrix, np.eye(4)):
+        matrix, _ = refine_on_skull(mri_path, ct_path, matrix)
     np.save(out_path, matrix)
     print(f"[REG] Transform saved to {out_path}")
     return matrix
+
+
+# -- Skull-band refinement (second pass) ---------------------------------------
+# The whole-head MI pass above can settle several mm from the true pose. Most of
+# the head gives it little to hold on to: the brain is nearly featureless on CT;
+# scalp, dressings, jaw and neck differ between a post-implant CT and the MRI; and
+# the head is close to left-right symmetric, so a sideways slide costs the metric
+# almost nothing. On 17 legacy sEEG imports the multithreaded first pass was
+# 2.4-13.5 mm off (median contact displacement) in 12, mostly left-right, and a
+# precise re-run of one offered two basins 4 mm either side of the skull.
+#
+# The cranial bone is the one structure that is rigid and the same shape in both
+# scans: bright on CT, a dark band on T1 between scalp fat and brain. This pass
+# scores only that band -- CT bone placed in the MRI by the first pass, down to
+# SKULL_DEPTH_MM below the vertex, widened by 7.5 mm -- with normalized mutual
+# information, and searches a rigid correction (Powell) from the first pass's pose
+# and from 4 mm either side of it, keeping the best. Deterministic: no random
+# sampling and no ITK threads. A result that does not score better than the
+# input, or moves anatomy more than SKULL_REFINE_MAX_MM, is discarded.
+# (An ITK Mattes-MI pass with a fixed mask on the band was tried first; from 4 mm
+# off it stayed put or stopped 3-4 mm short on 4 of those 17.)
+# NEURO_SKULL_REFINE=0 skips the pass.
+
+SKULL_REFINE = os.environ.get("NEURO_SKULL_REFINE", "1") != "0"
+SKULL_BONE_HU = 600.0
+SKULL_DEPTH_MM = 130.0
+SKULL_GRID_MM = 1.5
+SKULL_MARGIN_STEPS = 5                 # band = cranial bone dilated 5 grid steps (7.5 mm)
+SKULL_STARTS_MM = (0.0, 4.0, -4.0)     # left-right offsets the search starts from
+SKULL_REFINE_MAX_MM = 25.0
+_SKULL_BINS = 40
+
+
+def _nmi(a_bins: np.ndarray, b_bins: np.ndarray) -> float:
+    """Normalized mutual information (H(A) + H(B)) / H(A, B) of two binned samples."""
+    n = _SKULL_BINS
+    P = np.bincount(a_bins * n + b_bins, minlength=n * n).reshape(n, n).astype(float)
+    P /= P.sum()
+
+    def ent(q):
+        q = q[q > 0]
+        return -np.sum(q * np.log(q))
+
+    return (ent(P.sum(1)) + ent(P.sum(0))) / ent(P)
+
+
+def refine_on_skull(mri_path: str, ct_path: str, ct_to_mri: np.ndarray):
+    """Second registration pass on the cranial bone band, starting from
+    `ct_to_mri` (CT RAS -> MRI RAS). Returns (ct_to_mri, info); the input comes
+    back unchanged when the band is unusable or no start scores better."""
+    import nibabel as nib
+    from scipy.ndimage import binary_dilation, map_coordinates
+    from scipy.optimize import minimize
+    from scipy.spatial.transform import Rotation
+
+    t0 = time.perf_counter()
+    ct = nib.load(ct_path)
+    CT = np.asanyarray(ct.dataobj).astype(np.float32)
+    if CT.min() > -500:
+        print("[REG] Skull refine skipped: CT not in HU")
+        return ct_to_mri, {"applied": False, "reason": "CT not in HU"}
+    bone = np.argwhere(CT[::2, ::2, ::2] > SKULL_BONE_HU) * 2
+    if len(bone) < 1000:
+        print("[REG] Skull refine skipped: too little bone in the CT")
+        return ct_to_mri, {"applied": False, "reason": "too little bone"}
+    mr = nib.load(mri_path)
+    MR = np.asanyarray(mr.dataobj).astype(np.float32)
+    ct_inv, mr_inv = np.linalg.inv(ct.affine), np.linalg.inv(mr.affine)
+
+    # MRI-world grid over the cranium as the first pass places it
+    bw = (ct_to_mri @ ct.affine @ np.c_[bone, np.ones(len(bone))].T)[:3]
+    top = np.percentile(bw[2], 99.9)
+    lo = np.r_[bw[:2].min(1) - 10, top - SKULL_DEPTH_MM]
+    hi = np.r_[bw[:2].max(1) + 10, top + 5]
+    axes = [np.arange(lo[a], hi[a], SKULL_GRID_MM) for a in range(3)]
+    W = np.stack(np.meshgrid(*axes, indexing="ij"), -1).reshape(-1, 3)
+    W = np.c_[W, np.ones(len(W))].T
+    mv = map_coordinates(MR, (mr_inv @ W)[:3], order=1, cval=np.nan)
+    c0 = map_coordinates(CT, (ct_inv @ np.linalg.inv(ct_to_mri) @ W)[:3], order=1, cval=-1024)
+    band = binary_dilation((c0 > SKULL_BONE_HU).reshape([len(a) for a in axes]),
+                           iterations=SKULL_MARGIN_STEPS).ravel() & ~np.isnan(mv)
+    if band.sum() < 5000:
+        print("[REG] Skull refine skipped: skull band outside the MRI")
+        return ct_to_mri, {"applied": False, "reason": "skull outside the MRI"}
+    Wb, mb = W[:, band], mv[band]
+    m_lo, m_hi = np.percentile(mb, [1, 99.5])
+    mbin = np.minimum((np.clip((mb - m_lo) / max(m_hi - m_lo, 1e-6), 0, 1) * _SKULL_BINS).astype(int),
+                      _SKULL_BINS - 1)
+    centre = Wb[:3].mean(1)
+
+    def pose(p):
+        R = Rotation.from_rotvec(np.radians(p[3:])).as_matrix()
+        D = np.eye(4)
+        D[:3, :3] = R
+        D[:3, 3] = centre - R @ centre + p[:3]
+        return D @ ct_to_mri
+
+    def score(T):
+        c = map_coordinates(CT, (ct_inv @ np.linalg.inv(T) @ Wb)[:3], order=1, cval=-1024)
+        cb = np.minimum(((np.clip(c, -100, 1900) + 100) / 2000 * _SKULL_BINS).astype(int), _SKULL_BINS - 1)
+        return _nmi(mbin, cb)
+
+    fits = []
+    for dx in SKULL_STARTS_MM:
+        r = minimize(lambda p: -score(pose(p)), [dx, 0, 0, 0, 0, 0], method="Powell",
+                     options=dict(xtol=0.05, ftol=1e-6, maxfev=1500))
+        fits.append((float(-r.fun), pose(r.x)))
+    best_score, best = max(fits, key=lambda f: f[0])
+    before = score(ct_to_mri)
+
+    ct_pts = np.linalg.inv(ct_to_mri) @ Wb[:, ::20]          # band anatomy, CT world
+
+    def dist(A, B):
+        return float(np.median(np.linalg.norm((A @ ct_pts - B @ ct_pts)[:3], axis=0)))
+
+    moved = dist(best, ct_to_mri)
+    spread = max(dist(T, best) for _, T in fits)
+    info = {"applied": True, "moved_mm": round(moved, 2), "starts_spread_mm": round(spread, 2),
+            "nmi_before": round(before, 5), "nmi_after": round(best_score, 5),
+            "seconds": round(time.perf_counter() - t0, 1)}
+    if best_score <= before or moved > SKULL_REFINE_MAX_MM:
+        info.update(applied=False, reason="not better" if best_score <= before else "moved too far")
+        print(f"[REG] Skull refine rejected ({info['reason']}): moved {moved:.1f} mm, "
+              f"NMI {before:.4f} -> {best_score:.4f}")
+        return ct_to_mri, info
+    print(f"[REG] Skull refine: moved {moved:.1f} mm, NMI {before:.4f} -> {best_score:.4f}, "
+          f"starts agree within {spread:.1f} mm ({info['seconds']} s)")
+    return best, info
 
 
 # ── Multi-start "precise" registration (enumerate MI basins for human review) ──
@@ -330,7 +461,33 @@ def run_multistart(mri_path: str, ct_path: str, k: int = 11, threads: int = 8,
                             thresh_mm=thresh_mm, max_basins=max_basins)
     print(f"[MULTISTART] {k} starts -> {len(basins)} basin(s): "
           f"sizes {[b['size'] for b in basins]}")
+    if SKULL_REFINE and basins:
+        # Basins either side of the skull (seen on a legacy import) refine to the same
+        # pose; fold those together so the reviewer is not asked to choose
+        # between two copies of one answer.
+        for b in basins:
+            b["transform"], b["skull_refine"] = refine_on_skull(mri_path, ct_path, b["transform"])
+        basins = _merge_converged(basins, points, thresh_mm)
+        print(f"[MULTISTART] after skull refine: {len(basins)} basin(s)")
     return basins
+
+
+def _merge_converged(basins, points_world, thresh_mm: float):
+    """Fold each basin into an earlier (larger) one whose transform now lies
+    within thresh_mm of it."""
+    merged = []
+    for b in basins:
+        home = next((m for m in merged
+                     if median_displacement(m["transform"], b["transform"], points_world) < thresh_mm), None)
+        if home is None:
+            merged.append(b)
+            continue
+        home["size"] += b["size"]
+        home["member_indices"] = home["member_indices"] + b["member_indices"]
+        home["spread_mm"] = max(home["spread_mm"], b["spread_mm"])
+        if b["metric"] is not None and (home["metric"] is None or b["metric"] < home["metric"]):
+            home["metric"] = b["metric"]
+    return merged
 
 
 # -- Secondary MRI -> primary MRI (additional slice-viewer base layers) --------
