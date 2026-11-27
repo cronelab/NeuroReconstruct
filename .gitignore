@@ -17,8 +17,8 @@ backend/build/
 backend/dist/
 *.spec.bak
 
-# Database
-backend/brain_viewer.db
+# Database, and any copies of it (backups hold patient data too)
+backend/*.db
 
 # Reconstruction data (large NIfTI files, patient data)
 backend/data/
