@@ -8,7 +8,9 @@ its standard outputs. Nothing here depends on how the zip was made -- the
 subject directory.
 
 WHAT AN IMPORT PRODUCES (recon_dir/freesurfer/):
-  subject/...                  the whitelisted FreeSurfer files, canonical names
+  subject/...                  the whitelisted FreeSurfer files, canonical names,
+                               incl. mri/transforms/synthmorph.1.0mm.1.0mm/ (the
+                               recon-all SynthMorph registration to MNI152 2009c)
   cortical_surface.json        lh+rh pial in the app frame, same payload schema
                                as the fast surface plus Desikan/Destrieux
   labels_dkt_on_mri.nii.gz     aparc.DKTatlas+aseg resampled onto mri.nii.gz
@@ -73,7 +75,8 @@ UPLOAD_NAME = "upload.zip"
 SOURCES = ("fast", "freesurfer")
 SURFACE_SCHEMA = 1
 
-# A full recon-all subject is ~0.5-1 GB; the slim export is ~50 MB.
+# A full recon-all subject is ~0.5-1 GB; the slim export is ~50 MB, ~250 MB
+# with the SynthMorph folder (~400 MB unpacked: the warps are float32 NIfTIs).
 MAX_UNCOMPRESSED_BYTES = 3 * 1024 ** 3
 # orig.mgz vs mri.nii.gz intensity correlation. The same T1 conformed by
 # FreeSurfer correlates at ~0.95+; anything below this is treated as a
@@ -116,6 +119,14 @@ for _h in ("lh", "rh"):
     OPTIONAL[f"surf/{_h}.thickness"] = [f"surf/{_h}.thickness"]
     OPTIONAL[f"label/{_h}.aparc.annot"] = [f"label/{_h}.aparc.annot"]
     OPTIONAL[f"label/{_h}.aparc.a2009s.annot"] = [f"label/{_h}.aparc.a2009s.annot"]
+
+# Whole folders kept file for file (recursively) under their own paths.
+# recon-all (FreeSurfer 8) registers the subject to MNI152 ICBM 2009c with
+# SynthMorph and leaves it all here: forward and inverse warps (RAS displacement
+# NIfTIs), the affine (.lta/.xfm), a warped orig and the log. Kept whole so the
+# MNI export can reuse that registration instead of running its own. FastSurfer
+# and older recon-all have no such folder.
+OPTIONAL_DIRS = ("mri/transforms/synthmorph.1.0mm.1.0mm/",)
 
 _ROOT_RE = re.compile(r"^(.*?)surf/lh\.pial(\.T1|\.T2|\.FLAIR)?$")
 
@@ -176,6 +187,10 @@ def inspect_zip(zip_path):
                 chosen[canon] = hit
             elif required:
                 missing.append(canon)
+    for prefix in OPTIONAL_DIRS:
+        for name in sorted(infos):
+            if name.startswith(root + prefix):
+                chosen.setdefault(name[len(root):], name)
     if missing:
         raise FreeSurferImportError(
             "Missing FreeSurfer outputs: " + ", ".join(missing)
