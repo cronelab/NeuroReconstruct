@@ -69,6 +69,8 @@ a = Analysis(
     datas=[
         (frontend_build, "frontend_build"),
         ("services", "services"),
+        # ICBM 2009c template, the MNI export's target grid (mni_registration.py)
+        ("assets", "assets"),
     ] + nibabel_datas + skimage_datas + trimesh_datas + scipy_datas + matplotlib_datas + ants_datas,
     hiddenimports=[
         "uvicorn.logging","uvicorn.loops","uvicorn.loops.auto","uvicorn.loops.asyncio",

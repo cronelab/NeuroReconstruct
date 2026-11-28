@@ -6,8 +6,9 @@ Run from the Dockerfile. Without it the first reconstruction uploaded after each
 container start pays a several-hundred-MB download in the middle of a request,
 and fails outright if egress is restricted.
 
-The ANTs MNI152 template doubles as the warm-up subject: it is a real T1 head,
-it ships with ANTs, and mni_registration.py needs it at runtime anyway.
+The ANTs MNI152 template doubles as the warm-up subject: it is a real T1 head
+and it ships with ANTs. (The MNI export itself uses the ICBM 2009c template
+bundled in backend/assets/, not this one.)
 
 Each model runs in its OWN subprocess. TensorFlow does not return memory to the
 OS between model loads, so running all three in one interpreter accumulates past

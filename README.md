@@ -200,7 +200,7 @@ off. At least one pane always stays on.
 | `structure_extractor.py` | Patient-specific brain structure segmentation via **antspynet**. Segments hippocampus, amygdala, thalamus, putamen, caudate, pallidum, and cortical parcellation. Results cached as `structures.json` + `structures_cortical.nii.gz`. Falls back to borrowing cached structures from any other reconstruction if antspynet is unavailable. |
 | `ct_electrode_extractor.py` | CT mesh generation (HU threshold + marching cubes). `snap_to_blob_centroid()` snaps a clicked world position to the nearest bright CT blob centroid within 8mm. |
 | `electrode_service.py` | Autofill: cubic spline fit parameterized by contact number. Interpolates between placed contacts, linear extrapolation beyond the manual range. Blob-snap applied to interpolated contacts only. |
-| `mni_registration.py` | Results-export pipeline. Registers the patient MRI to MNI152 via **ANTs** affine + SyN (`SyNRA`), warps the CT into MNI using the existing `ct_to_mri.npy`, and maps electrode contacts (RAS points, LPS-flipped for ANTs) into MNI space. Writes `MRI_mni.nii.gz`, `CT_mni.nii.gz`, transforms, `electrodes_mni.csv`/`.json`, and `export_manifest.json` to `<recon>/export/`. CPU-only, deterministic. |
+| `mni_registration.py` | Results-export pipeline. Brings the patient into **ICBM 2009c MNI152** (bundled in `backend/assets/mni_icbm152_2009c/`). Uses the **SynthMorph** registration recon-all already computed when the FreeSurfer import has it (no registration at export time); otherwise registers the skull-stripped MRI to the skull-stripped template with **ANTs** `antsRegistrationSyN[s]` (~4.5 min). Either way it writes ITK displacement fields, warps the MRI and CT (via `ct_to_mri.npy`), and maps electrode contacts (RAS points, LPS-flipped for ANTs) into MNI space. Writes `MRI_mni.nii.gz`, `CT_mni.nii.gz`, transforms, `electrodes_mni.csv`/`.json`, and `export_manifest.json` to `<recon>/export/`. CPU-only. |
 | `contact_labeling.py` | Labels each contact with the patient-specific DKT structure it sits in — or, for white-matter contacts, a plurality vote among structure voxels within a 2mm radius (reports structure, group, `distance_mm`, `vote_share`, `voxel_content`), leaving genuinely off-structure contacts unassigned. Native MRI space (no atlas warp); uses the cached `structures_cortical.nii.gz`. Writes `electrodes_structures.csv`, whose `parcellation` column says which source (fast / freesurfer) the labels came from. |
 | `freesurfer_import.py` | Imports uploaded **FreeSurfer outputs** (a zipped recon-all or FastSurfer subject folder) as an alternative parcellation source: converts lh/rh pial from tkr-RAS to the app frame using `orig.mgz`'s full matrices, resamples `aparc.DKTatlas+aseg` onto the MRI grid, and checks/repairs alignment against `mri.nii.gz`. `activate_source` swaps which label volume `structures_cortical.nii.gz` holds. See [FreeSurfer outputs](#freesurfer-outputs-gold-standard-surfaces--parcellation). |
 | `seeg_service.py` | sEEG **functional mapping**. Reads a [NeurosEEGRead](https://github.com/cronelab/NeuroRead) HDF5 recording, computes a per-channel band-power envelope (Butterworth bandpass + Hilbert), and renders it on the brain by joining h5 channels to localized contacts **by shaft name + contact number** (the h5 carries no coordinates). Trial-averaged (event-related z-score) or continuous modes. See the [sEEG Functional Mapping](#seeg-functional-mapping) section. The Hilbert envelope is cached on disk per (file, band); computed results are memoized in-process. |
@@ -215,15 +215,16 @@ normalization (`mni_registration.py`) and contact-to-structure labeling
 
 | Artifact | Contents |
 |---|---|
-| `electrodes_mni.csv` / `.json` | Per-contact MNI152 coordinates (JSON also keeps native mm for traceability). |
+| `electrodes_mni.csv` / `.json` | Per-contact MNI152 (ICBM 2009c) coordinates. The JSON also keeps native mm and each contact's `mni_method`: `synthmorph`, `ants_syn_brain`, or `synthmorph_affine_extrapolated` (outside SynthMorph's crop box, about x -76..75, y -112..76, z -76..85 mm, where the affine plus the warp's correction at the nearest box point is used; nearly always extracranial). |
 | `electrodes_structures.csv` | Per-contact anatomical structure (or nearest, with distance and vote share). |
-| `MRI_mni.nii.gz`, `CT_mni.nii.gz` | Patient MRI and CT warped into MNI152 space. |
-| `mri_to_mni_*`, `mni_to_mri_invwarp.nii.gz` | Forward/inverse ANTs transforms, retained for re-runs. |
-| `export_manifest.json` | Template, ANTs version, transform type, contact counts, phase timings. |
+| `MRI_mni.nii.gz`, `CT_mni.nii.gz` | Patient MRI and CT warped into MNI152 space, on the 2009c grid (193 x 229 x 193, 1 mm). |
+| `mri_to_mni_warp.nii.gz`, `mni_to_mri_invwarp.nii.gz` (+ `mri_to_mni_affine.mat` for ANTs) | Forward/inverse ITK displacement fields. A SynthMorph export's fields are complete on their own (no affine); `export_manifest.json` lists what to apply (`transforms_apply`). |
+| `export_manifest.json` | Template, method (`synthmorph` / `ants_syn_brain`), how to apply the transforms, contact counts (incl. extrapolated), phase timings. |
 
-> MNI registration is CPU-heavy (SyN is multi-minute) but uses plain `ants`,
-> which **is** bundled in the standalone exe — so MNI coordinate export runs
-> there. Only the contact-structure labeling step depends on a DKT segmentation:
+> With a recon-all import the export takes ~20 s. Without one, the ANTs
+> fallback is CPU-heavy (SyN at full resolution, ~4.5 min) but uses plain
+> `ants`, which **is** bundled in the standalone exe — so MNI coordinate export
+> runs there (its brain mask then comes from the morphological skull strip). Only the contact-structure labeling step depends on a DKT segmentation:
 > if structures were never computed for a case, that step needs antspynet (absent
 > in the exe) and is skipped, though `electrodes_mni.csv` is still produced.
 
