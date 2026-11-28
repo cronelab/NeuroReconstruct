@@ -114,24 +114,18 @@ def _skull_strip_morphological(data: np.ndarray, affine: np.ndarray,
     return brain_mask
 
 
-# ── Main extraction ────────────────────────────────────────────────────────────
+# ── Brain mask ─────────────────────────────────────────────────────────────────
 
-def extract_brain_mesh(nifti_path: str, output_path: str,
-                       threshold: float = None, modality: str = "t1") -> dict:
+def compute_brain_mask(data: np.ndarray, affine: np.ndarray,
+                       threshold: float = None, modality: str = "t1"):
     """
-    Load a NIfTI MRI, skull-strip, run marching cubes, save mesh as JSON.
+    The brain mask the mesh is built from: antspynet brain extraction (or the
+    morphological fallback), holes filled, lightly closed, largest component.
 
-    modality: MRI contrast of the input volume ("t1" or "t2"). Passed through
-    to antspynet's brain_extraction() so the correct pretrained network is used.
+    data/affine: canonical RAS volume (nib.as_closest_canonical). The MNI
+    export's ANTs fallback reuses this so it registers the same brain the
+    viewer shows. Returns (mask, used_morphological, threshold).
     """
-    img = nib.load(nifti_path)
-    img = nib.as_closest_canonical(img)
-    data = img.get_fdata()
-    affine = img.affine
-
-    print(f"[MESH] Loaded volume: shape={data.shape}, "
-          f"intensity range={data.min():.1f}–{data.max():.1f}")
-
     # ── Threshold for tissue detection ────────────────────────────────────────
     nonzero = data[data > 0]
     if len(nonzero) == 0:
@@ -166,6 +160,46 @@ def extract_brain_mesh(nifti_path: str, output_path: str,
         brain_mask = labeled == largest
         print(f"[MESH] Largest-component filter: kept {int(comp_sizes[largest])} voxels, "
               f"dropped {n_components - 1} island(s) totaling {dropped} voxels")
+
+    return brain_mask, used_morphological, threshold
+
+
+def write_brain_mask(nifti_path: str, output_path: str, modality: str = "t1") -> str:
+    """compute_brain_mask for a NIfTI file, saved as a uint8 NIfTI.
+
+    The mask is written in canonical RAS voxel order with the canonical affine,
+    which is the same physical grid as the input with its axes possibly
+    permuted -- resample nearest-neighbour onto the input to index it."""
+    img = nib.as_closest_canonical(nib.load(nifti_path))
+    mask, _, _ = compute_brain_mask(img.get_fdata(), img.affine, None, modality)
+    out = nib.Nifti1Image(mask.astype(np.uint8), img.affine)
+    out.set_data_dtype(np.uint8)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    nib.save(out, output_path)
+    print(f"[MESH] Brain mask: {int(mask.sum())} voxels -> {output_path}")
+    return output_path
+
+
+# ── Main extraction ────────────────────────────────────────────────────────────
+
+def extract_brain_mesh(nifti_path: str, output_path: str,
+                       threshold: float = None, modality: str = "t1") -> dict:
+    """
+    Load a NIfTI MRI, skull-strip, run marching cubes, save mesh as JSON.
+
+    modality: MRI contrast of the input volume ("t1" or "t2"). Passed through
+    to antspynet's brain_extraction() so the correct pretrained network is used.
+    """
+    img = nib.load(nifti_path)
+    img = nib.as_closest_canonical(img)
+    data = img.get_fdata()
+    affine = img.affine
+
+    print(f"[MESH] Loaded volume: shape={data.shape}, "
+          f"intensity range={data.min():.1f}–{data.max():.1f}")
+
+    brain_mask, used_morphological, threshold = compute_brain_mask(
+        data, affine, threshold, modality)
 
     # ── Smooth before marching cubes ──────────────────────────────────────────
     # antspynet mask is already clean — no smoothing needed (would blur sulci).
@@ -251,6 +285,45 @@ except ImportError:
                             describe_outcome, run_worker)
 
 
+def _run_isolated(args, what):
+    """Run this module's CLI with args in a child process, under HEAVY_JOB_LOCK.
+    Raises if the child fails."""
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cmd = [sys.executable, os.path.abspath(__file__)] + list(args)
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [backend_dir, env["PYTHONPATH"]] if env.get("PYTHONPATH") else [backend_dir])
+
+    if not HEAVY_JOB_LOCK.acquire(blocking=False):
+        print("[MESH] Another heavy job is running; waiting for it to finish")
+        HEAVY_JOB_LOCK.acquire()
+    try:
+        print(f"[MESH] Spawning {what} worker (pid parent {os.getpid()}, "
+              f"container limit {describe_limit()})")
+        # stdout/stderr are inherited so the worker's [MESH] lines land in the
+        # same log as everything else.
+        returncode, peak = run_worker(cmd, cwd=backend_dir, env=env)
+    finally:
+        HEAVY_JOB_LOCK.release()
+
+    print(f"[MESH] {describe_outcome(returncode, peak)}")
+    if returncode != 0:
+        raise RuntimeError(f"{what} {describe_outcome(returncode, peak)}")
+
+
+def write_brain_mask_isolated(nifti_path: str, output_path: str,
+                              modality: str = "t1") -> str:
+    """write_brain_mask in a child process, for the same reason as
+    extract_brain_mesh_isolated: TensorFlow never gives its memory back."""
+    if getattr(sys, "frozen", False):
+        return write_brain_mask(nifti_path, output_path, modality)
+    _run_isolated(["--mask", nifti_path, output_path, modality], "brain mask")
+    if not os.path.exists(output_path):
+        raise RuntimeError("brain-mask worker reported success but wrote no mask")
+    return output_path
+
+
 def extract_brain_mesh_isolated(nifti_path: str, output_path: str,
                                 threshold: float = None,
                                 modality: str = "t1") -> dict:
@@ -273,30 +346,8 @@ def extract_brain_mesh_isolated(nifti_path: str, output_path: str,
         # there is no TensorFlow to isolate.
         return extract_brain_mesh(nifti_path, output_path, threshold, modality)
 
-    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    cmd = [sys.executable, os.path.abspath(__file__), nifti_path, output_path,
-           modality, "auto" if threshold is None else repr(threshold)]
-
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [backend_dir, env["PYTHONPATH"]] if env.get("PYTHONPATH") else [backend_dir])
-
-    if not HEAVY_JOB_LOCK.acquire(blocking=False):
-        print("[MESH] Another heavy job is running; waiting for it to finish")
-        HEAVY_JOB_LOCK.acquire()
-    try:
-        print(f"[MESH] Spawning mesh worker (pid parent {os.getpid()}, "
-              f"container limit {describe_limit()})")
-        # stdout/stderr are inherited so the worker's [MESH] lines land in the
-        # same log as everything else.
-        returncode, peak = run_worker(cmd, cwd=backend_dir, env=env)
-    finally:
-        HEAVY_JOB_LOCK.release()
-
-    print(f"[MESH] {describe_outcome(returncode, peak)}")
-
-    if returncode != 0:
-        raise RuntimeError(f"mesh extraction {describe_outcome(returncode, peak)}")
+    _run_isolated([nifti_path, output_path, modality,
+                   "auto" if threshold is None else repr(threshold)], "mesh extraction")
     if not os.path.exists(output_path):
         raise RuntimeError("mesh worker reported success but wrote no mesh")
     with open(output_path) as f:
@@ -304,9 +355,13 @@ def extract_brain_mesh_isolated(nifti_path: str, output_path: str,
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 5 and sys.argv[1] == "--mask":
+        write_brain_mask(sys.argv[2], sys.argv[3], sys.argv[4])
+        raise SystemExit(0)
     if len(sys.argv) != 5:
-        print("usage: mesh_extractor.py <mri.nii.gz> <mesh.json> <modality> "
-              "<threshold|auto>", file=sys.stderr)
+        print("usage: mesh_extractor.py <mri.nii.gz> <mesh.json> <modality> <threshold|auto>\n"
+              "       mesh_extractor.py --mask <mri.nii.gz> <mask.nii.gz> <modality>",
+              file=sys.stderr)
         raise SystemExit(2)
     _thr = None if sys.argv[4] == "auto" else float(sys.argv[4])
     extract_brain_mesh(sys.argv[1], sys.argv[2], _thr, sys.argv[3])
