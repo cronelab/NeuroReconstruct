@@ -21,6 +21,9 @@ What is load-bearing, and covered here:
      sign slip would hide.
   4. The extrapolation is exact for an affine truth even when the LTA's affine
      differs from it, i.e. the residual has the right sign.
+  5. The CT -> MRI grid resample, done in slabs to bound memory, is bit-identical
+     to resampling the whole grid at once, and only reads the CT as float32
+     when that is exact.
 """
 
 import os
@@ -220,9 +223,68 @@ def test_template_is_bundled_on_synthmorph_grid():
     assert np.allclose(img.affine[:3, 3], [-96, -132, -78]) and np.allclose(img.affine[:3, :3], np.eye(3))
 
 
+def _resample_whole_grid(ct_path, mri_path, ct_to_mri_ras):
+    """The resample as it was before slabs (every MRI voxel at once): the reference."""
+    from scipy.ndimage import map_coordinates
+    ct, mri = nib.load(ct_path), nib.load(mri_path)
+    nx, ny, nz = mri.shape[:3]
+    ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+    vox = np.stack([ii.ravel(), jj.ravel(), kk.ravel(), np.ones(ii.size)], axis=0).astype(np.float64)
+    ct_vox = np.linalg.inv(ct.affine) @ (np.linalg.inv(ct_to_mri_ras) @ (mri.affine @ vox))
+    out = map_coordinates(ct.get_fdata(), ct_vox[:3], order=1, mode="constant", cval=-1000.0)
+    return out.reshape((nx, ny, nz)).astype(np.float32)
+
+
+def test_ct_resample_in_slabs_matches_whole_grid():
+    rng = np.random.default_rng(1)
+    ct_aff = shift([-30.0, -28.0, -20.0]) @ rot(0, 8) @ np.diag([0.5, 0.5, 0.8, 1.0])
+    mri_aff = shift([-24.0, -31.0, -24.0]) @ rot(1, 5) @ np.diag([1.1, 0.9, 1.2, 1.0])
+    ct_to_mri = shift([2.5, -3.0, 1.5]) @ rot(2, 7) @ rot(1, -4)
+    mri_shape = (23, 29, 17)
+    cts = [("int16", rng.integers(-1024, 3000, size=(120, 112, 70)).astype(np.int16), np.float32),
+           ("float64", rng.normal(0.0, 500.0, size=(120, 112, 70)), np.float64)]
+    keep = mr._RESAMPLE_SLAB_VOXELS
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            mri = os.path.join(d, "mri.nii.gz")
+            nib.save(nib.Nifti1Image(np.zeros(mri_shape, np.float32), mri_aff), mri)
+            for name, data, read_as in cts:
+                ct = os.path.join(d, f"ct_{name}.nii.gz")
+                nib.save(nib.Nifti1Image(data, ct_aff), ct)
+                assert mr._exact_float_dtype(nib.load(ct)) is read_as, name
+                expect = _resample_whole_grid(ct, mri, ct_to_mri)
+                outside = (expect == -1000.0).mean()
+                assert 0.05 < outside < 0.7, f"MRI grid should straddle the CT's edge ({outside:.2f})"
+                # one plane per slab, uneven 4-plane slabs, one slab
+                for slab in (1, 4 * 29 * 17, 10 ** 9):
+                    mr._RESAMPLE_SLAB_VOXELS = slab
+                    got = mr._resample_ct_into_mri_grid(ct, mri, ct_to_mri)
+                    assert np.asarray(got.dataobj).dtype == np.float32
+                    assert np.array_equal(np.asarray(got.dataobj), expect), \
+                        f"{name} CT, slab {slab}: differs from the whole-grid resample"
+                    assert np.array_equal(got.affine, nib.load(mri).affine)
+    finally:
+        mr._RESAMPLE_SLAB_VOXELS = keep
+
+
+def test_ct_read_as_float32_only_when_exact():
+    from types import SimpleNamespace as NS
+
+    def img(dtype, slope, inter):
+        return NS(get_data_dtype=lambda: np.dtype(dtype), dataobj=NS(slope=slope, inter=inter))
+
+    for args, want in [(("int16", 1.0, -1024.0), np.float32), (("uint8", 1.0, 0.0), np.float32),
+                       (("float32", 1.0, 0.0), np.float32), (("int16", 0.5, 0.0), np.float64),
+                       (("int16", 1.0, 0.5), np.float64), (("int16", 512.0, 0.0), np.float64),
+                       (("int32", 1.0, 0.0), np.float64), (("float32", 2.0, 0.0), np.float64),
+                       (("float64", 1.0, 0.0), np.float64)]:
+        assert mr._exact_float_dtype(img(*args)) is want, args
+
+
 if __name__ == "__main__":
     tests = [test_template_is_bundled_on_synthmorph_grid, test_lta_must_be_ras_to_ras,
              test_find_synthmorph_needs_all_three_files,
+             test_ct_read_as_float32_only_when_exact, test_ct_resample_in_slabs_matches_whole_grid,
              test_points_and_itk_fields_identity_frame, test_points_and_itk_fields_registered_frame]
     failed = 0
     for t in tests:

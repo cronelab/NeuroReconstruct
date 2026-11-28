@@ -432,28 +432,62 @@ def mni_transforms(recon_dir: str, mri_path: str, out_dir: str, method: str = "a
 
 # ── CT -> MRI grid ──────────────────────────────────────────────────────────────
 
+# MRI voxels per slab: about 150 MB of float64 coordinate temporaries.
+_RESAMPLE_SLAB_VOXELS = 1 << 20
+
+
+def _exact_float_dtype(img):
+    """float32 when it holds every scaled voxel value exactly, else float64.
+
+    Exact means interpolation reads the same numbers as from ``get_fdata()``,
+    so the result does not change. That holds for float32 data stored unscaled
+    and for 8/16-bit integers with whole-number scaling that stays within
+    float32's exact-integer range (every CT here: int16, slope 1, inter -1024).
+    """
+    raw = img.get_data_dtype()
+    slope = float(getattr(img.dataobj, "slope", np.nan))
+    inter = float(getattr(img.dataobj, "inter", np.nan))
+    if raw == np.float32 and slope == 1.0 and inter == 0.0:
+        return np.float32
+    if (raw.kind in "iu" and raw.itemsize <= 2 and slope.is_integer() and inter.is_integer()
+            and abs(slope) * 2 ** 16 + abs(inter) <= 2 ** 24):
+        return np.float32
+    return np.float64
+
+
 def _resample_ct_into_mri_grid(ct_path: str, mri_path: str, ct_to_mri_ras: np.ndarray):
     """
     Resample the CT onto the MRI voxel grid using the rigid CT->MRI (RAS) transform.
     Returns a nibabel image on the MRI grid (HU, air = -1000 outside FOV).
+
+    The grid is walked in slabs of whole planes along its first axis, so memory
+    is the CT, the float32 output and one slab of coordinates (on a 399x512x256
+    MRI this step peaked at 8.3 GiB over the whole grid, 0.9 GiB in slabs;
+    each slab is a contiguous block of the output). Trilinear sampling is per
+    point, and the three transforms are applied in the same order as the
+    whole-grid version, so the output is bit-identical to it. Composing them into
+    one matrix first would not be: it moves a few voxels by float rounding.
     """
     import nibabel as nib
     from scipy.ndimage import map_coordinates
 
     ct = nib.load(ct_path)
     mri = nib.load(mri_path)
-    ct_data = ct.get_fdata()
+    ct_data = ct.get_fdata(dtype=_exact_float_dtype(ct))
     nx, ny, nz = mri.shape[:3]
+    out = np.empty((nx, ny, nz), dtype=np.float32)
 
     # MRI voxel indices -> MRI world RAS -> CT world RAS -> CT voxel indices
-    ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
-    vox = np.stack([ii.ravel(), jj.ravel(), kk.ravel(), np.ones(ii.size)], axis=0).astype(np.float64)
-    mri_world = mri.affine @ vox
-    ct_world = np.linalg.inv(ct_to_mri_ras) @ mri_world
-    ct_vox = np.linalg.inv(ct.affine) @ ct_world
-
-    sampled = map_coordinates(ct_data, ct_vox[:3], order=1, mode="constant", cval=-1000.0)
-    out = sampled.reshape((nx, ny, nz)).astype(np.float32)
+    mri_to_ct_world = np.linalg.inv(ct_to_mri_ras)
+    world_to_ct_vox = np.linalg.inv(ct.affine)
+    step = max(1, _RESAMPLE_SLAB_VOXELS // (ny * nz))
+    for i0 in range(0, nx, step):
+        i1 = min(nx, i0 + step)
+        ii, jj, kk = np.meshgrid(np.arange(i0, i1), np.arange(ny), np.arange(nz), indexing="ij")
+        vox = np.stack([ii.ravel(), jj.ravel(), kk.ravel(), np.ones(ii.size)], axis=0)
+        ct_vox = world_to_ct_vox @ (mri_to_ct_world @ (mri.affine @ vox))
+        map_coordinates(ct_data, ct_vox[:3].reshape(3, i1 - i0, ny, nz), order=1,
+                        mode="constant", cval=-1000.0, output=out[i0:i1])
     return nib.Nifti1Image(out, mri.affine)
 
 
