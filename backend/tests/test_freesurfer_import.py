@@ -325,6 +325,53 @@ def test_import_places_surface_and_labels():
     print("ok  import places both pial surfaces, parcels and labels correctly")
 
 
+SYNTHMORPH = "mri/transforms/synthmorph.1.0mm.1.0mm"
+
+
+def add_synthmorph_folder(sd):
+    """recon-all's SynthMorph outputs (contents are stand-ins), plus a file
+    elsewhere in transforms/ that must NOT be kept. Returns {rel path: bytes}."""
+    files = {
+        f"{SYNTHMORPH}/warp.to.mni152.1.0mm.1.0mm.nii.gz": b"\x1f\x8b forward warp",
+        f"{SYNTHMORPH}/warp.to.mni152.1.0mm.1.0mm.inv.nii.gz": b"\x1f\x8b inverse warp",
+        f"{SYNTHMORPH}/reg.invol_to_targ.lta": b"type = 1 # LINEAR_RAS_TO_RAS\n",
+        f"{SYNTHMORPH}/reg.targ_to_invol.lta": b"type = 1\n",
+        f"{SYNTHMORPH}/reg.invol_to_targ.xfm": b"MNI Transform File\n",
+        f"{SYNTHMORPH}/aff.lta": b"type = 1\n",
+        f"{SYNTHMORPH}/test.nii.gz": b"\x1f\x8b warped orig",
+        f"{SYNTHMORPH}/log/fs-synthmorph-reg.Y2026.M10.D10.H17.M46.log": b"log\n",
+    }
+    for rel, data in {**files, "mri/transforms/talairach.xfm": b"not kept"}.items():
+        p = os.path.join(sd, *rel.split("/"))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as fh:
+            fh.write(data)
+    return files
+
+
+def test_synthmorph_folder_is_kept_whole():
+    with tempfile.TemporaryDirectory() as d:
+        sd, recon, _ = make_subject(d)
+        want = add_synthmorph_folder(sd)
+        z = zip_subject(sd, os.path.join(d, "s.zip"))
+        chosen = fsi.inspect_zip(z)
+        assert set(want) <= set(chosen), set(want) - set(chosen)
+        assert "mri/transforms/talairach.xfm" not in chosen
+        info = fsi.import_freesurfer(recon, z, verbose=False)
+        for rel, data in want.items():
+            with open(os.path.join(recon, fsi.FS_DIR, "subject", *rel.split("/")), "rb") as fh:
+                assert fh.read() == data, rel
+        assert set(want) <= set(info["files"])
+        assert not os.path.exists(os.path.join(recon, fsi.FS_DIR, "subject", "mri", "transforms",
+                                               "talairach.xfm"))
+
+        # Without the folder (FastSurfer, older recon-all) the import is unchanged.
+        sd2, recon2, _ = make_subject(os.path.join(d, "plain"))
+        info2 = fsi.import_freesurfer(recon2, zip_subject(sd2, os.path.join(d, "p.zip")), verbose=False)
+        assert not any(f.startswith("mri/transforms/") for f in info2["files"])
+    print("ok  the SynthMorph folder is kept file for file; nothing else under transforms/")
+
+
 def test_switching_source_round_trips_fast_labels():
     with tempfile.TemporaryDirectory() as d:
         sd, recon, _ = make_subject(d)
@@ -422,6 +469,7 @@ if __name__ == "__main__":
     test_tkr_to_scanner_handles_oblique()
     test_inspect_zip_rejects_bad_uploads()
     test_import_places_surface_and_labels()
+    test_synthmorph_folder_is_kept_whole()
     test_switching_source_round_trips_fast_labels()
     test_annot_from_another_run_is_refused()
     test_fastsurfer_names_are_accepted()
